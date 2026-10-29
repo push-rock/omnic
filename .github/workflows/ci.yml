@@ -38,6 +38,14 @@ jobs:
           code=${PIPESTATUS[0]}
           echo "::remove-matcher owner=gcc::"
           exit $code
+      - name: dump compiler errors as annotations
+        if: failure()
+        shell: bash
+        run: |
+          grep -iE 'error|undefined|warning.*error' build.log | grep -v '^--' | head -30 | while IFS= read -r line; do
+            msg=$(echo "$line" | cut -c1-250)
+            echo "::error::${msg}"
+          done
       - name: upload build log on failure
         if: failure()
         uses: actions/upload-artifact@v4

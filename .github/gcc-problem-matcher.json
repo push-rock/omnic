@@ -11,6 +11,24 @@
           "message": 4
         }
       ]
+    },
+    {
+      "owner": "ld",
+      "pattern": [
+        {
+          "regexp": "^.*undefined reference to `(.+)'.*$",
+          "message": 1
+        }
+      ]
+    },
+    {
+      "owner": "make",
+      "pattern": [
+        {
+          "regexp": "^(.+?):\\s+\\*\\*\\*\\s+\\[(.+)\\]\\s+Error\\s+\\d+.*$",
+          "message": 2
+        }
+      ]
     }
   ]
 }
