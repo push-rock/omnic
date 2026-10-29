@@ -35,14 +35,34 @@ static void cleanup_all(void) {
                            "omnic_test_src.txt.zst",
                            "omnic_test_src.txt.lz4",
                            "omnic_test_src.txt.xz",
+                           "omnic_test_src.txt.gz",
+                           "omnic_test_src.txt.br",
+                           "omnic_test_src.txt.snappy",
+                           "omnic_test_src.txt.lzfse",
                            DST_FMT,
                            "omnic_test_dst",
+                           "omnic_test_dst.gz",
+                           "omnic_test_dst.br",
+                           "omnic_test_dst.snappy",
+                           "omnic_test_dst.lzfse",
                            "omnic_test_rand.png",
                            "omnic_test_rand.png.zst",
                            "omnic_test_rand",
                            "omnic_test_rand.zst",
                            "omnic_test_trunc.zst",
+                           "omnic_test_trunc.gz",
+                           "omnic_test_trunc.br",
+                           "omnic_test_trunc.snappy",
+                           "omnic_test_trunc.lzfse",
                            "omnic_test_trunc",
+                           "omnic_test_empty",
+                           "omnic_test_mm1.gz",
+                           "omnic_test_mm2.gz",
+                           "omnic_test_mm.gz",
+                           "omnic_test_mm",
+                           "omnic_test_mm_ref",
+                           "omnic_test_crc.snappy",
+                           "omnic_test_crc",
                            NULL};
     for (int i = 0; files[i] != NULL; i++) remove(files[i]);
 }
@@ -166,7 +186,9 @@ static void test_detect(void) {
     CHECK(omnic_entropy((const uint8_t *)"\x00", 1) == 0.0);
 }
 
-/* 完整流程：compress -> 解压到独立文件，比较内容（避免与 SRC 同名冲突） */
+/* 完整流程：compress -> 解压到独立文件，比较内容（避免与 SRC 同名冲突）。
+ * 产物改名为 omnic_test_dst.<ext>：无 magic 的 codec（brotli/raw-deflate 族）
+ * 解压识别依赖后缀兜底，不能统一改成 .tmp。 */
 static void test_roundtrip_full(const char *name) {
     const omnic_codec_ops *ops = omnic_codec_find(name);
     CHECK(ops != NULL);
@@ -178,13 +200,14 @@ static void test_roundtrip_full(const char *name) {
     omnic_report rep;
     CHECK(omnic_compress(SRC, &o, &rep) == OMNIC_OK);
     char *out = with_ext(SRC, ops->native_ext);
+    char dst2[64];
+    snprintf(dst2, sizeof dst2, "omnic_test_dst.%s", ops->native_ext);
 
-    /* 压缩产物改名避开 SRC 的扩展名，解压输出 = 去掉 .tmp 后缀 */
-    CHECK(rename(out, DST_FMT) == 0);
-    CHECK(omnic_decompress(DST_FMT, &o, &rep) == OMNIC_OK);
+    CHECK(rename(out, dst2) == 0);
+    CHECK(omnic_decompress(dst2, &o, &rep) == OMNIC_OK);
     CHECK(files_equal(SRC, "omnic_test_dst"));
     rm("omnic_test_dst");
-    rm(DST_FMT);
+    rm(dst2);
     rm(out);
     free(out);
 }
@@ -227,36 +250,145 @@ static void test_auto_and_skip(void) {
     CHECK(rep.klass == OMNIC_CLS_TEXT && rep.entropy < 6.0);
 }
 
-static void test_truncated(void) {
-    /* zstd 产物截断 -> E_DATA（SYS-DEC-003 子集） */
+/* 截断检测（SYS-DEC-003 子集）：截去尾部 10 字节——必然落在最后一个
+ * chunk/帧内部。不用"截一半"是避免 snappy framing 在 chunk 边界截断
+ * 形成合法短流（解压会成功前缀部分而非报错）。 */
+static void test_truncated(const char *name) {
     omnic_options o = def_opts();
-    o.codec = "zstd";
+    o.codec = name;
     omnic_report rep;
-    if (omnic_codec_find("zstd") == NULL) return;
+    const omnic_codec_ops *ops = omnic_codec_find(name);
+    CHECK(ops != NULL);
+    if (ops == NULL) return;
     CHECK(omnic_compress(SRC, &o, &rep) == OMNIC_OK);
-    char *z = with_ext(SRC, "zst");
-    /* 截一半 */
+    char *z = with_ext(SRC, ops->native_ext);
     FILE *f = fopen(z, "rb");
     fseek(f, 0, SEEK_END);
     long sz = ftell(f);
     fclose(f);
-    FILE *g = fopen(z, "r+b");
-    /* 覆盖尾部：保留前一半，截断 */
-    size_t keep = (size_t)(sz / 2);
-    /* Windows 下无 ftruncate 便捷方式：拷贝前半到新文件 */
-    fclose(g);
+    size_t keep = (size_t)(sz > 16 ? sz - 10 : sz / 2);
     f = fopen(z, "rb");
-    unsigned char *half = malloc(keep);
-    fread(half, 1, keep, f);
+    unsigned char *part = malloc(keep);
+    CHECK(fread(part, 1, keep, f) == keep);
     fclose(f);
-    f = fopen("omnic_test_trunc.zst", "wb");
-    fwrite(half, 1, keep, f);
+    char tname[64];
+    snprintf(tname, sizeof tname, "omnic_test_trunc.%s", ops->native_ext);
+    f = fopen(tname, "wb");
+    fwrite(part, 1, keep, f);
     fclose(f);
-    free(half);
+    free(part);
     o.flags = 0;
-    CHECK(omnic_decompress("omnic_test_trunc.zst", &o, &rep) == OMNIC_E_DATA);
-    rm("omnic_test_trunc.zst");
+    CHECK(omnic_decompress(tname, &o, &rep) == OMNIC_E_DATA);
+    rm(tname);
     rm("omnic_test_trunc");
+    rm(z);
+    free(z);
+}
+
+/* 空文件是经典边界：全部 codec 走一遍空输入 roundtrip */
+static void test_empty_roundtrip(void) {
+    static const char *names[] = {"zstd",     "lz4",  "xz",       "zlib",  "zlib-ng",
+                                  "libdeflate", "brotli", "snappy", "lzfse", NULL};
+    FILE *f = fopen("omnic_test_empty", "wb");
+    CHECK(f != NULL);
+    if (f != NULL) fclose(f);
+    for (int i = 0; names[i] != NULL; i++) {
+        const omnic_codec_ops *ops = omnic_codec_find(names[i]);
+        CHECK(ops != NULL);
+        if (ops == NULL) continue;
+        omnic_options o = def_opts();
+        o.codec = names[i];
+        omnic_report rep;
+        char out[64], dst[64];
+        snprintf(out, sizeof out, "omnic_test_empty.%s", ops->native_ext);
+        snprintf(dst, sizeof dst, "omnic_empty_%d.%s", i, ops->native_ext);
+        CHECK(omnic_compress("omnic_test_empty", &o, &rep) == OMNIC_OK);
+        CHECK(rename(out, dst) == 0);
+        o.flags = 0;
+        CHECK(omnic_decompress(dst, &o, &rep) == OMNIC_OK);
+        snprintf(dst, sizeof dst, "omnic_empty_%d", i); /* 解压输出名 */
+        CHECK(files_equal("omnic_test_empty", dst));
+        rm(dst);
+        snprintf(dst, sizeof dst, "omnic_empty_%d.%s", i, ops->native_ext);
+        rm(dst);
+    }
+    rm("omnic_test_empty");
+}
+
+/* 多 member gzip（cat a.gz b.gz）：解压须串接两个流的内容（inflateReset 路径） */
+static void test_gzip_multimember(void) {
+    const omnic_codec_ops *ops = omnic_codec_find("zlib");
+    CHECK(ops != NULL);
+    if (ops == NULL) return;
+    omnic_options o = def_opts();
+    o.codec = "zlib";
+    omnic_report rep;
+
+    CHECK(omnic_compress(SRC, &o, &rep) == OMNIC_OK);
+    char *z = with_ext(SRC, ops->native_ext);
+    CHECK(rename(z, "omnic_test_mm1.gz") == 0);
+    CHECK(omnic_compress(SRC, &o, &rep) == OMNIC_OK);
+    CHECK(rename(z, "omnic_test_mm2.gz") == 0);
+
+    FILE *a = fopen("omnic_test_mm1.gz", "rb");
+    FILE *b = fopen("omnic_test_mm2.gz", "rb");
+    FILE *c = fopen("omnic_test_mm.gz", "wb");
+    FILE *s = fopen(SRC, "rb");
+    FILE *r = fopen("omnic_test_mm_ref", "wb");
+    CHECK(a != NULL && b != NULL && c != NULL && s != NULL && r != NULL);
+    if (a && b && c && s && r) {
+        int ch;
+        while ((ch = fgetc(a)) != EOF) fputc(ch, c);
+        while ((ch = fgetc(b)) != EOF) fputc(ch, c);
+        while ((ch = fgetc(s)) != EOF) fputc(ch, r);
+        fseek(s, 0, SEEK_SET);
+        while ((ch = fgetc(s)) != EOF) fputc(ch, r);
+    }
+    if (a) fclose(a);
+    if (b) fclose(b);
+    if (c) fclose(c);
+    if (s) fclose(s);
+    if (r) fclose(r);
+
+    o.flags = 0;
+    CHECK(omnic_decompress("omnic_test_mm.gz", &o, &rep) == OMNIC_OK);
+    CHECK(files_equal("omnic_test_mm_ref", "omnic_test_mm"));
+    rm("omnic_test_mm1.gz");
+    rm("omnic_test_mm2.gz");
+    rm("omnic_test_mm.gz");
+    rm("omnic_test_mm");
+    rm("omnic_test_mm_ref");
+    rm(z);
+    free(z);
+}
+
+/* snappy framing 的 CRC 路径：翻转首个 chunk 的存储 CRC（数据本身完好），
+ * 必须被 framing 层校验拦下而非依赖 snappy 解码失败 */
+static void test_snappy_crc(void) {
+    const omnic_codec_ops *ops = omnic_codec_find("snappy");
+    CHECK(ops != NULL);
+    if (ops == NULL) return;
+    omnic_options o = def_opts();
+    o.codec = "snappy";
+    omnic_report rep;
+
+    CHECK(omnic_compress(SRC, &o, &rep) == OMNIC_OK);
+    char *z = with_ext(SRC, ops->native_ext);
+    CHECK(rename(z, "omnic_test_crc.snappy") == 0);
+    FILE *f = fopen("omnic_test_crc.snappy", "r+b");
+    CHECK(f != NULL);
+    if (f != NULL) {
+        int c;
+        fseek(f, 14, SEEK_SET); /* magic 10 + chunk 头 4 之后 = 首个 chunk 的 CRC 区 */
+        c = fgetc(f);
+        fseek(f, 14, SEEK_SET);
+        fputc(c ^ 0xFF, f);
+        fclose(f);
+        o.flags = 0;
+        CHECK(omnic_decompress("omnic_test_crc.snappy", &o, &rep) == OMNIC_E_DATA);
+    }
+    rm("omnic_test_crc.snappy");
+    rm("omnic_test_crc");
     rm(z);
     free(z);
 }
@@ -270,7 +402,20 @@ int main(void) {
     test_roundtrip_full("zstd");
     test_roundtrip_full("lz4");
     test_roundtrip_full("xz");
-    test_truncated();
+    test_roundtrip_full("zlib");
+    test_roundtrip_full("zlib-ng");
+    test_roundtrip_full("libdeflate");
+    test_roundtrip_full("brotli");
+    test_roundtrip_full("snappy");
+    test_roundtrip_full("lzfse");
+    test_truncated("zstd");
+    test_truncated("zlib");
+    test_truncated("brotli");
+    test_truncated("snappy");
+    test_truncated("lzfse");
+    test_empty_roundtrip();
+    test_gzip_multimember();
+    test_snappy_crc();
     rm(SRC);
     rm("omnic_test_rand.png");
     rm("omnic_test_rand.png.zst");

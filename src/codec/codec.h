@@ -32,5 +32,28 @@ extern const omnic_codec_ops omnic_codec_lz4;
 #ifdef OMNIC_CODEC_XZ
 extern const omnic_codec_ops omnic_codec_xz;
 #endif
+#ifdef OMNIC_CODEC_ZLIB
+extern const omnic_codec_ops omnic_codec_zlib;
+#endif
+#ifdef OMNIC_CODEC_ZLIB_NG
+extern const omnic_codec_ops omnic_codec_zlibng;
+#endif
+#ifdef OMNIC_CODEC_LIBDEFLATE
+extern const omnic_codec_ops omnic_codec_libdeflate;
+#endif
+#ifdef OMNIC_CODEC_BROTLI
+extern const omnic_codec_ops omnic_codec_brotli;
+#endif
+#ifdef OMNIC_CODEC_SNAPPY
+extern const omnic_codec_ops omnic_codec_snappy;
+#endif
+#ifdef OMNIC_CODEC_LZFSE
+extern const omnic_codec_ops omnic_codec_lzfse;
+#endif
+
+/* codec_util.c：整块式 API（libdeflate/lzfse 等）的适配辅助 */
+omnic_status omnic_read_all(omnic_reader *in, uint8_t **data, size_t *len);
+/* 释放 read_all 的产物 */
+void omnic_free_all(uint8_t *data);
 
 #endif /* OMNIC_CODEC_H */

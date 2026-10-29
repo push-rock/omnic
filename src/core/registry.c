@@ -14,6 +14,26 @@ static const omnic_codec_ops *const g_codecs[] = {
 #ifdef OMNIC_CODEC_XZ
     &omnic_codec_xz,
 #endif
+    /* gzip 格式的解压入口取注册顺序第一个：zlib 的 inflate 是最标准的实现，
+     * zlib-ng / libdeflate 产出同格式流但各自保留 decompress 能力。 */
+#ifdef OMNIC_CODEC_ZLIB
+    &omnic_codec_zlib,
+#endif
+#ifdef OMNIC_CODEC_ZLIB_NG
+    &omnic_codec_zlibng,
+#endif
+#ifdef OMNIC_CODEC_LIBDEFLATE
+    &omnic_codec_libdeflate,
+#endif
+#ifdef OMNIC_CODEC_BROTLI
+    &omnic_codec_brotli,
+#endif
+#ifdef OMNIC_CODEC_SNAPPY
+    &omnic_codec_snappy,
+#endif
+#ifdef OMNIC_CODEC_LZFSE
+    &omnic_codec_lzfse,
+#endif
 };
 
 #define G_CODEC_N (sizeof(g_codecs) / sizeof(g_codecs[0]))

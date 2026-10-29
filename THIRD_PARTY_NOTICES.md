@@ -14,7 +14,6 @@ All codec libraries are vendored under `third_party/` with unmodified sources
 | third_party/brotli | https://github.com/google/brotli | 1.2.0 | MIT |
 | third_party/snappy | https://github.com/google/snappy | 1.3.1 | BSD-3-Clause |
 | third_party/lzfse | https://github.com/lzfse/lzfse | master (1.0) | Apple BSD-style |
-| third_party/bzip2 | https://sourceware.org/bzip2 | 1.0.8 | bzip2 (BSD-style) |
 
 Notes:
 - Source archives are fetched by `tools/fetch_third_party.ps1` (with a mirror

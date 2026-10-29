@@ -61,8 +61,14 @@ omnic list                     列出算法与支持的格式
 | zstd 1.5.7 | .zst | -5..22 | 支持多线程 |
 | lz4 1.10.0 | .lz4 | 0..12 | 级别 0 = fast 模式，1..12 = LZ4HC |
 | xz 5.8.4 | .xz | 0..9 | CRC64 校验 |
+| zlib 1.3.2 | .gz | 0..9 | 流式编解码，解压支持多 member 拼接流 |
+| zlib-ng 2.3.3 | .gz | 0..9 | 同格式更快实现，非兼容模式（zng_ 前缀）共存 |
+| libdeflate 1.26 | .gz | 0..12 | 整块 API，gzip 速度上限 |
+| brotli 1.2.0 | .br | 0..11 | |
+| snappy 1.3.1 | .snappy | 1..2 | 官方 framing 格式（magic + CRC32C + 64KB 分块） |
+| lzfse 1.0 | .lzfse | — | 单一速率点 |
 
-更多算法（zlib / zlib-ng / libdeflate / brotli / bzip2 / snappy / lzfse / lzham / lzav）正基于同一套适配器接口陆续接入 —— 完整的准入清单（按许可证筛选）见 `docs/REQUIREMENTS.md` 第 4.5 节。解压端可识别的格式：gzip、zlib、deflate、zstd、xz、lzma、lzip、bzip2、lz4、brotli、snappy、compress(.Z)、lzfse、lzvn。
+所有适配器共用一套接口（`src/codec/ac_*.c`），新增算法 = 一个适配器文件 + 一条注册表项。解压端可识别的格式：gzip、zlib、deflate、zstd、xz、lzma、lzip、bzip2、lz4、brotli、snappy、compress(.Z)、lzfse、lzvn。
 
 ## 决策是怎么做的
 

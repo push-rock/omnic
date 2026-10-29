@@ -61,8 +61,14 @@ omnic list                       list codecs and recognized formats
 | zstd 1.5.7 | .zst | -5..22 | multithreaded |
 | lz4 1.10.0 | .lz4 | 0..12 | level 0 = fast mode, 1..12 = LZ4HC |
 | xz 5.8.4 | .xz | 0..9 | CRC64 |
+| zlib 1.3.2 | .gz | 0..9 | streaming, multi-member gzip on decompress |
+| zlib-ng 2.3.3 | .gz | 0..9 | same format, faster implementation |
+| libdeflate 1.26 | .gz | 0..12 | whole-buffer API, highest gzip speed |
+| brotli 1.2.0 | .br | 0..11 | |
+| snappy 1.3.1 | .snappy | 1..2 | official framing format (magic + CRC32C + 64 KB chunks) |
+| lzfse 1.0 | .lzfse | — | single speed point |
 
-More codecs (zlib/zlib-ng/libdeflate/brotli/bzip2/snappy/lzfse/lzham/lzav) are being integrated on the same adapter interface — see `docs/REQUIREMENTS.md` §4.5 for the licensing-based admission list. Recognized-on-decompress formats: gzip, zlib, deflate, zstd, xz, lzma, lzip, bzip2, lz4, brotli, snappy, compress(.Z), lzfse, lzvn.
+All adapters share one interface (`src/codec/ac_*.c`), so adding a codec is a single file plus a registry entry. Recognized-on-decompress formats: gzip, zlib, deflate, zstd, xz, lzma, lzip, bzip2, lz4, brotli, snappy, compress(.Z), lzfse, lzvn.
 
 ## How it picks
 
