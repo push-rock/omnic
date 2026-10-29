@@ -2,6 +2,8 @@
 
 **Universal compressor** — one binary that picks the right codec for each file, and decompresses most formats you'll meet in the wild.
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 ```
 $ omnic c report.json
 report.json: zstd | balanced | text | level 8
