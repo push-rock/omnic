@@ -38,6 +38,9 @@ endif()
 if(OMNIC_CODEC_XZ)
   set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
   set(XZ_NLS OFF CACHE BOOL "" FORCE)
+  # 关闭 xz 上游自带的测试注册（include(CTest) 默认 BUILD_TESTING=ON），
+  # 不影响我们自己的 add_test
+  set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
   foreach(_t XZ_TOOL_XZDEC XZ_TOOL_LZMADEC XZ_TOOL_LZMAINFO XZ_TOOL_SCRIPTS)
     set(${_t} OFF CACHE BOOL "" FORCE)
   endforeach()
