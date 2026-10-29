@@ -1,0 +1,77 @@
+# omnic
+
+**Universal compressor** — one binary that picks the right codec for each file, and decompresses most formats you'll meet in the wild.
+
+```
+$ omnic c report.json
+report.json: zstd | balanced | text | level 8
+    1048576 -> 91234 bytes (8.70%), 0.091s, 11.5 MB/s
+
+$ omnic c --profile best_ratio report.json
+report.json: xz | best_ratio | text | level 9
+    1048576 -> 61042 bytes (5.82%), 0.322s, 3.3 MB/s
+
+$ omnic d report.json.xz
+report.json.xz: xz
+    61042 -> 1048576 bytes, 0.019s, 55.2 MB/s
+```
+
+## Why
+
+lzbench benchmarks 50+ compressors, but no mainstream tool routes between them. `zstd --adapt` adapts levels *within* one codec; 7-Zip doesn't care whether the input is JSON or a bitmap. omnic closes that gap:
+
+- **Compress**: classify the input (extension + 4 MB entropy sample), then look up a policy table — *7 data classes × 4 preference profiles* — to pick `(codec, level)`.
+- **Prefer**: `--profile fast_compress | fast_decompress | best_ratio | balanced`.
+- **Decompress**: recognize the format by magic number first, extension as fallback. Native formats only, so every output can be unpacked by the official tools of that codec.
+- **Skip incompressible data**: already-compressed inputs (jpeg/zip/…) and high-entropy data (≥7.5 bits/byte) are skipped with a warning; `--force` overrides.
+
+## Build
+
+Requires CMake ≥ 3.16 and a C11 compiler (MSVC / GCC / Clang). All codecs are vendored — no system dependencies.
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+./build/omnic list
+ctest --test-dir build
+```
+
+## Usage
+
+```
+omnic c   [options] <file...>    compress (auto codec unless -c)
+omnic d   [options] <file...>    decompress (auto format by magic/ext)
+omnic analyze <file...>          show type/entropy/decision, no side effects
+omnic list                       list codecs and recognized formats
+
+-p --profile <v>   fast_compress | fast_decompress | best_ratio | balanced
+-c --codec <name>  force a codec            -l --level <n>  codec-native level
+-T --threads <n>   worker threads (zstd)    -o --output-dir <dir>
+-f --force    overwrite output / compress anyway
+-k --keep     keep the source file (default: removed after success)
+-x --explain  print the decision rationale  -q --quiet
+```
+
+## Codecs
+
+| codec | format | levels | notes |
+|---|---|---|---|
+| zstd 1.5.7 | .zst | -5..22 | multithreaded |
+| lz4 1.10.0 | .lz4 | 0..12 | level 0 = fast mode, 1..12 = LZ4HC |
+| xz 5.8.4 | .xz | 0..9 | CRC64 |
+
+More codecs (zlib/zlib-ng/libdeflate/brotli/bzip2/snappy/lzfse/lzham/lzav) are being integrated on the same adapter interface — see `docs/REQUIREMENTS.md` §4.5 for the licensing-based admission list. Recognized-on-decompress formats: gzip, zlib, deflate, zstd, xz, lzma, lzip, bzip2, lz4, brotli, snappy, compress(.Z), lzfse, lzvn.
+
+## How it picks
+
+The policy table is compiled in (`src/policy/policy_table.gen.c`), initialized from lzbench measurements, and regenerable from real data by the offline training pipeline (`tools/train`, Python: `bench.py` → CSV → `fit.py` → C table). Deciding is a table lookup — microseconds, no model runtime.
+
+## Docs
+
+- `docs/REQUIREMENTS.md` — requirement baseline (73 tracked requirements)
+- `docs/ARCHITECTURE.md` — design, codec interface, decision pipeline
+- `docs/omnic-requirements-matrix.xlsx` — requirement matrix, risks, WBS
+
+## License
+
+MIT. Vendored codecs keep their own licenses, see `THIRD_PARTY_NOTICES.md`. No GPL/LGPL code is linked by default (`OMNIC_ENABLE_GPL` is reserved for optional builds).
