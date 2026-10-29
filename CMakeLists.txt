@@ -42,8 +42,6 @@ if(OMNIC_CODEC_XZ)
     set(${_t} OFF CACHE BOOL "" FORCE)
   endforeach()
   add_subdirectory(third_party/xz liblzma EXCLUDE_FROM_ALL)
-  # xz 上游 include 为 PRIVATE，补 INTERFACE 供 adapter 使用
-  target_include_directories(liblzma INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/xz/src/liblzma/api)
 endif()
 
 # ---- libomnic（INT-LIB-001） ----
@@ -84,6 +82,10 @@ target_include_directories(omnic_core PUBLIC
 )
 if(OMNIC_DEFS)
   target_compile_definitions(omnic_core PRIVATE ${OMNIC_DEFS})
+endif()
+if(OMNIC_CODEC_XZ)
+  # xz 上游的 include 是 PRIVATE；adapter 编译需要显式补头文件路径
+  target_include_directories(omnic_core PUBLIC third_party/xz/src/liblzma/api)
 endif()
 if(OMNIC_LIBS)
   target_link_libraries(omnic_core PUBLIC ${OMNIC_LIBS})
