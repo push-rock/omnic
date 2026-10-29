@@ -1,0 +1,13 @@
+build/
+third_party/*.tar.gz
+third_party/*.zip
+.vscode/
+.idea/
+*.o
+*.obj
+*.exe
+*.a
+*.lib
+*.dll
+*.so
+*.dylib
