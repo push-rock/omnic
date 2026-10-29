@@ -1,5 +1,5 @@
 #ifndef _WIN32
-#define _POSIX_C_SOURCE 199309L /* glibc 严格 C 模式下 clock_gettime 需要 */
+#define _POSIX_C_SOURCE 200809L /* clock_gettime + snprintf（199309 下 Darwin 会隐藏后者） */
 #endif
 #include "core/util.h"
 

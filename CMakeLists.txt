@@ -94,6 +94,8 @@ endif()
 if(OMNIC_LIBS)
   target_link_libraries(omnic_core PUBLIC ${OMNIC_LIBS})
 endif()
+# log2 等数学函数在 Linux 上位于独立的 libm；Windows (CRT) 与 macOS (libSystem) 自动链接
+target_link_libraries(omnic_core PUBLIC $<$<PLATFORM_ID:Linux>:m>)
 
 # ---- CLI ----
 add_executable(omnic src/cli/argp.c src/cli/main.c src/cli/report.c)
