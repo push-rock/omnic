@@ -72,7 +72,6 @@ omnic list                     列出算法与支持的格式
 
 - `docs/REQUIREMENTS.md` —— 需求基线（73 条受控需求）
 - `docs/ARCHITECTURE.md` —— 架构设计、codec 接口、决策管线
-- `docs/omnic-requirements-matrix.xlsx` —— 需求矩阵、风险、WBS
 
 ## 许可证
 

@@ -72,7 +72,6 @@ The policy table is compiled in (`src/policy/policy_table.gen.c`), initialized f
 
 - `docs/REQUIREMENTS.md` — requirement baseline (73 tracked requirements)
 - `docs/ARCHITECTURE.md` — design, codec interface, decision pipeline
-- `docs/omnic-requirements-matrix.xlsx` — requirement matrix, risks, WBS
 
 ## License
 
