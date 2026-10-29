@@ -31,6 +31,19 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
       - name: build
-        run: cmake --build build -j --config Release
+        shell: bash
+        run: |
+          echo "::add-matcher::.github/gcc-problem-matcher.json"
+          cmake --build build -j --config Release 2>&1 | tee build.log
+          code=${PIPESTATUS[0]}
+          echo "::remove-matcher owner=gcc::"
+          exit $code
+      - name: upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.os }}-${{ matrix.cc }}
+          path: build.log
+          if-no-files-found: ignore
       - name: test
         run: ctest --test-dir build --output-on-failure -C Release
