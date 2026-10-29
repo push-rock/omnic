@@ -68,11 +68,6 @@ More codecs (zlib/zlib-ng/libdeflate/brotli/bzip2/snappy/lzfse/lzham/lzav) are b
 
 The policy table is compiled in (`src/policy/policy_table.gen.c`), initialized from lzbench measurements, and regenerable from real data by the offline training pipeline (`tools/train`, Python: `bench.py` → CSV → `fit.py` → C table). Deciding is a table lookup — microseconds, no model runtime.
 
-## Docs
-
-- `docs/REQUIREMENTS.md` — requirement baseline (73 tracked requirements)
-- `docs/ARCHITECTURE.md` — design, codec interface, decision pipeline
-
 ## License
 
 MIT. Vendored codecs keep their own licenses, see `THIRD_PARTY_NOTICES.md`. No GPL/LGPL code is linked by default (`OMNIC_ENABLE_GPL` is reserved for optional builds).

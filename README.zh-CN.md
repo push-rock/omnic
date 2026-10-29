@@ -68,11 +68,6 @@ omnic list                     列出算法与支持的格式
 
 决策表编译进二进制（`src/policy/policy_table.gen.c`），初值来自 lzbench 实测数据，并可由离线训练管线（`tools/train`，Python：`bench.py` → CSV → `fit.py` → C 决策表）用真实数据重新生成。决策过程就是查表 —— 微秒级，无任何模型运行时依赖。
 
-## 文档
-
-- `docs/REQUIREMENTS.md` —— 需求基线（73 条受控需求）
-- `docs/ARCHITECTURE.md` —— 架构设计、codec 接口、决策管线
-
 ## 许可证
 
 MIT。内置的各算法库保留其原始许可证，见 `THIRD_PARTY_NOTICES.md`。默认不链接任何 GPL/LGPL 代码（`OMNIC_ENABLE_GPL` 预留给可选构建）。
