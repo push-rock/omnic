@@ -3,6 +3,7 @@
 /third_party/*.zip
 # 内部项目管理产物，不入库
 /docs/
+/tools/gen_matrix.py
 .vscode/
 .idea/
 *.o
