@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(omnic C)
 
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_C_STANDARD_REQUIRED ON)
+# 注意：不要设置全局 CMAKE_C_STANDARD。目录级变量会泄漏进 third_party 子目录，
+# -std=c11 的 __STRICT_ANSI__ 会让 glibc 隐藏 POSIX 函数声明（futimens/fcntl 等），
+# xz/zstd 在 Linux 上因此编译失败。omnic 自身的 target 在文件末尾用 target 级属性约束。
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
@@ -103,3 +104,8 @@ enable_testing()
 add_executable(test_core tests/test_core.c)
 target_link_libraries(test_core PRIVATE omnic_core)
 add_test(NAME core COMMAND test_core)
+
+# omnic 自身代码按严格 C11 编译（C_EXTENSIONS OFF）；第三方库走编译器默认（gnu 模式）
+foreach(_t omnic omnic_core test_core)
+  set_target_properties(${_t} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+endforeach()

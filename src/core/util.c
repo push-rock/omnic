@@ -1,3 +1,6 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 199309L /* glibc 严格 C 模式下 clock_gettime 需要 */
+#endif
 #include "core/util.h"
 
 #include <stdio.h>

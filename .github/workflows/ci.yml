@@ -21,14 +21,16 @@ jobs:
             cc: cl
           - os: windows-latest
             cc: gcc
+            gen: "MinGW Makefiles"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        # CC 环境变量对 VS 生成器无效；windows+gcc 需显式 MinGW 生成器
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.gen && format('-G "{0}"', matrix.gen) || '' }}
         env:
           CC: ${{ matrix.cc }}
       - name: build
-        run: cmake --build build -j
+        run: cmake --build build -j --config Release
       - name: test
-        run: ctest --test-dir build --output-on-failure
+        run: ctest --test-dir build --output-on-failure -C Release
