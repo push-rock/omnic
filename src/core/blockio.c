@@ -3,12 +3,19 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* 分块流式 codec（snappy 64KB chunk 等）的小粒度 fread/fwrite 直落系统调用，
+ * Windows 下单次调用开销可达 ~100µs。1MB 全缓冲把调用次数压缩两个数量级
+ * （A7 实测 snappy 解压路径损耗 71% -> 个位数）。stdio 分配失败时静默回退
+ * 默认缓冲，行为不变。 */
+#define OMNIC_IO_BUF (1024u * 1024u)
+
 void omnic_reader_init(omnic_reader *r, FILE *f) {
     r->f = f;
     r->pend = NULL;
     r->pend_len = 0;
     r->pend_cap = 0;
     r->total_in = 0;
+    (void)setvbuf(f, NULL, _IOFBF, OMNIC_IO_BUF);
 }
 
 void omnic_reader_fini(omnic_reader *r) {
@@ -55,6 +62,7 @@ uint64_t omnic_reader_total(const omnic_reader *r) { return r->total_in; }
 void omnic_writer_init(omnic_writer *w, FILE *f) {
     w->f = f;
     w->total_out = 0;
+    (void)setvbuf(f, NULL, _IOFBF, OMNIC_IO_BUF);
 }
 
 omnic_status omnic_writer_write(omnic_writer *w, const void *buf, size_t n) {

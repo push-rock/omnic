@@ -182,6 +182,11 @@ if(OMNIC_CODEC_SNAPPY)
   list(APPEND OMNIC_SRC src/codec/ac_snappy.c)
   list(APPEND OMNIC_DEFS OMNIC_CODEC_SNAPPY)
   list(APPEND OMNIC_LIBS snappy)
+  # CRC32C 硬件路径（SSE4.2）：MSVC x64 恒可用，GCC/Clang 需 per-file 开启；
+  # 仅 x86 目标加 flag（arm64 走 __ARM_FEATURE_CRC32 或表驱动回退）
+  if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
+    set_source_files_properties(src/codec/ac_snappy.c PROPERTIES COMPILE_OPTIONS "-msse4.2")
+  endif()
 endif()
 if(OMNIC_CODEC_LZFSE)
   list(APPEND OMNIC_SRC src/codec/ac_lzfse.c)

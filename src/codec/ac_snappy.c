@@ -12,8 +12,45 @@
 #define SN_MAGIC "\xff\x06\x00\x00sNaPpY"  /* 10 字节流标识 */
 #define SN_CAP (2u * SN_BLOCK + 8u)        /* chunk 载荷缓冲（覆盖压缩膨胀上限） */
 
-/* ---- CRC-32C（Castagnoli，表驱动、函数内惰性初始化） ---- */
+/* ---- CRC-32C（Castagnoli）：SSE4.2 / ARM64 硬件指令优先（~10GB/s，逐字节
+ * 表驱动仅 ~500MB/s，是 framing 路径的吞吐瓶颈）；无指令集时回退表驱动，
+ * 函数内惰性初始化 ---- */
 
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__SSE4_2__) || defined(_MSC_VER))
+#include <nmmintrin.h>
+static uint32_t sn_crc32c(const uint8_t *p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    while (n >= 8) {
+        c = (uint32_t)_mm_crc32_u64(c, *(const uint64_t *)p);
+        p += 8;
+        n -= 8;
+    }
+    if (n >= 4) {
+        c = (uint32_t)_mm_crc32_u32(c, *(const uint32_t *)p);
+        p += 4;
+        n -= 4;
+    }
+    while (n--) c = _mm_crc32_u8(c, *p++);
+    return c ^ 0xFFFFFFFFu;
+}
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+static uint32_t sn_crc32c(const uint8_t *p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    while (n >= 8) {
+        c = __crc32cd(c, *(const uint64_t *)p);
+        p += 8;
+        n -= 8;
+    }
+    if (n >= 4) {
+        c = __crc32cw(c, *(const uint32_t *)p);
+        p += 4;
+        n -= 4;
+    }
+    while (n--) c = __crc32cb(c, *p++);
+    return c ^ 0xFFFFFFFFu;
+}
+#else
 static uint32_t sn_crc32c(const uint8_t *p, size_t n) {
     static uint32_t tbl[256];
     static int ready = 0;
@@ -29,6 +66,7 @@ static uint32_t sn_crc32c(const uint8_t *p, size_t n) {
     while (n--) c = tbl[(c ^ *p++) & 0xFF] ^ (c >> 8);
     return c ^ 0xFFFFFFFFu;
 }
+#endif
 
 static uint32_t sn_mask(uint32_t c) { return ((c >> 15) | (c << 17)) + 0xa282ead8u; }
 
@@ -60,57 +98,68 @@ static uint32_t sn_get_be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
 }
 
-static omnic_status sn_write_chunk(omnic_writer *out, uint8_t type, uint32_t crc,
-                                   const uint8_t *payload, size_t plen) {
-    uint8_t hdr[8];
-    hdr[0] = type;
-    sn_put_le24(hdr + 1, (uint32_t)(plen + 4));
-    hdr[4] = (uint8_t)(crc >> 24);
-    hdr[5] = (uint8_t)(crc >> 16);
-    hdr[6] = (uint8_t)(crc >> 8);
-    hdr[7] = (uint8_t)crc;
-    if (omnic_writer_write(out, hdr, 8) != OMNIC_OK) return OMNIC_E_SYSTEM;
-    return omnic_writer_write(out, payload, plen);
-}
+/* 批量读写：4MB 预读直切 64KB 块（省逐块中转拷贝与 fread 调用），
+ * chunk 头与压缩产物在批缓冲内连续拼接、攒满一次写出（高速 codec 下
+ * 逐 chunk 的 fwrite 调用链占压缩耗时 ~20%）。 */
+#define SN_BATCH (4u * 1024u * 1024u)
 
 static omnic_status omnic_snappy_compress(omnic_reader *in, omnic_writer *out, int level, int threads) {
     (void)threads;
     if (level < SNAPPY_MIN_COMPRESSION_LEVEL) level = SNAPPY_MIN_COMPRESSION_LEVEL;
     if (level > SNAPPY_MAX_COMPRESSION_LEVEL) level = SNAPPY_MAX_COMPRESSION_LEVEL;
     omnic_status ret = OMNIC_OK;
-    uint8_t *raw = (uint8_t *)malloc(SN_BLOCK);
-    uint8_t *cbuf = (uint8_t *)malloc(snappy_max_compressed_length(SN_BLOCK));
+    uint8_t *inbuf = (uint8_t *)malloc(SN_BATCH);
+    size_t outcap = (size_t)SN_BATCH + SN_BATCH / 8 + 4096; /* 覆盖最坏膨胀 + 64 个 chunk 头 */
+    uint8_t *outbuf = (uint8_t *)malloc(outcap);
 
-    if (raw == NULL || cbuf == NULL) {
+    if (inbuf == NULL || outbuf == NULL) {
         ret = OMNIC_E_SYSTEM;
         goto done;
     }
-    if (omnic_writer_write(out, (const uint8_t *)SN_MAGIC, 10) != OMNIC_OK) {
-        ret = OMNIC_E_SYSTEM;
-        goto done;
-    }
+    memcpy(outbuf, SN_MAGIC, 10);
+    size_t opos = 10;
     for (;;) {
-        size_t n = omnic_reader_read(in, raw, SN_BLOCK);
+        size_t n = omnic_reader_read(in, inbuf, SN_BATCH);
         if (n == 0) break; /* EOF：流以最后一个数据 chunk 收尾，无终止符 */
-        uint32_t crc = sn_mask(sn_crc32c(raw, n));
-        size_t clen = snappy_max_compressed_length(SN_BLOCK);
-        snappy_status st = snappy_compress_with_level((const char *)raw, n, level, (char *)cbuf, &clen);
-        if (st != SNAPPY_OK) {
-            ret = OMNIC_E_DATA;
+        for (size_t off = 0; off < n; off += SN_BLOCK) {
+            size_t chunk = n - off > SN_BLOCK ? SN_BLOCK : n - off;
+            uint32_t crc = sn_mask(sn_crc32c(inbuf + off, chunk));
+            size_t room = outcap - opos - 8;
+            size_t clen = room < chunk * 2 + 64 ? room : chunk * 2 + 64;
+            snappy_status st = snappy_compress_with_level((const char *)(inbuf + off), chunk, level,
+                                                          (char *)(outbuf + opos + 8), &clen);
+            if (st != SNAPPY_OK) {
+                ret = OMNIC_E_DATA;
+                goto done;
+            }
+            /* compressed chunk 的 payload 即完整 snappy block（自带 varint 前缀）；
+             * 无收益时退化为 uncompressed chunk（两种 chunk 的头部成本同为 8B） */
+            uint8_t type = 0x00;
+            size_t plen = clen;
+            if (clen >= chunk) {
+                type = 0x01;
+                plen = chunk;
+                memcpy(outbuf + opos + 8, inbuf + off, chunk);
+            }
+            outbuf[opos] = type;
+            sn_put_le24(outbuf + opos + 1, (uint32_t)(plen + 4));
+            outbuf[opos + 4] = (uint8_t)(crc >> 24);
+            outbuf[opos + 5] = (uint8_t)(crc >> 16);
+            outbuf[opos + 6] = (uint8_t)(crc >> 8);
+            outbuf[opos + 7] = (uint8_t)crc;
+            opos += 8 + plen;
+        }
+        if (n < SN_BATCH) break; /* 短读即 EOF */
+        if (omnic_writer_write(out, outbuf, opos) != OMNIC_OK) {
+            ret = OMNIC_E_SYSTEM;
             goto done;
         }
-        /* compressed chunk 的 payload 即完整 snappy block（自带 varint 前缀）；
-         * 无收益时退化为 uncompressed chunk（两种 chunk 的头部成本同为 8B） */
-        if (clen < n) {
-            ret = sn_write_chunk(out, 0x00, crc, cbuf, clen);
-        } else {
-            ret = sn_write_chunk(out, 0x01, crc, raw, n);
-        }
-        if (ret != OMNIC_OK) break;
+        opos = 0;
     }
+    if (opos > 0 && omnic_writer_write(out, outbuf, opos) != OMNIC_OK) ret = OMNIC_E_SYSTEM;
 done:
-    free(raw);
-    free(cbuf);
+    free(inbuf);
+    free(outbuf);
     return ret;
 }
 

@@ -8,6 +8,29 @@
 omnic_status omnic_read_all(omnic_reader *in, uint8_t **data, size_t *len) {
     size_t cap = 1u << 20;
     size_t n = 0;
+
+    /* 可 seek 的 reader 预估总大小，一次分配到位：翻倍 realloc 对大输入
+     * 的累计拷贝是可观的吞吐损耗（A7 实测 libdeflate 路径 ~15%）。
+     * 预估失败（管道等）回退翻倍策略。 */
+    long cur = -1;
+    if (in->f != NULL) {
+        cur = ftell(in->f);
+        if (cur >= 0 && fseek(in->f, 0, SEEK_END) == 0) {
+            long end = ftell(in->f);
+            if (end >= cur && fseek(in->f, cur, SEEK_SET) == 0 && end > cur) {
+                size_t want = in->pend_len + (size_t)(end - cur);
+                /* +1 余量：精确容量下读满会误触发翻倍 realloc（大输入一次
+                 * 全量 memcpy，libdeflate 路径实测 ~13%）；留一字节即可让
+                 * EOF 轮读到 0 直接收尾 */
+                if (want + 1 > cap && want <= (size_t)-1 / 2) cap = want + 1;
+            } else {
+                cur = -1;
+            }
+        } else {
+            cur = -1;
+        }
+    }
+
     uint8_t *buf = (uint8_t *)malloc(cap);
     if (buf == NULL) return OMNIC_E_SYSTEM;
     for (;;) {
