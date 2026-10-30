@@ -114,3 +114,18 @@ const omnic_codec_ops omnic_codec_lzfse = {
     omnic_lzfse_compress,
     omnic_lzfse_decompress,
 };
+
+/* lzvn 条目（需求 4.4 节）："bvn" 前缀的流是首块为 LZVN 块（bvxn）的 lzfse
+ * 流，解码与 lzfse 完全同路。上游无独立 lzvn 封装 API，仅解码。 */
+const omnic_codec_ops omnic_codec_lzvn = {
+    "lzvn",
+    OMNIC_FMT_LZVN,
+    "lzvn",
+    false,
+    true,
+    0,
+    0,
+    0,
+    NULL,
+    omnic_lzfse_decompress,
+};

@@ -31,9 +31,12 @@ extern const omnic_codec_ops omnic_codec_lz4;
 #endif
 #ifdef OMNIC_CODEC_XZ
 extern const omnic_codec_ops omnic_codec_xz;
+extern const omnic_codec_ops omnic_codec_lzma; /* lzma alone（.lzma） */
 #endif
 #ifdef OMNIC_CODEC_ZLIB
 extern const omnic_codec_ops omnic_codec_zlib;
+extern const omnic_codec_ops omnic_codec_zlibstream; /* zlib 流（RFC 1950） */
+extern const omnic_codec_ops omnic_rawdeflate;       /* raw deflate（.zz） */
 #endif
 #ifdef OMNIC_CODEC_ZLIB_NG
 extern const omnic_codec_ops omnic_codec_zlibng;
@@ -49,6 +52,7 @@ extern const omnic_codec_ops omnic_codec_snappy;
 #endif
 #ifdef OMNIC_CODEC_LZFSE
 extern const omnic_codec_ops omnic_codec_lzfse;
+extern const omnic_codec_ops omnic_codec_lzvn; /* lzvn（解码与 lzfse 同路） */
 #endif
 
 /* codec_util.c：整块式 API（libdeflate/lzfse 等）的适配辅助 */

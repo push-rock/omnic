@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "codec/codec.h"
 #include "core/registry.h"
@@ -39,12 +40,18 @@ static void cleanup_all(void) {
                            "omnic_test_src.txt.br",
                            "omnic_test_src.txt.snappy",
                            "omnic_test_src.txt.lzfse",
+                           "omnic_test_src.txt.zlib",
+                           "omnic_test_src.txt.zz",
+                           "omnic_test_src.txt.lzma",
                            DST_FMT,
                            "omnic_test_dst",
                            "omnic_test_dst.gz",
                            "omnic_test_dst.br",
                            "omnic_test_dst.snappy",
                            "omnic_test_dst.lzfse",
+                           "omnic_test_dst.zlib",
+                           "omnic_test_dst.zz",
+                           "omnic_test_dst.lzma",
                            "omnic_test_rand.png",
                            "omnic_test_rand.png.zst",
                            "omnic_test_rand",
@@ -56,6 +63,13 @@ static void cleanup_all(void) {
                            "omnic_test_trunc.br",
                            "omnic_test_trunc.snappy",
                            "omnic_test_trunc.lzfse",
+                           "omnic_test_trunc.zlib",
+                           "omnic_test_trunc.zz",
+                           "omnic_test_trunc.lzma",
+                           "omnic_test_trunc.lzvn",
+                           "omnic_test_lzvn.lzvn",
+                           "omnic_test_lzvn",
+                           "omnic_test_lzvn_ref",
                            "omnic_test_trunc",
                            "omnic_test_empty",
                            "omnic_test_mm1.gz",
@@ -329,7 +343,8 @@ static void test_truncated(const char *name) {
 /* 空文件是经典边界：全部 codec 走一遍空输入 roundtrip */
 static void test_empty_roundtrip(void) {
     static const char *names[] = {"zstd",     "lz4",  "xz",       "zlib",  "zlib-ng",
-                                  "libdeflate", "brotli", "snappy", "lzfse", NULL};
+                                  "libdeflate", "brotli", "snappy", "lzfse",
+                                  "zlib-stream", "raw-deflate", "lzma", NULL};
     FILE *f = fopen("omnic_test_empty", "wb");
     CHECK(f != NULL);
     if (f != NULL) fclose(f);
@@ -434,6 +449,148 @@ static void test_snappy_crc(void) {
     free(z);
 }
 
+/* ---- lzvn 解码路径（需求 4.4）----
+ * 上游无公开工具产出该格式，测试手工构造首块为 bvxn 的 lzfse 流：
+ * 块头三 uint32 小端（bvxn 魔数 + n_raw + n_payload）+ lzvn 载荷 + bvx$ 终止块。
+ * 载荷由 lzfse 库内的 lzvn 编码器产出（自带流结束标记），声明见下。 */
+size_t lzvn_encode_scratch_size(void);
+size_t lzvn_encode_buffer(void *dst, size_t dst_size, const void *src, size_t src_size,
+                          void *work);
+
+static void put_le32(FILE *f, uint32_t v) {
+    fputc((int)(v & 0xFF), f);
+    fputc((int)((v >> 8) & 0xFF), f);
+    fputc((int)((v >> 16) & 0xFF), f);
+    fputc((int)((v >> 24) & 0xFF), f);
+}
+
+static void test_lzvn_decode(void) {
+    enum { N = 60000 };
+    uint8_t *buf = (uint8_t *)malloc(N);
+    size_t cap = N + N / 16 + 64;
+    uint8_t *pay = (uint8_t *)malloc(cap);
+    void *work = malloc(lzvn_encode_scratch_size());
+    CHECK(buf != NULL && pay != NULL && work != NULL);
+    if (buf == NULL || pay == NULL || work == NULL) goto done;
+    for (size_t i = 0; i < N; i++)
+        buf[i] = (i % 9 == 0) ? (uint8_t)(i >> 4) : (uint8_t)('a' + (int)(i % 26));
+    size_t plen = lzvn_encode_buffer(pay, cap, buf, N, work);
+    CHECK(plen > 0 && plen < N); /* 可压缩内容必须真的被压缩 */
+    if (plen == 0 || plen >= N) goto done;
+
+    {
+        FILE *f = fopen("omnic_test_lzvn.lzvn", "wb");
+        FILE *r = fopen("omnic_test_lzvn_ref", "wb");
+        CHECK(f != NULL && r != NULL);
+        if (f != NULL && r != NULL) {
+            put_le32(f, 0x6E787662u); /* "bvxn" */
+            put_le32(f, (uint32_t)N);
+            put_le32(f, (uint32_t)plen);
+            fwrite(pay, 1, plen, f);
+            put_le32(f, 0x24787662u); /* "bvx$" */
+            fwrite(buf, 1, N, r);
+        }
+        if (f) fclose(f);
+        if (r) fclose(r);
+    }
+    {
+        omnic_options o = def_opts();
+        omnic_report rep;
+        CHECK(omnic_decompress("omnic_test_lzvn.lzvn", &o, &rep) == OMNIC_OK);
+        CHECK(files_equal("omnic_test_lzvn", "omnic_test_lzvn_ref"));
+        rm("omnic_test_lzvn"); /* 后续小节重用同一输出名 */
+    }
+
+    /* 截断 10 字节：咬掉 bvx$ 终止块 + 载荷尾，bvxn 块校验必须报 E_DATA */
+    {
+        FILE *f = fopen("omnic_test_lzvn.lzvn", "rb");
+        CHECK(f != NULL);
+        if (f != NULL) {
+            unsigned char all[16 + 65536];
+            size_t total = fread(all, 1, sizeof(all), f);
+            fclose(f);
+            CHECK(total == 12 + plen + 4);
+            if (total == 12 + plen + 4) {
+                FILE *t = fopen("omnic_test_trunc.lzvn", "wb");
+                CHECK(t != NULL);
+                if (t != NULL) {
+                    fwrite(all, 1, total - 10, t);
+                    fclose(t);
+                }
+            }
+        }
+        omnic_options o = def_opts();
+        omnic_report rep;
+        CHECK(omnic_decompress("omnic_test_trunc.lzvn", &o, &rep) == OMNIC_E_DATA);
+        rm("omnic_test_trunc.lzvn");
+        rm("omnic_test_trunc");
+    }
+
+    /* 1 字节边界：库解码器在 n_raw=0 时提前返回（dst_len==0 早退被块校验
+     * 判错），零字节 bvzn 块无法表示；1 字节是可解码的最小流 */
+    {
+        size_t eplen = lzvn_encode_buffer(pay, cap, buf, 1, work);
+        CHECK(eplen > 0 && eplen <= 16);
+        if (eplen > 0) {
+            FILE *f = fopen("omnic_test_lzvn.lzvn", "wb");
+            CHECK(f != NULL);
+            if (f != NULL) {
+                put_le32(f, 0x6E787662u);
+                put_le32(f, 1);
+                put_le32(f, (uint32_t)eplen);
+                fwrite(pay, 1, eplen, f);
+                put_le32(f, 0x24787662u);
+                fclose(f);
+            }
+            omnic_options o = def_opts();
+            omnic_report rep;
+            CHECK(omnic_decompress("omnic_test_lzvn.lzvn", &o, &rep) == OMNIC_OK);
+            {
+                FILE *chk = fopen("omnic_test_lzvn", "rb"); /* 输出恰 1 字节 */
+                CHECK(chk != NULL);
+                if (chk != NULL) {
+                    int c = fgetc(chk);
+                    CHECK(c == (int)buf[0] && fgetc(chk) == EOF);
+                    fclose(chk);
+                }
+            }
+        }
+    }
+    rm("omnic_test_lzvn.lzvn");
+    rm("omnic_test_lzvn");
+    rm("omnic_test_lzvn_ref");
+done:
+    free(buf);
+    free(pay);
+    free(work);
+}
+
+/* DoD #6（SYS-CMP-002）：决策延迟——4MB 特征提取 + 分类查表 ≤ 50ms（不含磁盘 I/O）。
+ * Windows CRT 的 clock() 粒度 ~15ms，单次几毫秒测不出，跑多轮取平均。 */
+static void test_decision_latency(void) {
+    enum { N = 4u * 1024u * 1024u, ROUNDS = 64 };
+    uint8_t *buf = (uint8_t *)malloc(N);
+    CHECK(buf != NULL);
+    if (buf == NULL) return;
+    for (size_t i = 0; i < N; i++)
+        buf[i] = (uint8_t)(rng() >> 24); /* 全域字节，熵计算最重负载 */
+    clock_t t0 = clock();
+    omnic_class cls = OMNIC_CLS_UNKNOWN;
+    const omnic_policy_entry *e = NULL;
+    for (int i = 0; i < ROUNDS; i++) {
+        double h = omnic_entropy(buf, N); /* 特征提取主体（api 层 UNKNOWN->RANDOM 依此细分） */
+        cls = omnic_classify("noext", buf, N);
+        e = omnic_policy_lookup(cls, OMNIC_PROFILE_BALANCED);
+        (void)h;
+    }
+    clock_t t1 = clock();
+    CHECK(e != NULL);
+    double ms = (double)(t1 - t0) * 1000.0 / CLOCKS_PER_SEC / ROUNDS;
+    printf("decision latency (4MB sample, %d rounds avg): %.2f ms\n", ROUNDS, ms);
+    CHECK(ms < 50.0);
+    free(buf);
+}
+
 int main(void) {
     cleanup_all();
     make_src();
@@ -449,14 +606,22 @@ int main(void) {
     test_roundtrip_full("brotli");
     test_roundtrip_full("snappy");
     test_roundtrip_full("lzfse");
+    test_roundtrip_full("zlib-stream");
+    test_roundtrip_full("raw-deflate");
+    test_roundtrip_full("lzma");
     test_truncated("zstd");
     test_truncated("zlib");
     test_truncated("brotli");
     test_truncated("snappy");
     test_truncated("lzfse");
+    test_truncated("zlib-stream");
+    test_truncated("raw-deflate");
+    test_truncated("lzma");
     test_empty_roundtrip();
     test_gzip_multimember();
     test_snappy_crc();
+    test_lzvn_decode();
+    test_decision_latency();
     make_zeros("omnic_test_bigz", (4u << 20) + 700000); /* 解压跨 4MB 输出 flush */
     make_random("omnic_test_bigr", 5u << 20);           /* 产物超 4MB 输入块 */
     test_big_roundtrip("zstd");
@@ -468,6 +633,9 @@ int main(void) {
     test_big_roundtrip("brotli");
     test_big_roundtrip("snappy");
     test_big_roundtrip("lzfse");
+    test_big_roundtrip("zlib-stream");
+    test_big_roundtrip("raw-deflate");
+    test_big_roundtrip("lzma");
     rm(SRC);
     rm("omnic_test_rand.png");
     rm("omnic_test_rand.png.zst");

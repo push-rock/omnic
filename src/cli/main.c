@@ -34,8 +34,17 @@ static int cmd_list(void) {
     for (size_t i = 0;; i++) {
         const omnic_codec_ops *ops = omnic_codec_at(i);
         if (ops == NULL) break;
+        if (!ops->can_compress) continue; /* 仅解码条目归到下方段落 */
         printf("  %-10s levels %3d..%-3d default %-3d ext %-6s format %s\n", ops->name,
                ops->min_level, ops->max_level, ops->default_level, ops->native_ext,
+               omnic_fmt_str(ops->fmt));
+    }
+    printf("decode-only codecs:\n");
+    for (size_t i = 0;; i++) {
+        const omnic_codec_ops *ops = omnic_codec_at(i);
+        if (ops == NULL) break;
+        if (ops->can_compress) continue;
+        printf("  %-10s ext %-6s format %s\n", ops->name, ops->native_ext,
                omnic_fmt_str(ops->fmt));
     }
     printf("formats recognized on decompress (magic first, ext fallback): "

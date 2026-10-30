@@ -67,8 +67,12 @@ omnic list                     列出算法与支持的格式
 | brotli 1.2.1 | .br | 0..11 | |
 | snappy 1.3.1 | .snappy | 1..2 | 官方 framing 格式（magic + CRC32C + 64KB 分块） |
 | lzfse 1.0 | .lzfse | — | 单一速率点 |
+| zlib-stream | .zlib | 0..9 | RFC 1950 包装，同一 zlib 库 |
+| raw-deflate | .zz | 0..9 | 无头 deflate 流，后缀识别 |
+| lzma | .lzma | 0..9 | lzma-alone 容器，走 liblzma |
+| lzvn | — | 仅解码 | "bvn" 流，与 lzfse 共用块解码器 |
 
-所有适配器共用一套接口（`src/codec/ac_*.c`），新增算法 = 一个适配器文件 + 一条注册表项。解压端可识别的格式：gzip、zlib、deflate、zstd、xz、lzma、lzip、bzip2、lz4、brotli、snappy、compress(.Z)、lzfse、lzvn。
+所有适配器共用一套接口（`src/codec/ac_*.c`），新增算法 = 一个适配器文件 + 一条注册表项。解压当前支持：gzip（多 member）、zlib、raw deflate、zstd、xz、lzma、lz4、brotli、snappy、lzfse、lzvn。lzip、bzip2、.Z（LZW）可识别，解码器在后续版本补齐。
 
 ## 决策是怎么做的
 

@@ -67,8 +67,12 @@ omnic list                       list codecs and recognized formats
 | brotli 1.2.1 | .br | 0..11 | |
 | snappy 1.3.1 | .snappy | 1..2 | official framing format (magic + CRC32C + 64 KB chunks) |
 | lzfse 1.0 | .lzfse | — | single speed point |
+| zlib-stream | .zlib | 0..9 | RFC 1950 wrapper, same zlib library |
+| raw-deflate | .zz | 0..9 | headerless deflate, recognized by extension |
+| lzma | .lzma | 0..9 | lzma-alone container, via liblzma |
+| lzvn | — | decode only | "bvn" streams, shares the lzfse block decoder |
 
-All adapters share one interface (`src/codec/ac_*.c`), so adding a codec is a single file plus a registry entry. Recognized-on-decompress formats: gzip, zlib, deflate, zstd, xz, lzma, lzip, bzip2, lz4, brotli, snappy, compress(.Z), lzfse, lzvn.
+All adapters share one interface (`src/codec/ac_*.c`), so adding a codec is a single file plus a registry entry. Decompression works today for: gzip (multi-member), zlib, raw deflate, zstd, xz, lzma, lz4, brotli, snappy, lzfse, lzvn. lzip, bzip2 and .Z (LZW) are recognized but their decoders land in a later release.
 
 ## How it picks
 
