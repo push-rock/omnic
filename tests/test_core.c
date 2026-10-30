@@ -168,7 +168,7 @@ static void test_policy(void) {
         }
     }
     const omnic_policy_entry *e = omnic_policy_lookup(OMNIC_CLS_TEXT, OMNIC_PROFILE_BEST_RATIO);
-    CHECK(e != NULL && strcmp(e->codec, "xz") == 0);
+    CHECK(e != NULL && strcmp(e->codec, "brotli") == 0);
     e = omnic_policy_lookup(OMNIC_CLS_ALREADY_COMPRESSED, OMNIC_PROFILE_BALANCED);
     CHECK(omnic_policy_is_skip(e));
     e = omnic_policy_lookup(OMNIC_CLS_TEXT, OMNIC_PROFILE_FAST_COMPRESS);

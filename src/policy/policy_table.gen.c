@@ -4,11 +4,11 @@
 #include "policy/policy.h"
 
 const omnic_policy_entry omnic_policy_entries[] = {
-    /* 文本/代码：快压 lz4(~620MB/s)；高压缩 xz -9(23.0%) */
+    /* 文本/代码：快压 lz4；高压缩 brotli -11（文本实测胜 xz -9，见表尾登记） */
     {OMNIC_CLS_TEXT, OMNIC_PROFILE_FAST_COMPRESS, "lz4", 0, "text: lz4 fast ~620MB/s"},
     {OMNIC_CLS_TEXT, OMNIC_PROFILE_FAST_DECOMPRESS, "zstd", 3, "text: zstd -3 decompress ~1.2GB/s"},
     {OMNIC_CLS_TEXT, OMNIC_PROFILE_BALANCED, "zstd", 8, "text: zstd -8 ratio 28.2%"},
-    {OMNIC_CLS_TEXT, OMNIC_PROFILE_BEST_RATIO, "xz", 9, "text: xz -9 ratio 23.0%"},
+    {OMNIC_CLS_TEXT, OMNIC_PROFILE_BEST_RATIO, "brotli", 11, "text: brotli -11 beats xz -9 ratio & decompress"},
 
     /* 可执行/对象：模式与文本接近 */
     {OMNIC_CLS_EXEC, OMNIC_PROFILE_FAST_COMPRESS, "lz4", 0, "exec: lz4 fast"},
@@ -45,4 +45,10 @@ const omnic_policy_entry omnic_policy_entries[] = {
     {OMNIC_CLS_UNKNOWN, OMNIC_PROFILE_BEST_RATIO, "zstd", 19, "unknown: zstd -19"},
 };
 
+/* 手动修改登记：
+ * 2026-10-30 TEXT/BEST_RATIO: xz -9 -> brotli -11。源码合集语料(6.7MB)实测：
+ * 压缩率 15.46% vs 15.55%，解压速度 ~3x；PE 二进制语料上 xz -9 仍占优
+ * (16.23% vs 16.64%)，故 EXEC/STRUCTURED 维持 xz。zlib/zlib-ng/libdeflate/
+ * snappy/lzfse 在全部 (类型×偏好) 组合均被 zstd/lz4 压制，不进自动选路，
+ * 保留 -c 手选，待训练管线复测。 */
 const size_t omnic_policy_entries_n = sizeof(omnic_policy_entries) / sizeof(omnic_policy_entries[0]);
