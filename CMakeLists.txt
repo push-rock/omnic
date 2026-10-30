@@ -244,9 +244,11 @@ add_executable(test_core tests/test_core.c)
 target_link_libraries(test_core PRIVATE omnic_core)
 add_test(NAME core COMMAND test_core)
 
-# TST-PERF-001 冒烟：小语料 3 轮中位 + 量级线（30%，CI 共享 runner 噪声大；
-# 能抓住适配层量级回归，紧验收线由本地正式跑数把关）
-add_test(NAME bench_smoke COMMAND omnic_bench --size 4 --rounds 3 --check 30)
+# TST-PERF-001 冒烟：16MB×3 轮中位 + 量级线（40%）。小语料下 reader/writer
+# 初始化等固定成本占比过高（mac 4MB 实测 zstd 低档虚高 ~18%），16MB 稀释到
+# 个位数；40% 线容纳 CI 共享 runner 抖动，专抓量级回归（如 read_all 翻倍类），
+# 紧验收线由本地正式跑数把关
+add_test(NAME bench_smoke COMMAND omnic_bench --size 16 --rounds 3 --check 40)
 
 # MinGW：全静态链接 runtime（libgcc/libstdc++/winpthread，snappy 引入 C++ 与
 # zstd MT 引入 pthread），保证单二进制分发（BUS-005）

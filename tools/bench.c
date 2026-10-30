@@ -9,6 +9,7 @@
  * decode-only codec 无压缩产物可比，不参与本基准。
  *
  * 用法：omnic_bench [--size MiB] [--rounds N] [--csv FILE] [--check pct]
+ *                   [--only name] [--corpus FILE]...
  *   --check：压缩与解压损耗全部 <= pct% 时退出 0，否则退出 1（CI 门禁用）。
  * 语料固定种子生成（混合文本/JSON/低熵/半随机/纯随机），结果可复现。
  */
@@ -493,6 +494,23 @@ static uint32_t b_crc32c(const uint8_t *p, size_t n) {
     while (n--) c = _mm_crc32_u8(c, *p++);
     return c ^ 0xFFFFFFFFu;
 }
+#elif defined(__aarch64__) && defined(__ARM_FEATURE_CRC32)
+#include <arm_acle.h>
+static uint32_t b_crc32c(const uint8_t *p, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    while (n >= 8) {
+        c = __crc32cd(c, *(const uint64_t *)p);
+        p += 8;
+        n -= 8;
+    }
+    if (n >= 4) {
+        c = __crc32cw(c, *(const uint32_t *)p);
+        p += 4;
+        n -= 4;
+    }
+    while (n--) c = __crc32cb(c, *p++);
+    return c ^ 0xFFFFFFFFu;
+}
 #else
 static uint32_t b_crc32c(const uint8_t *p, size_t n) {
     static uint32_t tbl[256];
@@ -668,23 +686,51 @@ int main(int argc, char **argv) {
     const char *csv_path = NULL;
     double check_pct = 0;
     const char *only = NULL;
+    const char *cfiles[64]; /* --corpus：真实语料文件（可多次出现，按序拼接） */
+    int ncfiles = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) mib = (size_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) rounds = atoi(argv[++i]);
         else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) csv_path = argv[++i];
         else if (strcmp(argv[i], "--check") == 0 && i + 1 < argc) check_pct = atof(argv[++i]);
         else if (strcmp(argv[i], "--only") == 0 && i + 1 < argc) only = argv[++i];
-        else die("usage: omnic_bench [--size MiB] [--rounds N] [--csv FILE] [--check pct] [--only name]");
+        else if (strcmp(argv[i], "--corpus") == 0 && i + 1 < argc) {
+            if (ncfiles >= (int)(sizeof(cfiles) / sizeof(cfiles[0]))) die("too many --corpus files");
+            cfiles[ncfiles++] = argv[++i];
+        }
+        else die("usage: omnic_bench [--size MiB] [--rounds N] [--csv FILE] [--check pct] [--only name] [--corpus FILE]...");
     }
     if (rounds < 1) rounds = 1;
     if (rounds > 3) rounds = 3;
 
-    size_t n = mib * 1024 * 1024;
-    uint8_t *corpus = (uint8_t *)xmalloc(n);
-    gen_corpus(corpus, n);
-    write_whole(SRC_FILE, corpus, n);
+    uint8_t *corpus;
+    size_t src_len;
+    if (ncfiles > 0) { /* 真实语料（如 Silesia 12 文件按名序拼接，口径等价 silesia.tar） */
+        size_t *lens = xmalloc((size_t)ncfiles * sizeof(size_t));
+        uint8_t **bufs = xmalloc((size_t)ncfiles * sizeof(uint8_t *));
+        size_t total = 0;
+        for (int i = 0; i < ncfiles; i++) {
+            bufs[i] = read_whole(cfiles[i], &lens[i]);
+            total += lens[i];
+        }
+        corpus = xmalloc(total);
+        size_t off = 0;
+        for (int i = 0; i < ncfiles; i++) {
+            memcpy(corpus + off, bufs[i], lens[i]);
+            off += lens[i];
+            free(bufs[i]);
+        }
+        free(bufs);
+        free(lens);
+        src_len = total;
+    } else { /* 合成语料：自包含、可复现，CI 冒烟用 */
+        size_t n = mib * 1024 * 1024;
+        corpus = xmalloc(n);
+        gen_corpus(corpus, n);
+        src_len = n;
+    }
+    write_whole(SRC_FILE, corpus, src_len);
     free(corpus);
-    size_t src_len = n;
 
     /* 注册表驱动的 codec 集合（按启用条件组装） */
     static const int lv_zstd[] = {-3, 1, 3, 6, 9, 12, 16, 19};
@@ -737,7 +783,8 @@ int main(int argc, char **argv) {
                 "dec_base_mbs,dec_adapt_mbs,dec_loss_pct\n");
     }
 
-    printf("omnic_bench: %zu MiB corpus, %d round(s) (median)\n", mib, rounds);
+    printf("omnic_bench: %s corpus (%.1f MiB), %d round(s) (median)\n",
+           ncfiles > 0 ? "file" : "synthetic", (double)src_len / 1048576.0, rounds);
     printf("%-12s %-12s %5s %7s %26s %26s\n", "codec", "format", "level", "ratio", "compress MB/s",
            "decompress MB/s");
     printf("%-12s %-12s %5s %7s %26s %26s\n", "", "", "", "", "base -> adapt (loss%)",

@@ -81,14 +81,14 @@ omnic list                     列出算法与支持的格式
 
 ![算法全景图](assets/bench.svg)
 
-各压缩器的"速度 × 压缩比"全景，走 omnic 流式适配层实测（32 MiB 混合语料，3 轮取中位）。随构建自带的工具可复现：
+各压缩器的"速度 × 压缩比"全景，走 omnic 流式适配层在 [Silesia 标准语料](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia)上实测（212 MiB、12 个真实文件；3 轮取中位）。随构建自带的工具可复现：
 
 ```
-omnic_bench --size 32 --rounds 3 --csv bench.csv
+omnic_bench --rounds 3 --csv bench.csv --corpus silesia/dickens --corpus silesia/mozilla ...（12 个文件）
 python tools/plot_bench.py bench.csv -o assets/bench
 ```
 
-`omnic_bench` 同时在同一份数据上对比"直连裸库"与"走适配层"的吞吐：**压缩损耗全算法 ≤2.3%，解压 ≤0.5%**（参考机：i7-12700、GCC 16.2 MinGW-w64；原始数据见 `assets/bench.csv`）。多数解压路径走 omnic 反而**更快**（+6~59%）：适配层的定长分块缓冲天然缓存友好，而一次性基线在比 L3 更大的缓冲间穿行。这份余量不是白来的——整块式 codec 的 seek 预估分配、小块格式的 1 MiB stdio 缓冲、snappy framing 的 CRC32C 硬件指令化（SSE4.2/ARM64）、lzfse 的块头预扫精确分配，四处优化各守一段。`ctest` 每次提交跑 30% 量级冒烟门禁（`bench_smoke`）；紧验收线由本地跑同一工具把关。
+`omnic_bench` 同时在同一份数据上对比"直连裸库"与"走适配层"的吞吐：**Silesia 上压缩损耗全算法 ≤0.8%、解压 ≤1.4%**（参考机：i7-12700、GCC 16.2 MinGW-w64；原始数据见 `assets/bench.csv`）。多数解压路径走 omnic 反而**更快**（最高 +60%：zstd 低档、lz4、snappy）：适配层的定长分块缓冲天然缓存友好，而一次性基线在比 L3 更大的缓冲间穿行。这份余量不是白来的——整块式 codec 的 seek 预估分配、小块格式的 1 MiB stdio 缓冲、snappy framing 的 CRC32C 硬件指令化（SSE4.2/ARM64）、lzfse 的块头预扫精确分配，四处优化各守一段。`ctest` 每次提交跑 40% 量级冒烟门禁（`bench_smoke`，合成语料——CI 自包含可复现）；紧验收线由本地跑同一工具把关。
 
 ## 决策是怎么做的
 
