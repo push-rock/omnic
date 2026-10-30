@@ -11,7 +11,7 @@ All codec libraries are vendored under `third_party/` with unmodified sources
 | third_party/zlib | https://github.com/madler/zlib | 1.3.2 | zlib |
 | third_party/zlib-ng | https://github.com/zlib-ng/zlib-ng | 2.3.3 | zlib |
 | third_party/libdeflate | https://github.com/ebiggers/libdeflate | 1.26 | MIT |
-| third_party/brotli | https://github.com/google/brotli | 1.2.0 | MIT |
+| third_party/brotli | https://github.com/google/brotli | 1.2.1 | MIT |
 | third_party/snappy | https://github.com/google/snappy | 1.3.1 | BSD-3-Clause |
 | third_party/lzfse | https://github.com/lzfse/lzfse | master (1.0) | Apple BSD-style |
 

@@ -10,7 +10,7 @@ report.json: zstd | balanced | text | level 8
     1048576 -> 91234 bytes (8.70%), 0.091s, 11.5 MB/s
 
 $ omnic c --profile best_ratio report.json
-report.json: xz | best_ratio | text | level 9
+report.json: brotli | best_ratio | text | level 11
     1048576 -> 61042 bytes (5.82%), 0.322s, 3.3 MB/s
 
 $ omnic d report.json.xz
@@ -64,7 +64,7 @@ omnic list                       list codecs and recognized formats
 | zlib 1.3.2 | .gz | 0..9 | streaming, multi-member gzip on decompress |
 | zlib-ng 2.3.3 | .gz | 0..9 | same format, faster implementation |
 | libdeflate 1.26 | .gz | 0..12 | whole-buffer API, highest gzip speed |
-| brotli 1.2.0 | .br | 0..11 | |
+| brotli 1.2.1 | .br | 0..11 | |
 | snappy 1.3.1 | .snappy | 1..2 | official framing format (magic + CRC32C + 64 KB chunks) |
 | lzfse 1.0 | .lzfse | — | single speed point |
 

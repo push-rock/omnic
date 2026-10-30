@@ -12,7 +12,7 @@ $items = @(
     @{ f = "zlib-ng-2.3.3.tar.gz";     u = @("https://github.com/zlib-ng/zlib-ng/archive/refs/tags/v2.3.3.tar.gz",
                                               "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/2.3.3.tar.gz") },
     @{ f = "libdeflate-1.26.tar.gz";   u = @("https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.26.tar.gz") },
-    @{ f = "brotli-1.2.0.tar.gz";      u = @("https://github.com/google/brotli/archive/refs/tags/v1.2.0.tar.gz",
+    @{ f = "brotli-1.2.1.tar.gz";      u = @("https://github.com/google/brotli/archive/refs/tags/v1.2.1.tar.gz",
                                               "https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz") },
     @{ f = "xz-5.8.4.tar.gz";          u = @("https://github.com/tukaani-project/xz/archive/refs/tags/v5.8.4.tar.gz") },
     @{ f = "snappy-1.3.1.tar.gz";     u = @("https://github.com/google/snappy/archive/refs/tags/1.3.1.tar.gz") },
