@@ -77,6 +77,19 @@ omnic list                       list codecs and recognized formats
 
 All adapters share one interface (`src/codec/ac_*.c`), so adding a codec is a single file plus a registry entry. Decompression covers all 14 formats: gzip (multi-member), zlib, raw deflate, zstd, xz, lzma, lzip, bzip2, lz4, brotli, snappy, compress (.Z), lzfse, lzvn — recognized by magic number first, extension as fallback.
 
+## Performance
+
+![codec landscape](assets/bench.svg)
+
+Speed vs ratio for the compressors, measured through omnic's streaming adapter layer (32 MiB mixed corpus, median of 3 rounds). Reproduce with the bundled tool:
+
+```
+omnic_bench --size 32 --rounds 3 --csv bench.csv
+python tools/plot_bench.py bench.csv -o assets/bench
+```
+
+`omnic_bench` also measures adapter overhead against direct library calls on the same data: every codec stays within **2.3% on compression and 0.5% on decompression** (reference: i7-12700, GCC 16.2 MinGW-w64; raw numbers in `assets/bench.csv`). Most decompression paths are actually *faster* through omnic (+6–59%): fixed-size chunk buffers stay cache-hot, while one-shot baselines stream through buffers larger than L3. That margin is not free — it comes from seek-based size preallocation for whole-buffer codecs, 1 MiB stdio buffering for small-chunk formats, hardware CRC32C (SSE4.2/ARM64) in the snappy framing, and a block-header pre-scan that sizes lzfse output exactly. `ctest` runs a 30% adapter-overhead smoke gate (`bench_smoke`) on every push; the tight thresholds are enforced by local runs of the same tool.
+
 ## How it picks
 
 The policy table is compiled in (`src/policy/policy_table.gen.c`), initialized from lzbench measurements, and regenerable from real data by the offline training pipeline (`tools/train`, Python: `bench.py` → CSV → `fit.py` → C table). Deciding is a table lookup — microseconds, no model runtime.

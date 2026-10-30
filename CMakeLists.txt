@@ -230,21 +230,33 @@ target_link_libraries(omnic_core PUBLIC $<$<PLATFORM_ID:Linux>:m>)
 add_executable(omnic src/cli/argp.c src/cli/main.c src/cli/report.c)
 target_link_libraries(omnic PRIVATE omnic_core)
 
+# ---- bench（A7 / TST-PERF-001：适配层损耗基准 + README 数据源） ----
+add_executable(omnic_bench tools/bench.c tools/bench_zng.c)
+target_link_libraries(omnic_bench PRIVATE omnic_core)
+target_compile_definitions(omnic_bench PRIVATE ${OMNIC_DEFS})
+if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
+  target_compile_options(omnic_bench PRIVATE -msse4.2) # 基线 CRC32C 与适配层同硬件路径
+endif()
+
 # ---- tests（SW-INF-004） ----
 enable_testing()
 add_executable(test_core tests/test_core.c)
 target_link_libraries(test_core PRIVATE omnic_core)
 add_test(NAME core COMMAND test_core)
 
+# TST-PERF-001 冒烟：小语料 3 轮中位 + 量级线（30%，CI 共享 runner 噪声大；
+# 能抓住适配层量级回归，紧验收线由本地正式跑数把关）
+add_test(NAME bench_smoke COMMAND omnic_bench --size 4 --rounds 3 --check 30)
+
 # MinGW：全静态链接 runtime（libgcc/libstdc++/winpthread，snappy 引入 C++ 与
 # zstd MT 引入 pthread），保证单二进制分发（BUS-005）
 if(WIN32 AND NOT MSVC)
-  foreach(_t omnic test_core)
+  foreach(_t omnic omnic_bench test_core)
     target_link_options(${_t} PRIVATE -static)
   endforeach()
 endif()
 
 # omnic 自身代码按严格 C11 编译（C_EXTENSIONS OFF）；第三方库走编译器默认（gnu 模式）
-foreach(_t omnic omnic_core test_core)
+foreach(_t omnic omnic_bench omnic_core test_core)
   set_target_properties(${_t} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 endforeach()

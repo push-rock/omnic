@@ -6,6 +6,8 @@
 /tools/gen_matrix.py
 .vscode/
 .idea/
+__pycache__/
+*.pyc
 *.o
 *.obj
 *.exe
