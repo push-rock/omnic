@@ -19,24 +19,7 @@
 
 #include "codec/codec.h"
 #include "core/blockio.h"
-#include "core/util.h"
-
-#ifdef _WIN32
-#include <windows.h>
-static double now_sec(void) {
-    LARGE_INTEGER c, f;
-    QueryPerformanceCounter(&c);
-    QueryPerformanceFrequency(&f);
-    return (double)c.QuadPart / (double)f.QuadPart;
-}
-#else
-#include <time.h>
-static double now_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
-#endif
+#include "core/util.h" /* omnic_now_sec：跨平台单调时钟（含 POSIX 功能宏处理） */
 
 /* ---- 库头（按启用 codec 条件引入，与 adapter 相同的头） ---- */
 #ifdef OMNIC_CODEC_ZSTD
@@ -626,7 +609,7 @@ typedef struct {
 /* 走适配层全路径：文件 -> ops -> 文件，返回耗时秒 */
 static double adapt_run(const omnic_codec_ops *ops, const char *in_path, const char *out_path, int lvl,
                         bool compress) {
-    double t0 = now_sec();
+    double t0 = omnic_now_sec();
     FILE *fin = fopen(in_path, "rb");
     FILE *fout = fopen(out_path, "wb");
     if (fin == NULL || fout == NULL) die("open %s", in_path);
@@ -639,13 +622,13 @@ static double adapt_run(const omnic_codec_ops *ops, const char *in_path, const c
     fclose(fin);
     fclose(fout);
     if (st != OMNIC_OK) die("adapt %s failed: %s", compress ? "compress" : "decompress", omnic_last_error());
-    return now_sec() - t0;
+    return omnic_now_sec() - t0;
 }
 
 /* 基线路径：读文件 -> 内存直调 -> 写文件，返回耗时秒与产物大小 */
 static double base_run(base_c_fn bc, base_d_fn bd, const char *in_path, const char *out_path, int lvl,
                        bool compress, size_t in_len, size_t *out_len) {
-    double t0 = now_sec();
+    double t0 = omnic_now_sec();
     size_t n;
     uint8_t *src = read_whole(in_path, &n);
     uint8_t *dst;
@@ -661,7 +644,7 @@ static double base_run(base_c_fn bc, base_d_fn bd, const char *in_path, const ch
     free(src);
     free(dst);
     *out_len = dn;
-    return now_sec() - t0;
+    return omnic_now_sec() - t0;
 }
 
 static double median3(double a, double b, double c) {
