@@ -44,6 +44,13 @@ static bool file_exists(const char *path) {
     return true;
 }
 
+/* Windows 的 rename() 不覆盖已存在目标（-f 已放行的覆盖场景）：先删后改名 */
+static omnic_status finalize_rename(const char *tmp_path, const char *out_path) {
+    if (rename(tmp_path, out_path) == 0) return OMNIC_OK;
+    remove(out_path);
+    return rename(tmp_path, out_path) == 0 ? OMNIC_OK : OMNIC_E_SYSTEM;
+}
+
 /* 采样+分类+决策（压缩路径 1-2 步，SYS-CMP-001/002）。 */
 typedef struct {
     omnic_class klass;
@@ -209,7 +216,7 @@ omnic_status omnic_run_compress(const char *path, const omnic_options *o, omnic_
         goto fail;
     }
     f.out_open = false;
-    if (rename(f.tmp_path, f.out_path) != 0) {
+    if (finalize_rename(f.tmp_path, f.out_path) != OMNIC_OK) {
         omnic_set_error("cannot finalize '%s': %s", f.out_path, strerror(errno));
         ret = OMNIC_E_SYSTEM;
         goto fail;
@@ -304,7 +311,7 @@ omnic_status omnic_run_decompress(const char *path, const omnic_options *o, omni
         goto fail;
     }
     f.out_open = false;
-    if (rename(f.tmp_path, f.out_path) != 0) {
+    if (finalize_rename(f.tmp_path, f.out_path) != OMNIC_OK) {
         omnic_set_error("cannot finalize '%s': %s", f.out_path, strerror(errno));
         ret = OMNIC_E_SYSTEM;
         goto fail;

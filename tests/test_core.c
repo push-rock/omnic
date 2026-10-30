@@ -49,6 +49,8 @@ static void cleanup_all(void) {
                            "omnic_test_rand.png.zst",
                            "omnic_test_rand",
                            "omnic_test_rand.zst",
+                           "omnic_test_bigz",
+                           "omnic_test_bigr",
                            "omnic_test_trunc.zst",
                            "omnic_test_trunc.gz",
                            "omnic_test_trunc.br",
@@ -101,6 +103,17 @@ static void make_random(const char *path, size_t n) {
     while (n > 0) {
         size_t c = n < sizeof(b) ? n : sizeof(b);
         for (size_t i = 0; i < c; i++) b[i] = (unsigned char)(rng() >> 16);
+        fwrite(b, 1, c, f);
+        n -= c;
+    }
+    fclose(f);
+}
+
+static void make_zeros(const char *path, size_t n) {
+    FILE *f = fopen(path, "wb");
+    unsigned char b[65536] = {0};
+    while (n > 0) {
+        size_t c = n < sizeof(b) ? n : sizeof(b);
         fwrite(b, 1, c, f);
         n -= c;
     }
@@ -210,6 +223,34 @@ static void test_roundtrip_full(const char *name) {
     rm(dst2);
     rm(out);
     free(out);
+}
+
+/* 大文件 roundtrip：可压缩内容 >4MB 时压缩产物 <4MB（单输入块）而解压跨输出
+ * flush——brotli 解码循环曾在该形态把输出满暂停误判为截断；随机 5MB 则令产物
+ * 超过输入块大小，覆盖解压多块喂入。 */
+static void test_big_roundtrip(const char *name) {
+    const omnic_codec_ops *ops = omnic_codec_find(name);
+    CHECK(ops != NULL);
+    if (ops == NULL) return;
+
+    const char *srcs[2] = {"omnic_test_bigz", "omnic_test_bigr"};
+    omnic_options o = def_opts();
+    o.codec = name;
+    o.flags |= OMNIC_F_FORCE; /* 随机数据默认跳过 */
+
+    for (int i = 0; i < 2; i++) {
+        omnic_report rep;
+        CHECK(omnic_compress(srcs[i], &o, &rep) == OMNIC_OK);
+        char *out = with_ext(srcs[i], ops->native_ext);
+        char dst2[64];
+        snprintf(dst2, sizeof dst2, "omnic_test_dst.%s", ops->native_ext);
+        CHECK(rename(out, dst2) == 0);
+        CHECK(omnic_decompress(dst2, &o, &rep) == OMNIC_OK);
+        CHECK(files_equal(srcs[i], "omnic_test_dst"));
+        rm("omnic_test_dst");
+        rm(dst2);
+        free(out);
+    }
 }
 
 static void test_auto_and_skip(void) {
@@ -416,9 +457,22 @@ int main(void) {
     test_empty_roundtrip();
     test_gzip_multimember();
     test_snappy_crc();
+    make_zeros("omnic_test_bigz", (4u << 20) + 700000); /* 解压跨 4MB 输出 flush */
+    make_random("omnic_test_bigr", 5u << 20);           /* 产物超 4MB 输入块 */
+    test_big_roundtrip("zstd");
+    test_big_roundtrip("lz4");
+    test_big_roundtrip("xz");
+    test_big_roundtrip("zlib");
+    test_big_roundtrip("zlib-ng");
+    test_big_roundtrip("libdeflate");
+    test_big_roundtrip("brotli");
+    test_big_roundtrip("snappy");
+    test_big_roundtrip("lzfse");
     rm(SRC);
     rm("omnic_test_rand.png");
     rm("omnic_test_rand.png.zst");
+    rm("omnic_test_bigz");
+    rm("omnic_test_bigr");
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

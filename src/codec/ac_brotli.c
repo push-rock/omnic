@@ -1,5 +1,7 @@
 /* brotli adapter：.br 原生流式编解码。格式无 magic，识别走后缀兜底。
- * 级别 0-11 为原生语义；LGWIN 固定 22（4MB 块下最优窗口）。 */
+ * 级别 0-11 为原生语义；LGWIN 固定 22（4MB 块下最优窗口）。
+ * 解压注意：输出填满会以 NEEDS_MORE_INPUT 暂停（而非 NEEDS_MORE_OUTPUT），
+ * 输入耗尽时必须先用新输出缓冲重调，仍无进展才判定截断。 */
 #include <stdlib.h>
 #include <string.h>
 #include <brotli/decode.h>
@@ -62,6 +64,7 @@ static omnic_status omnic_brotli_decompress(omnic_reader *in, omnic_writer *out)
     uint8_t *inbuf = (uint8_t *)malloc(BR_CHUNK);
     uint8_t *outbuf = (uint8_t *)malloc(BR_CHUNK);
     bool done = false;
+    bool input_eof = false;
     size_t avail_in = 0;
     const uint8_t *next_in = inbuf;
 
@@ -70,11 +73,14 @@ static omnic_status omnic_brotli_decompress(omnic_reader *in, omnic_writer *out)
         goto done;
     }
     for (;;) {
-        if (avail_in == 0) {
+        if (avail_in == 0 && !input_eof) {
             size_t n = omnic_reader_read(in, inbuf, BR_CHUNK);
-            if (n == 0) break; /* EOF */
-            avail_in = n;
-            next_in = inbuf;
+            if (n == 0) {
+                input_eof = true;
+            } else {
+                avail_in = n;
+                next_in = inbuf;
+            }
         }
         size_t avail_out = BR_CHUNK;
         uint8_t *next_out = outbuf;
@@ -91,7 +97,10 @@ static omnic_status omnic_brotli_decompress(omnic_reader *in, omnic_writer *out)
             ret = OMNIC_E_DATA;
             goto done;
         }
-        /* NEEDS_MORE_INPUT / NEEDS_MORE_OUTPUT：回到循环顶继续 */
+        /* 输入耗尽且无输入可读且本次有剩余输出空间仍报缺输入：真截断。
+         * 输出恰好填满时的暂停也报 NEEDS_MORE_INPUT——下一轮腾出输出
+         * 缓冲重调即可继续，不能在这里判定失败。 */
+        if (r == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT && input_eof && avail_in == 0 && avail_out > 0) break;
     }
     if (!done) ret = OMNIC_E_DATA; /* EOF 前未完成 = 截断 */
 done:
