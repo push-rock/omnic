@@ -71,8 +71,11 @@ omnic list                     列出算法与支持的格式
 | raw-deflate | .zz | 0..9 | 无头 deflate 流，后缀识别 |
 | lzma | .lzma | 0..9 | lzma-alone 容器，走 liblzma |
 | lzvn | — | 仅解码 | "bvn" 流，与 lzfse 共用块解码器 |
+| lzip | .lz | 仅解码 | lzip 容器（v0/v1），走 liblzma，多 member |
+| bzip2 1.0.8 | .bz2 | 仅解码 | vendored 解码半边，串接流 |
+| compress | .Z | 仅解码 | LZW（ncompress 语义），自研解码器 |
 
-所有适配器共用一套接口（`src/codec/ac_*.c`），新增算法 = 一个适配器文件 + 一条注册表项。解压当前支持：gzip（多 member）、zlib、raw deflate、zstd、xz、lzma、lz4、brotli、snappy、lzfse、lzvn。lzip、bzip2、.Z（LZW）可识别，解码器在后续版本补齐。
+所有适配器共用一套接口（`src/codec/ac_*.c`），新增算法 = 一个适配器文件 + 一条注册表项。解压覆盖全部 14 种格式：gzip（多 member）、zlib、raw deflate、zstd、xz、lzma、lzip、bzip2、lz4、brotli、snappy、compress（.Z）、lzfse、lzvn——魔数优先识别，后缀兜底。
 
 ## 决策是怎么做的
 

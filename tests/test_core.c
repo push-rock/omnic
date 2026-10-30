@@ -70,6 +70,14 @@ static void cleanup_all(void) {
                            "omnic_test_lzvn.lzvn",
                            "omnic_test_lzvn",
                            "omnic_test_lzvn_ref",
+                           "omnic_test_lz.lz",
+                           "omnic_test_lz",
+                           "omnic_test_corpus.lz",
+                           "omnic_test_corpus",
+                           "omnic_test_bz.bz2",
+                           "omnic_test_bz",
+                           "omnic_test_z.Z",
+                           "omnic_test_z",
                            "omnic_test_trunc",
                            "omnic_test_empty",
                            "omnic_test_mm1.gz",
@@ -159,6 +167,21 @@ static int files_equal(const char *a, const char *b) {
 
 static void rm(const char *p) { remove(p); }
 
+static int copy_file(const char *src, const char *dst) {
+    FILE *a = fopen(src, "rb"), *b = fopen(dst, "wb");
+    if (a == NULL || b == NULL) {
+        if (a) fclose(a);
+        if (b) fclose(b);
+        return -1;
+    }
+    char buf[65536];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), a)) > 0) fwrite(buf, 1, n, b);
+    fclose(a);
+    fclose(b);
+    return 0;
+}
+
 static omnic_options def_opts(void) {
     /* 测试统一保留源文件（压缩成功默认删源，假设 A8） */
     omnic_options o = {OMNIC_PROFILE_BALANCED, NULL, 0, 0, OMNIC_F_KEEP, NULL};
@@ -214,7 +237,7 @@ static void test_detect(void) {
 }
 
 /* 完整流程：compress -> 解压到独立文件，比较内容（避免与 SRC 同名冲突）。
- * 产物改名为 omnic_test_dst.<ext>：无 magic 的 codec（brotli/raw-deflate 族）
+ * 产物改名 omnic_test_dst.<ext>：无 magic 的 codec（brotli/raw-deflate 族）
  * 解压识别依赖后缀兜底，不能统一改成 .tmp。 */
 static void test_roundtrip_full(const char *name) {
     const omnic_codec_ops *ops = omnic_codec_find(name);
@@ -306,7 +329,7 @@ static void test_auto_and_skip(void) {
 }
 
 /* 截断检测（SYS-DEC-003 子集）：截去尾部 10 字节——必然落在最后一个
- * chunk/帧内部。不用"截一半"是避免 snappy framing 在 chunk 边界截断
+ * chunk/帧内部。统一截 10 字节是为了避开 snappy framing 的 chunk 边界截断
  * 形成合法短流（解压会成功前缀部分而非报错）。 */
 static void test_truncated(const char *name) {
     omnic_options o = def_opts();
@@ -419,7 +442,7 @@ static void test_gzip_multimember(void) {
 }
 
 /* snappy framing 的 CRC 路径：翻转首个 chunk 的存储 CRC（数据本身完好），
- * 必须被 framing 层校验拦下而非依赖 snappy 解码失败 */
+ * 必须由 framing 层校验拦下而非依赖 snappy 解码失败 */
 static void test_snappy_crc(void) {
     const omnic_codec_ops *ops = omnic_codec_find("snappy");
     CHECK(ops != NULL);
@@ -451,7 +474,7 @@ static void test_snappy_crc(void) {
 
 /* ---- lzvn 解码路径（需求 4.4）----
  * 上游无公开工具产出该格式，测试手工构造首块为 bvxn 的 lzfse 流：
- * 块头三 uint32 小端（bvxn 魔数 + n_raw + n_payload）+ lzvn 载荷 + bvx$ 终止块。
+ * 块头为 uint32 小端（bvxn 魔数 + n_raw + n_payload），lzvn 载荷 + bvx$ 终止块，
  * 载荷由 lzfse 库内的 lzvn 编码器产出（自带流结束标记），声明见下。 */
 size_t lzvn_encode_scratch_size(void);
 size_t lzvn_encode_buffer(void *dst, size_t dst_size, const void *src, size_t src_size,
@@ -565,6 +588,401 @@ done:
     free(work);
 }
 
+/* lzip（需求 4.4）：内嵌 blob 验证内容与截断（blob = "omnic lzip embedded
+ * test payload\n" x100 的 .lz v1 封装，dict 2^16）；外加 vendored xz 自带
+ * 官方 .lz 语料全量回归（good 8 个全过 / bad+unsupported 10 个全拒，
+ * 语义与 xz -dc 对齐）。语料不存在时跳过该段（防非常规构建布局）。 */
+static void test_lzip_decode(void) {
+    static const uint8_t blob[] = {
+        76, 90, 73, 80, 1, 16, 0, 55, 155, 74, 29, 94, 104, 211, 11, 58, 125, 185, 252, 246,
+        74, 56, 162, 230, 115, 234, 185, 188, 175, 91, 252, 244, 135, 251, 126, 45, 108, 152,
+        201, 63, 0, 39, 136, 253, 224, 215, 86, 152, 102, 72, 229, 90, 216, 72, 39, 148, 171,
+        44, 190, 234, 239, 8, 255, 254, 158, 4, 0, 45, 207, 166, 69, 228, 12, 0, 0, 0, 0, 0,
+        0, 87, 0, 0, 0, 0, 0, 0, 0};
+    static const char pattern[] = "omnic lzip embedded test payload\n"; /* 33 字节 */
+    enum { PAYLOAD = 3300 };
+
+    FILE *f = fopen("omnic_test_lz.lz", "wb");
+    CHECK(f != NULL);
+    if (f != NULL) {
+        fwrite(blob, 1, sizeof(blob), f);
+        fclose(f);
+    }
+    {
+        omnic_options o = def_opts();
+        omnic_report rep;
+        CHECK(omnic_decompress("omnic_test_lz.lz", &o, &rep) == OMNIC_OK);
+        FILE *r = fopen("omnic_test_lz", "rb");
+        CHECK(r != NULL);
+        if (r != NULL) {
+            uint8_t *out = (uint8_t *)malloc(PAYLOAD);
+            CHECK(out != NULL);
+            if (out != NULL) {
+                int ok = (fread(out, 1, PAYLOAD, r) == PAYLOAD);
+                for (int i = 0; ok && i < 100; i++)
+                    if (memcmp(out + i * 33, pattern, 33) != 0) ok = 0;
+                CHECK(ok && fgetc(r) == EOF);
+                free(out);
+            }
+            fclose(r);
+        }
+    }
+    rm("omnic_test_lz"); /* 截断用例重用同一输出名 */
+    /* 截断 10 字节：咬掉 trailer 的 CRC/尺寸域，必须 E_DATA */
+    f = fopen("omnic_test_lz.lz", "wb");
+    CHECK(f != NULL);
+    if (f != NULL) {
+        fwrite(blob, 1, sizeof(blob) - 10, f);
+        fclose(f);
+    }
+    {
+        omnic_options o = def_opts();
+        omnic_report rep;
+        CHECK(omnic_decompress("omnic_test_lz.lz", &o, &rep) == OMNIC_E_DATA);
+    }
+    rm("omnic_test_lz.lz");
+    rm("omnic_test_lz");
+
+    static const char *good[] = {"good-1-v0.lz",
+                                 "good-1-v0-trailing-1.lz",
+                                 "good-1-v1.lz",
+                                 "good-1-v1-trailing-1.lz",
+                                 "good-1-v1-trailing-2.lz",
+                                 "good-2-v0-v1.lz",
+                                 "good-2-v1-v0.lz",
+                                 "good-2-v1-v1.lz",
+                                 NULL};
+    static const char *bad[] = {"bad-1-v0-uncomp-size.lz", "bad-1-v1-crc32.lz", "bad-1-v1-dict-1.lz",
+                               "bad-1-v1-dict-2.lz",      "bad-1-v1-magic-1.lz", "bad-1-v1-magic-2.lz",
+                               "bad-1-v1-member-size.lz", "bad-1-v1-trailing-magic.lz",
+                               "bad-1-v1-uncomp-size.lz", "unsupported-1-v234.lz", NULL};
+    const char *dir = "../third_party/xz/tests/files/";
+    char path[256];
+    snprintf(path, sizeof path, "%s%s", dir, good[0]);
+    FILE *probe = fopen(path, "rb");
+    if (probe == NULL) {
+        printf("note: lzip corpus not found, skip corpus checks\n");
+        return;
+    }
+    fclose(probe);
+    /* 语料先拷到工作目录再解压，避免输出落进 third_party */
+    for (int i = 0; good[i] != NULL; i++) {
+        omnic_options o = def_opts();
+        omnic_report rep;
+        snprintf(path, sizeof path, "%s%s", dir, good[i]);
+        CHECK(copy_file(path, "omnic_test_corpus.lz") == 0);
+        CHECK(omnic_decompress("omnic_test_corpus.lz", &o, &rep) == OMNIC_OK);
+        rm("omnic_test_corpus");
+    }
+    /* 两 member 内容拼接：good-2-v1-v1 = "Hello\n" + "World!\n" */
+    {
+        omnic_options o = def_opts();
+        omnic_report rep;
+        snprintf(path, sizeof path, "%sgood-2-v1-v1.lz", dir);
+        CHECK(copy_file(path, "omnic_test_corpus.lz") == 0);
+        CHECK(omnic_decompress("omnic_test_corpus.lz", &o, &rep) == OMNIC_OK);
+        FILE *r = fopen("omnic_test_corpus", "rb");
+        CHECK(r != NULL);
+        if (r != NULL) {
+            char buf[16];
+            size_t n = fread(buf, 1, sizeof(buf), r);
+            CHECK(n == 13 && memcmp(buf, "Hello\nWorld!\n", 13) == 0);
+            fclose(r);
+        }
+        rm("omnic_test_corpus");
+    }
+    for (int i = 0; bad[i] != NULL; i++) {
+        omnic_options o = def_opts();
+        omnic_report rep;
+        snprintf(path, sizeof path, "%s%s", dir, bad[i]);
+        CHECK(copy_file(path, "omnic_test_corpus.lz") == 0);
+        CHECK(omnic_decompress("omnic_test_corpus.lz", &o, &rep) == OMNIC_E_DATA);
+        rm("omnic_test_corpus");
+    }
+    rm("omnic_test_corpus.lz");
+}
+
+/* bzip2（需求 4.4）：嵌入流由 Python bz2（libbzip2 参考实现）产出——
+ * 小流内容校验、串接流（cat 两流）、5MB 零填充跨 4MB 输出块、截断拒收。 */
+static void test_bzip2_decode(void) {
+    static const uint8_t blob_a[] = {
+        66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 147, 29, 173, 234, 0, 10, 139, 217, 128, 0, 16,
+        64, 0, 16, 0, 62, 39, 204, 48, 48, 0, 216, 5, 52, 200, 196, 196, 196, 41, 166, 70, 38, 38,
+        32, 82, 170, 6, 70, 158, 154, 155, 83, 97, 22, 194, 47, 34, 47, 194, 47, 2, 44, 136, 178,
+        34, 236, 34, 228, 69, 236, 69, 129, 23, 2, 44, 4, 91, 132, 88, 17, 122, 17, 124, 17, 100,
+        69, 161, 22, 132, 91, 136, 176, 34, 250, 34, 232, 69, 208, 139, 145, 23, 2, 45, 132, 90,
+        17, 119, 17, 100, 69, 200, 139, 248, 187, 146, 41, 194, 132, 132, 152, 237, 111, 80};
+    static const uint8_t blob_z[] = {
+        66, 90, 104, 57, 49, 65, 89, 38, 83, 89, 174, 205, 220, 147, 0, 40, 40, 68, 0, 192, 0, 0, 4,
+        0, 8, 32, 0, 48, 204, 5, 41, 166, 9, 2, 108, 66, 64, 158, 46, 228, 138, 112, 161, 33, 93,
+        155, 185, 38};
+    static const char pattern[] = "omnic bzip2 embedded test payload\n"; /* 34 字节 */
+    enum { A_PAYLOAD = 6800, Z_PAYLOAD = 5 * 1024 * 1024 };
+    omnic_options o = def_opts();
+    omnic_report rep;
+
+    /* 单流内容 */
+    {
+        FILE *f = fopen("omnic_test_bz.bz2", "wb");
+        CHECK(f != NULL);
+        if (f != NULL) {
+            fwrite(blob_a, 1, sizeof(blob_a), f);
+            fclose(f);
+        }
+        CHECK(omnic_decompress("omnic_test_bz.bz2", &o, &rep) == OMNIC_OK);
+        FILE *r = fopen("omnic_test_bz", "rb");
+        CHECK(r != NULL);
+        if (r != NULL) {
+            uint8_t *out = (uint8_t *)malloc(A_PAYLOAD);
+            CHECK(out != NULL);
+            if (out != NULL) {
+                int ok = (fread(out, 1, A_PAYLOAD, r) == A_PAYLOAD);
+                for (int i = 0; ok && i < 200; i++)
+                    if (memcmp(out + i * 34, pattern, 34) != 0) ok = 0;
+                CHECK(ok && fgetc(r) == EOF);
+                free(out);
+            }
+            fclose(r);
+        }
+        rm("omnic_test_bz");
+    }
+    /* 串接流：同一小流两份 */
+    {
+        FILE *f = fopen("omnic_test_bz.bz2", "wb");
+        CHECK(f != NULL);
+        if (f != NULL) {
+            fwrite(blob_a, 1, sizeof(blob_a), f);
+            fwrite(blob_a, 1, sizeof(blob_a), f);
+            fclose(f);
+        }
+        CHECK(omnic_decompress("omnic_test_bz.bz2", &o, &rep) == OMNIC_OK);
+        FILE *r = fopen("omnic_test_bz", "rb");
+        CHECK(r != NULL);
+        if (r != NULL) {
+            uint8_t *out = (uint8_t *)malloc(2 * A_PAYLOAD);
+            CHECK(out != NULL);
+            if (out != NULL) {
+                int ok = (fread(out, 1, 2 * A_PAYLOAD, r) == 2 * A_PAYLOAD);
+                for (int i = 0; ok && i < 400; i++)
+                    if (memcmp(out + i * 34, pattern, 34) != 0) ok = 0;
+                CHECK(ok && fgetc(r) == EOF);
+                free(out);
+            }
+            fclose(r);
+        }
+        rm("omnic_test_bz");
+    }
+    /* 5MB 零填充：解码输出跨 4MB flush 边界 */
+    {
+        FILE *f = fopen("omnic_test_bz.bz2", "wb");
+        CHECK(f != NULL);
+        if (f != NULL) {
+            fwrite(blob_z, 1, sizeof(blob_z), f);
+            fclose(f);
+        }
+        CHECK(omnic_decompress("omnic_test_bz.bz2", &o, &rep) == OMNIC_OK);
+        FILE *r = fopen("omnic_test_bz", "rb");
+        CHECK(r != NULL);
+        if (r != NULL) {
+            size_t left = Z_PAYLOAD;
+            int ok = 1;
+            uint8_t *buf = (uint8_t *)malloc(65536);
+            CHECK(buf != NULL);
+            if (buf != NULL) {
+                while (left > 0) {
+                    size_t c = left < 65536 ? left : 65536;
+                    if (fread(buf, 1, c, r) != c) {
+                        ok = 0;
+                        break;
+                    }
+                    for (size_t i = 0; i < c; i++)
+                        if (buf[i] != 0) {
+                            ok = 0;
+                            break;
+                        }
+                    left -= c;
+                }
+                CHECK(ok && fgetc(r) == EOF);
+                free(buf);
+            }
+            fclose(r);
+        }
+        rm("omnic_test_bz");
+    }
+    /* 截断 10 字节：拒收 */
+    {
+        FILE *f = fopen("omnic_test_bz.bz2", "wb");
+        CHECK(f != NULL);
+        if (f != NULL) {
+            fwrite(blob_a, 1, sizeof(blob_a) - 10, f);
+            fclose(f);
+        }
+        CHECK(omnic_decompress("omnic_test_bz.bz2", &o, &rep) == OMNIC_E_DATA);
+    }
+    rm("omnic_test_bz.bz2");
+    rm("omnic_test_bz");
+}
+
+/* compress(.Z)（需求 4.4）：fixtures 由 ncompress 5.0 生成（见 tests/files/
+ * README.md）。文本档验证内容与升宽路径；随机档验证表满 + CLEAR；零填充档
+ * 验证升宽至 16 位与跨 4MB 输出。格式无校验和：截断只能解出前缀（上游
+ * uncompress 同行为），测试如实断言该语义。 */
+static void test_compressz_decode(void) {
+    const char *dir = "../tests/files/";
+    omnic_options o = def_opts();
+    omnic_report rep;
+    char path[256];
+
+    snprintf(path, sizeof path, "%s%s", dir, "z_text.Z");
+    FILE *probe = fopen(path, "rb");
+    if (probe == NULL) {
+        printf("note: .Z fixtures not found, skip\n");
+        return;
+    }
+    fclose(probe);
+
+    /* 文本档：期望内容 = 模式行 x 400（行号递增，C 侧重构） */
+    enum { ZTEXT = 400 * 45 };
+    char *expect = (char *)malloc(ZTEXT);
+    CHECK(expect != NULL);
+    if (expect != NULL) {
+        int off = 0;
+        for (int i = 0; i < 400; i++)
+            off += sprintf(expect + off, "omnic compress .Z fixture payload line %05d\n", i);
+        CHECK(off == ZTEXT);
+
+        snprintf(path, sizeof path, "%s%s", dir, "z_text.Z");
+        CHECK(copy_file(path, "omnic_test_z.Z") == 0);
+        CHECK(omnic_decompress("omnic_test_z.Z", &o, &rep) == OMNIC_OK);
+        {
+            FILE *r = fopen("omnic_test_z", "rb");
+            CHECK(r != NULL);
+            if (r != NULL) {
+                char *got = (char *)malloc(ZTEXT);
+                CHECK(got != NULL);
+                if (got != NULL) {
+                    CHECK(fread(got, 1, ZTEXT, r) == ZTEXT && memcmp(got, expect, ZTEXT) == 0);
+                    CHECK(fgetc(r) == EOF);
+                    free(got);
+                }
+                fclose(r);
+            }
+        }
+
+        /* 截断 10 字节：无校验和格式只能解出前缀（omnic 返回 OK 属实然语义） */
+        {
+            FILE *src = fopen(path, "rb");
+            CHECK(src != NULL);
+            if (src != NULL) {
+                uint8_t buf[8192];
+                size_t n = fread(buf, 1, sizeof(buf), src);
+                fclose(src);
+                CHECK(n == 2126);
+                FILE *t = fopen("omnic_test_z.Z", "wb");
+                CHECK(t != NULL);
+                if (t != NULL) {
+                    fwrite(buf, 1, n - 10, t);
+                    fclose(t);
+                }
+            }
+            rm("omnic_test_z"); /* 重用输出名，先清残留 */
+            CHECK(omnic_decompress("omnic_test_z.Z", &o, &rep) == OMNIC_OK);
+            FILE *r = fopen("omnic_test_z", "rb");
+            CHECK(r != NULL);
+            if (r != NULL) {
+                char *got = (char *)malloc(ZTEXT);
+                CHECK(got != NULL);
+                if (got != NULL) {
+                    size_t got_n = fread(got, 1, ZTEXT, r);
+                    CHECK(got_n > 0 && got_n < ZTEXT && fgetc(r) == EOF);
+                    CHECK(memcmp(got, expect, got_n) == 0); /* 严格前缀 */
+                    free(got);
+                }
+                fclose(r);
+            }
+        }
+        free(expect);
+    }
+
+    /* 随机档（-b 10）：表满 + CLEAR 路径 */
+    {
+        snprintf(path, sizeof path, "%s%s", dir, "z_rand10.Z");
+        CHECK(copy_file(path, "omnic_test_z.Z") == 0);
+        rm("omnic_test_z");
+        CHECK(omnic_decompress("omnic_test_z.Z", &o, &rep) == OMNIC_OK);
+        snprintf(path, sizeof path, "%s%s", dir, "z_rand10.expected");
+        CHECK(files_equal("omnic_test_z", path));
+    }
+
+    /* 零填充档（-b 16）：升宽至 16 位 + 输出跨 4MB flush 边界 */
+    {
+        snprintf(path, sizeof path, "%s%s", dir, "z_zeros.Z");
+        CHECK(copy_file(path, "omnic_test_z.Z") == 0);
+        rm("omnic_test_z");
+        CHECK(omnic_decompress("omnic_test_z.Z", &o, &rep) == OMNIC_OK);
+        FILE *r = fopen("omnic_test_z", "rb");
+        CHECK(r != NULL);
+        if (r != NULL) {
+            enum { ZBYTES = 5 * 1024 * 1024 };
+            uint8_t *buf = (uint8_t *)malloc(65536);
+            CHECK(buf != NULL);
+            size_t left = ZBYTES;
+            int ok = 1;
+            if (buf != NULL) {
+                while (left > 0) {
+                    size_t c = left < 65536 ? left : 65536;
+                    if (fread(buf, 1, c, r) != c) {
+                        ok = 0;
+                        break;
+                    }
+                    for (size_t i = 0; i < c; i++)
+                        if (buf[i] != 0) {
+                            ok = 0;
+                            break;
+                        }
+                    left -= c;
+                }
+                CHECK(ok && fgetc(r) == EOF);
+                free(buf);
+            }
+            fclose(r);
+        }
+    }
+
+    /* 空 .Z（仅 3 字节头）-> 空输出；坏 flags（bits 5-6 置位）-> E_DATA */
+    {
+        static const uint8_t empty_z[] = {0x1F, 0x9D, 0x8C};
+        FILE *f = fopen("omnic_test_z.Z", "wb");
+        CHECK(f != NULL);
+        if (f != NULL) {
+            fwrite(empty_z, 1, 3, f);
+            fclose(f);
+        }
+        rm("omnic_test_z");
+        CHECK(omnic_decompress("omnic_test_z.Z", &o, &rep) == OMNIC_OK);
+        {
+            FILE *r = fopen("omnic_test_z", "rb");
+            CHECK(r != NULL);
+            if (r != NULL) {
+                CHECK(fgetc(r) == EOF);
+                fclose(r);
+            }
+        }
+        rm("omnic_test_z");
+        f = fopen("omnic_test_z.Z", "wb");
+        CHECK(f != NULL);
+        if (f != NULL) {
+            uint8_t bad = 0xEC;
+            fwrite(empty_z, 1, 2, f);
+            fwrite(&bad, 1, 1, f);
+            fclose(f);
+        }
+        CHECK(omnic_decompress("omnic_test_z.Z", &o, &rep) == OMNIC_E_DATA);
+    }
+    rm("omnic_test_z.Z");
+    rm("omnic_test_z");
+}
+
 /* DoD #6（SYS-CMP-002）：决策延迟——4MB 特征提取 + 分类查表 ≤ 50ms（不含磁盘 I/O）。
  * Windows CRT 的 clock() 粒度 ~15ms，单次几毫秒测不出，跑多轮取平均。 */
 static void test_decision_latency(void) {
@@ -621,6 +1039,9 @@ int main(void) {
     test_gzip_multimember();
     test_snappy_crc();
     test_lzvn_decode();
+    test_lzip_decode();
+    test_bzip2_decode();
+    test_compressz_decode();
     test_decision_latency();
     make_zeros("omnic_test_bigz", (4u << 20) + 700000); /* 解压跨 4MB 输出 flush */
     make_random("omnic_test_bigr", 5u << 20);           /* 产物超 4MB 输入块 */

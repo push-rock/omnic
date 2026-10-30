@@ -71,8 +71,11 @@ omnic list                       list codecs and recognized formats
 | raw-deflate | .zz | 0..9 | headerless deflate, recognized by extension |
 | lzma | .lzma | 0..9 | lzma-alone container, via liblzma |
 | lzvn | — | decode only | "bvn" streams, shares the lzfse block decoder |
+| lzip | .lz | decode only | lzip container (v0/v1), via liblzma, multi-member |
+| bzip2 1.0.8 | .bz2 | decode only | vendored decode half, concatenated streams |
+| compress | .Z | decode only | LZW, ncompress semantics, self-contained decoder |
 
-All adapters share one interface (`src/codec/ac_*.c`), so adding a codec is a single file plus a registry entry. Decompression works today for: gzip (multi-member), zlib, raw deflate, zstd, xz, lzma, lz4, brotli, snappy, lzfse, lzvn. lzip, bzip2 and .Z (LZW) are recognized but their decoders land in a later release.
+All adapters share one interface (`src/codec/ac_*.c`), so adding a codec is a single file plus a registry entry. Decompression covers all 14 formats: gzip (multi-member), zlib, raw deflate, zstd, xz, lzma, lzip, bzip2, lz4, brotli, snappy, compress (.Z), lzfse, lzvn — recognized by magic number first, extension as fallback.
 
 ## How it picks
 

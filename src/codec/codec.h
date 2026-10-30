@@ -32,6 +32,7 @@ extern const omnic_codec_ops omnic_codec_lz4;
 #ifdef OMNIC_CODEC_XZ
 extern const omnic_codec_ops omnic_codec_xz;
 extern const omnic_codec_ops omnic_codec_lzma; /* lzma alone（.lzma） */
+extern const omnic_codec_ops omnic_codec_lzip; /* lzip 容器（.lz），仅解码 */
 #endif
 #ifdef OMNIC_CODEC_ZLIB
 extern const omnic_codec_ops omnic_codec_zlib;
@@ -53,6 +54,12 @@ extern const omnic_codec_ops omnic_codec_snappy;
 #ifdef OMNIC_CODEC_LZFSE
 extern const omnic_codec_ops omnic_codec_lzfse;
 extern const omnic_codec_ops omnic_codec_lzvn; /* lzvn（解码与 lzfse 同路） */
+#endif
+#ifdef OMNIC_CODEC_BZIP2
+extern const omnic_codec_ops omnic_codec_bzip2; /* bzip2（vendored 解码半边） */
+#endif
+#ifdef OMNIC_CODEC_COMPRESSZ
+extern const omnic_codec_ops omnic_codec_compressz; /* compress(.Z)（自研 LZW 解码） */
 #endif
 
 /* codec_util.c：整块式 API（libdeflate/lzfse 等）的适配辅助 */

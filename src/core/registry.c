@@ -18,6 +18,10 @@ static const omnic_codec_ops *const g_codecs[] = {
 #ifdef OMNIC_CODEC_XZ
     &omnic_codec_lzma,
 #endif
+    /* lzip：容器解析在 liblzma 的 lzip decoder 内，仅解码 */
+#ifdef OMNIC_CODEC_XZ
+    &omnic_codec_lzip,
+#endif
     /* gzip 格式的解压入口取注册顺序第一个：zlib 的 inflate 是最标准的实现，
      * zlib-ng / libdeflate 产出同格式流但各自保留 decompress 能力。 */
 #ifdef OMNIC_CODEC_ZLIB
@@ -46,6 +50,14 @@ static const omnic_codec_ops *const g_codecs[] = {
     /* lzvn：bvn 前缀流 = 首块为 LZVN 块的 lzfse 流，解码同路 */
 #ifdef OMNIC_CODEC_LZFSE
     &omnic_codec_lzvn,
+#endif
+    /* bzip2：vendored 1.0.8 解码半边，串接流支持 */
+#ifdef OMNIC_CODEC_BZIP2
+    &omnic_codec_bzip2,
+#endif
+    /* compress(.Z)：自研 LZW 解码器，语义对齐 ncompress */
+#ifdef OMNIC_CODEC_COMPRESSZ
+    &omnic_codec_compressz,
 #endif
 };
 

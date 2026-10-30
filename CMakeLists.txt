@@ -25,6 +25,8 @@ option(OMNIC_CODEC_LIBDEFLATE "Enable libdeflate codec" ON)
 option(OMNIC_CODEC_BROTLI "Enable brotli codec" ON)
 option(OMNIC_CODEC_SNAPPY "Enable snappy codec" ON)
 option(OMNIC_CODEC_LZFSE "Enable lzfse codec" ON)
+option(OMNIC_CODEC_BZIP2 "Enable bzip2 decompression" ON)
+option(OMNIC_CODEC_COMPRESSZ "Enable compress(.Z) decompression" ON)
 
 # 关闭所有第三方子项目的测试注册（zlib-ng/xz 等会 include(CTest)），
 # 不影响我们自己的 add_test
@@ -113,6 +115,17 @@ if(OMNIC_CODEC_LZFSE)
   target_include_directories(lzfse_static PUBLIC third_party/lzfse-heads-master/src)
 endif()
 
+if(OMNIC_CODEC_BZIP2)
+  # bzip2 1.0.8 仅集成解码半边（bzlib_dec.c 为上游 bzlib.c 的裁剪，见文件头）
+  add_library(bzip2dec STATIC
+    third_party/bzip2/bzlib_dec.c
+    third_party/bzip2/decompress.c
+    third_party/bzip2/huffman.c
+    third_party/bzip2/crctable.c
+    third_party/bzip2/randtable.c)
+  target_include_directories(bzip2dec PUBLIC third_party/bzip2)
+endif()
+
 # ---- libomnic（INT-LIB-001） ----
 set(OMNIC_SRC
   src/core/api.c
@@ -174,6 +187,16 @@ if(OMNIC_CODEC_LZFSE)
   list(APPEND OMNIC_SRC src/codec/ac_lzfse.c)
   list(APPEND OMNIC_DEFS OMNIC_CODEC_LZFSE)
   list(APPEND OMNIC_LIBS lzfse_static)
+endif()
+if(OMNIC_CODEC_BZIP2)
+  list(APPEND OMNIC_SRC src/codec/ac_bzip2.c)
+  list(APPEND OMNIC_DEFS OMNIC_CODEC_BZIP2)
+  list(APPEND OMNIC_LIBS bzip2dec)
+endif()
+if(OMNIC_CODEC_COMPRESSZ)
+  # .Z 解码器自研（语义对齐 ncompress 5.0），无第三方库依赖
+  list(APPEND OMNIC_SRC src/codec/ac_compressz.c)
+  list(APPEND OMNIC_DEFS OMNIC_CODEC_COMPRESSZ)
 endif()
 
 add_library(omnic_core STATIC ${OMNIC_SRC})
