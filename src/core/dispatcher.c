@@ -61,6 +61,12 @@ typedef struct {
     double entropy;
     omnic_features feats;
     const omnic_policy_entry *pe;
+    omnic_policy_entry override; /* 试压胜者的表行副本（pe 指向它时生效） */
+    char reason_buf[96];         /* override.reason 的可写缓冲 */
+    uint8_t *seg_base;           /* 三段采样缓冲（决策方持有，调用方 free） */
+    const uint8_t *trial;        /* 中段（试压对象） */
+    size_t trial_len;
+    long file_size;
 } omnic_decision;
 
 /* 三值中位数（小写首字母避免与 math 库宏冲突） */
@@ -99,7 +105,10 @@ static omnic_status decide(FILE *f, const char *path, const omnic_options *o, om
                           &d->feats);
     /* 熵取三段中位数：与 RANDOM 判定同源，抗单段误判（如文本尾附 base64 段） */
     d->entropy = med3(d->feats.entropy_h, d->feats.entropy_m, d->feats.entropy_t);
-    free(seg);
+    d->seg_base = seg; /* 调用方（含 analyze 路径）负责 free */
+    d->trial = seg + OMNIC_SAMPLE_SEG;
+    d->trial_len = mn;
+    d->file_size = sz;
 
     d->klass = omnic_classify_ext(path);
     if (d->klass == OMNIC_CLS_UNKNOWN && d->entropy >= OMNIC_ENTROPY_SKIP) {
@@ -109,6 +118,55 @@ static omnic_status decide(FILE *f, const char *path, const omnic_options *o, om
     }
     d->pe = omnic_policy_lookup(d->klass, o->profile);
     return OMNIC_OK;
+}
+
+/* FC 档候选试压（PHASE2 §3.5）：对中段 256KiB 实测两候选的 (t, ρ)，
+ * 预算内取 ρ 优者覆写表行。mem 后端保证时序不含磁盘 IO。 */
+static const omnic_codec_ops *trial_codec(const char *name) {
+    const omnic_codec_ops *ops = omnic_codec_find(name);
+    return (ops != NULL && ops->can_compress) ? ops : NULL;
+}
+
+static omnic_status trial_run(const omnic_codec_ops *ops, int level, const uint8_t *src,
+                              size_t n, double *t_out, size_t *len_out) {
+    omnic_reader r;
+    omnic_writer w;
+    omnic_reader_init_mem(&r, src, n);
+    omnic_writer_init_mem(&w);
+    double t0 = omnic_now_sec();
+    omnic_status st = ops->compress(&r, &w, level, 1);
+    double t1 = omnic_now_sec();
+    *t_out = t1 - t0;
+    *len_out = (size_t)omnic_writer_total(&w);
+    free(omnic_writer_mem_drain(&w, NULL));
+    omnic_reader_fini(&r);
+    return st;
+}
+
+static void trial_pick(omnic_decision *d) {
+    const omnic_codec_ops *c1 = trial_codec(d->pe->codec);
+    const omnic_codec_ops *c2 = trial_codec(d->pe->codec2);
+    double t1 = 0, t2 = 0;
+    size_t l1 = 0, l2 = 0;
+    if (c1 == NULL || c2 == NULL || c1 == c2) return;
+    omnic_status s1 = trial_run(c1, d->pe->level, d->trial, d->trial_len, &t1, &l1);
+    omnic_status s2 = trial_run(c2, d->pe->level2, d->trial, d->trial_len, &t2, &l2);
+    if (s1 != OMNIC_OK && s2 != OMNIC_OK) return;
+    /* 预算内 ρ 优者胜（PHASE2 预注册：argmax ρ s.t. t ≤ 50ms；全超 → 默认 c1） */
+    bool use2 = (s2 == OMNIC_OK && t2 <= OMNIC_TRIAL_BUDGET_SEC &&
+                 (s1 != OMNIC_OK || t1 > OMNIC_TRIAL_BUDGET_SEC || l2 < l1));
+    d->override = *d->pe;
+    if (use2) {
+        d->override.codec = d->pe->codec2;
+        d->override.level = d->pe->level2;
+    }
+    /* reason 走独立缓冲（表内 reason 是字面量，不可写）；ρ 用百分位显示 */
+    double r1 = (d->trial_len > 0) ? 100.0 * (double)l1 / (double)d->trial_len : 0.0;
+    double r2 = (d->trial_len > 0) ? 100.0 * (double)l2 / (double)d->trial_len : 0.0;
+    snprintf(d->reason_buf, sizeof(d->reason_buf), "trial 256KiB: %s %.1f%% vs %s %.1f%%",
+             d->pe->codec, r1, d->pe->codec2, r2);
+    d->override.reason = d->reason_buf;
+    d->pe = &d->override;
 }
 
 static const omnic_codec_ops *pick_codec(const omnic_options *o, const omnic_policy_entry *pe,
@@ -189,6 +247,14 @@ omnic_status omnic_run_compress(const char *path, const omnic_options *o, omnic_
     ret = decide(f.in, path, o, &d);
     if (ret != OMNIC_OK) goto fail;
 
+    /* FC 档试压（PHASE2 §3.5）：≥32MiB 且表给了第二候选才触发；
+     * 试压后 d.pe 可能指向 d.override（栈内副本） */
+    if (o->codec == NULL && o->profile == OMNIC_PROFILE_FAST_COMPRESS && d.pe != NULL &&
+        !omnic_policy_is_skip(d.pe) && d.pe->codec2 != NULL && d.trial_len > 0 &&
+        d.file_size >= (long)OMNIC_TRIAL_MIN) {
+        trial_pick(&d);
+    }
+
     rep->klass = d.klass;
     rep->entropy = d.entropy;
 
@@ -202,6 +268,7 @@ omnic_status omnic_run_compress(const char *path, const omnic_options *o, omnic_
                  omnic_class_str(d.klass), "use --force to compress anyway", d.entropy);
         fill_report(rep, OMNIC_SKIP_CODEC, 0, d.klass, d.entropy, 0, 0, 0.0);
         files_close(&f, false);
+        free(d.seg_base);
         return OMNIC_OK;
     }
 
@@ -264,11 +331,13 @@ omnic_status omnic_run_compress(const char *path, const omnic_options *o, omnic_
     rep->fmt = ops->fmt;
 
     files_close(&f, false);
+    free(d.seg_base);
     if (!(o->flags & OMNIC_F_KEEP)) remove(path); /* 假设 A8：默认删源 */
     return OMNIC_OK;
 
 fail:
     files_close(&f, true);
+    free(d.seg_base);
     return ret;
 }
 
@@ -388,6 +457,7 @@ omnic_status omnic_run_analyze(const char *path, omnic_report *rep) {
             snprintf(rep->reason, sizeof(rep->reason), "%s", d.pe->reason);
         }
     }
+    free(d.seg_base); /* analyze 不试压（纯探测），中段只用于特征 */
     omnic_reader_fini(&r);
     fclose(in);
     return ret;

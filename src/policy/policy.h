@@ -12,6 +12,8 @@ typedef struct omnic_policy_entry {
     const char *codec;
     int level; /* codec 原生级别；zstd 负值 = --fast 模式 */
     const char *reason;
+    const char *codec2; /* FC 档试压第二候选（NULL = 不试压，PHASE2 §3.5） */
+    int level2;
 } omnic_policy_entry;
 
 const omnic_policy_entry *omnic_policy_lookup(omnic_class c, omnic_profile p);

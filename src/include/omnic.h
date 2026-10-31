@@ -93,6 +93,11 @@ typedef struct omnic_options {
 #define OMNIC_MAGIC_SIZE 16u
 #define OMNIC_ENTROPY_SKIP 7.5 /* bits/byte，SW-DET-003（三段熵中位数判定） */
 
+/* FC 档候选试压（PHASE2_DECIDER_DESIGN §3.5）：仅快 codec 候选（≥32MiB 文件，
+ * 256KiB 中段实测 ≤ 数 ms），单候选绝对预算 50ms；预算内取 ρ 最优 */
+#define OMNIC_TRIAL_MIN (32u * 1024u * 1024u)
+#define OMNIC_TRIAL_BUDGET_SEC 0.05
+
 typedef struct omnic_report {
     char codec[16];
     int level;

@@ -265,6 +265,51 @@ static void test_feature(void) {
     free(buf);
 }
 
+/* FC 档候选试压（PHASE2 §3.5）：≥32MiB、reason 含实测数字、roundtrip 完整。
+ * SRC 自然文本 ×11（≥32MiB）：自然文本上 zstd-3 的 ρ 稳定优于 lz4
+ * （一期实测），验证预算内选优方向。 */
+static void test_trial(void) {
+    omnic_options o = def_opts();
+    omnic_report rep;
+    const char *path = "omnic_test_trial.tar";
+    const char *ref = "omnic_test_trial_ref.tar";
+    rm("omnic_test_trial.tar.zst");
+    rm("omnic_test_trial.tar.lz4"); /* 上次运行的残留（试压胜者不定） */
+    rm(path);
+    rm(ref);
+
+    FILE *f = fopen(path, "wb");
+    CHECK(f != NULL);
+    if (f == NULL) return;
+    for (int i = 0; i < 11; i++) { /* 3MiB × 11 = 33MiB */
+        FILE *s = fopen(SRC, "rb");
+        CHECK(s != NULL);
+        if (s == NULL) {
+            fclose(f);
+            return;
+        }
+        char buf[65536];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), s)) > 0) fwrite(buf, 1, n, f);
+        fclose(s);
+    }
+    fclose(f);
+    CHECK(copy_file(path, ref) == 0);
+
+    o.profile = OMNIC_PROFILE_FAST_COMPRESS;
+    CHECK(omnic_compress(path, &o, &rep) == OMNIC_OK);
+    CHECK(!rep.skipped);
+    CHECK(strstr(rep.reason, "trial 256KiB") != NULL);
+    CHECK(strcmp(rep.codec, "zstd") == 0); /* 自然文本 zstd-3 ρ 胜 lz4（预算内选优） */
+
+    o.flags |= OMNIC_F_FORCE; /* def_opts 的 KEEP 保留了源文件，解压需覆盖 */
+    CHECK(omnic_decompress("omnic_test_trial.tar.zst", &o, &rep) == OMNIC_OK);
+    CHECK(files_equal(path, ref));
+    rm("omnic_test_trial.tar.zst");
+    rm(path);
+    rm(ref);
+}
+
 static void test_detect(void) {
     CHECK(omnic_detect_magic((const uint8_t *)"\x28\xB5\x2F\xFD", 4) == OMNIC_FMT_ZSTD);
     CHECK(omnic_detect_magic((const uint8_t *)"\x1F\x8B\x08\x00", 4) == OMNIC_FMT_GZIP);
@@ -1067,6 +1112,7 @@ int main(void) {
     make_src();
     test_policy();
     test_feature();
+    test_trial();
     test_detect();
     test_auto_and_skip();
     test_roundtrip_full("zstd");
