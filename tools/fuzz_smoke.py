@@ -19,7 +19,19 @@ import sys
 import tempfile
 import time
 
-OMNIC_DEFAULT = os.path.join("build", "omnic.exe" if os.name == "nt" else "omnic")
+OMNIC_DEFAULT = None
+
+
+def find_default_omnic():
+    """单配置生成器在 build/，MSVC 多配置在 build/Release/。"""
+    cands = []
+    for sub in ("", "Release/"):
+        for name in ("omnic.exe", "omnic"):
+            p = os.path.join("build", sub + name)
+            if os.path.isfile(p):
+                return p
+            cands.append(p)
+    return cands[0]  # 不存在时报错用（提示安装路径）
 
 # 内嵌合法样本（同 tests/test_core.c：bzip2 blob_a / lzip blob，原文均为 pattern×N）
 BZIP2_BLOB = bytes([
@@ -93,12 +105,12 @@ def mutations(data: bytes, rng: random.Random, quick: bool):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--omnic", default=OMNIC_DEFAULT)
+    ap.add_argument("--omnic", default=None)
     ap.add_argument("--workdir", default=None)
     ap.add_argument("--quick", action="store_true", help="少量翻转，快速冒烟")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
-    omnic = os.path.abspath(args.omnic)
+    omnic = os.path.abspath(args.omnic or find_default_omnic())
     if not os.path.isfile(omnic):
         sys.exit(f"omnic binary not found: {omnic}")
     work = args.workdir or tempfile.mkdtemp(prefix="omnic_fuzz_")
@@ -138,15 +150,23 @@ def main():
         f.write(LZIP_BLOB)
     cases.append(("lzip", lz, LZIP_PAT))
     lv = os.path.join(work, "good_lzvn.lzvn")
-    gen = os.path.join("build", "fuzz_lzvn_gen" + (".exe" if os.name == "nt" else ""))
-    if os.path.isfile(gen):
+    gen = None
+    for sub in ("", "Release/"):
+        for name in ("fuzz_lzvn_gen.exe", "fuzz_lzvn_gen"):
+            p = os.path.join("build", sub + name)
+            if os.path.isfile(p):
+                gen = p
+                break
+        if gen:
+            break
+    if gen:
         rc = subprocess.run([gen, lv, os.path.join(work, "lzvn_ref.bin")], capture_output=True)
         if rc.returncode == 0:
             cases.append(("lzvn", lv, open(os.path.join(work, "lzvn_ref.bin"), "rb").read()))
         else:
             print("WARN: lzvn gen failed, skipping lzvn")
     else:
-        print(f"WARN: {gen} not found, skipping lzvn (build tools/fuzz_lzvn_gen.c first)")
+        print("WARN: fuzz_lzvn_gen not found in build/, skipping lzvn")
 
     # .Z 的 golden：先成功解压一次建立基准（文件带后缀避免产物同名冲突）
     for i, (label, art, gold) in enumerate(cases):
