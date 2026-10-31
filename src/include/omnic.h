@@ -34,12 +34,19 @@ typedef enum {
 /* 数据类型分类（SW-DET-002） */
 typedef enum {
     OMNIC_CLS_UNKNOWN = 0,        /* 未知二进制，靠采样熵细分 */
-    OMNIC_CLS_TEXT,               /* 文本/代码/标记语言 */
+    OMNIC_CLS_TEXT,               /* 文本/代码/标记语言（γ 细分前的粗类） */
     OMNIC_CLS_EXEC,               /* 可执行/对象文件 */
-    OMNIC_CLS_STRUCTURED,         /* 结构化二进制/数据库/tar */
-    OMNIC_CLS_MEDIA_RAW,          /* 未压缩媒体（位图/PCM） */
+    OMNIC_CLS_STRUCTURED,         /* 结构化二进制（γ 细分前的粗类） */
+    OMNIC_CLS_MEDIA_RAW,          /* 未压缩媒体（γ 细分前的粗类） */
     OMNIC_CLS_ALREADY_COMPRESSED, /* 已压缩数据，默认跳过（SYS-CMP-003） */
-    OMNIC_CLS_RANDOM              /* 高熵随机数据（仅采样判定） */
+    OMNIC_CLS_RANDOM,             /* 高熵随机数据（仅采样判定） */
+    /* 二期细分类（PHASE2_DECIDER_DESIGN §3.4）：γ 由内容特征驱动，
+     * 粗类值不重排、CLI/ABI 向后兼容；决策表按细类建行。
+     * STRUCTURED 细分（CONTAINER/DB）实测无分离特征，撤销（见 feature.c 注） */
+    OMNIC_CLS_NTEXT,              /* 自然语言文本（TEXT 细分） */
+    OMNIC_CLS_CODE,               /* 源代码/标记语言（TEXT 细分） */
+    OMNIC_CLS_GRAPHIC,            /* 合成图/图形位图（MEDIA_RAW 细分） */
+    OMNIC_CLS_PHOTO               /* 照片/噪声主导位图（MEDIA_RAW 细分） */
 } omnic_class;
 
 /* 支持的压缩流格式（需求 4.4 节清单） */
@@ -79,10 +86,12 @@ typedef struct omnic_options {
 #define OMNIC_F_QUIET 0x04u
 #define OMNIC_F_EXPLAIN 0x08u /* 输出决策依据（SW-POL-003） */
 
-/* 采样与决策参数（SYS-CMP-002：4MB 采样、决策 ≤50ms） */
-#define OMNIC_SAMPLE_SIZE (4u * 1024u * 1024u)
+/* 采样与决策参数（SYS-CMP-002：决策 ≤50ms）
+ * 二期分层采样（PHASE2_DECIDER_DESIGN §3.2）：头/中/尾各 256KiB，
+ * 一阶熵在 256KiB 已收敛（|Ĥ_256K − Ĥ_4M| < 0.02 bits），IO 降至一期 4MiB 前缀的 1/5.3 */
+#define OMNIC_SAMPLE_SEG (256u * 1024u)
 #define OMNIC_MAGIC_SIZE 16u
-#define OMNIC_ENTROPY_SKIP 7.5 /* bits/byte，SW-DET-003 */
+#define OMNIC_ENTROPY_SKIP 7.5 /* bits/byte，SW-DET-003（三段熵中位数判定） */
 
 typedef struct omnic_report {
     char codec[16];

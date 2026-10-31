@@ -11,6 +11,7 @@
 #include "core/registry.h"
 #include "core/util.h"
 #include "detect/entropy.h"
+#include "detect/feature.h"
 #include "detect/filetype.h"
 #include "detect/magic.h"
 #include "policy/policy.h"
@@ -51,24 +52,60 @@ static omnic_status finalize_rename(const char *tmp_path, const char *out_path) 
     return rename(tmp_path, out_path) == 0 ? OMNIC_OK : OMNIC_E_SYSTEM;
 }
 
-/* 采样+分类+决策（压缩路径 1-2 步，SYS-CMP-001/002）。 */
+/* 采样+分类+决策（压缩路径 1-2 步，SYS-CMP-001/002）。
+ * 二期分层采样（PHASE2_DECIDER_DESIGN §3.2）：头/中/尾三段各 256KiB，
+ * 特征向量 φ 驱动细分类 γ；决策后 rewind 交还 codec。直接走 FILE*
+ * 而非 reader：三段定位需要 fseek，且不污染 reader 的 total 计数。 */
 typedef struct {
     omnic_class klass;
     double entropy;
+    omnic_features feats;
     const omnic_policy_entry *pe;
 } omnic_decision;
 
-static omnic_status decide(omnic_reader *r, const char *path, const omnic_options *o, omnic_decision *d) {
-    uint8_t *sample = (uint8_t *)malloc(OMNIC_SAMPLE_SIZE);
-    if (sample == NULL) return OMNIC_E_SYSTEM;
-    size_t n = omnic_reader_read(r, sample, OMNIC_SAMPLE_SIZE);
-    d->entropy = omnic_entropy(sample, n);
-    omnic_reader_unread(r, sample, n); /* 采样数据归还 codec */
-    free(sample);
+/* 三值中位数（小写首字母避免与 math 库宏冲突） */
+static double med3(double a, double b, double c) {
+    if (a > b) {
+        if (b > c) return b;
+        return a > c ? c : a;
+    }
+    if (a > c) return a;
+    return b > c ? c : b;
+}
+
+static omnic_status decide(FILE *f, const char *path, const omnic_options *o, omnic_decision *d) {
+    uint8_t *seg = (uint8_t *)malloc(3 * OMNIC_SAMPLE_SEG);
+    if (seg == NULL) return OMNIC_E_SYSTEM;
+
+    long sz = -1;
+    if (fseek(f, 0, SEEK_END) == 0) sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    size_t hn = fread(seg, 1, OMNIC_SAMPLE_SEG, f);
+    size_t mn = 0, tn = 0;
+    /* >=3 段长才有分层意义；两段(头+尾)覆盖 [s,3s)；更短只有头段。
+     * sz<0（fseek/ftell 失败，含 Win32 long 溢出的 >2GB 文件）退化为头段采样。 */
+    if (sz >= (long)(3 * OMNIC_SAMPLE_SEG)) {
+        if (fseek(f, sz / 2 - (long)(OMNIC_SAMPLE_SEG / 2), SEEK_SET) == 0)
+            mn = fread(seg + OMNIC_SAMPLE_SEG, 1, OMNIC_SAMPLE_SEG, f);
+        if (fseek(f, sz - (long)OMNIC_SAMPLE_SEG, SEEK_SET) == 0)
+            tn = fread(seg + 2 * OMNIC_SAMPLE_SEG, 1, OMNIC_SAMPLE_SEG, f);
+    } else if (sz >= (long)(2 * OMNIC_SAMPLE_SEG)) {
+        if (fseek(f, sz - (long)OMNIC_SAMPLE_SEG, SEEK_SET) == 0)
+            tn = fread(seg + 2 * OMNIC_SAMPLE_SEG, 1, OMNIC_SAMPLE_SEG, f);
+    }
+    fseek(f, 0, SEEK_SET);
+
+    omnic_feature_extract(seg, hn, seg + OMNIC_SAMPLE_SEG, mn, seg + 2 * OMNIC_SAMPLE_SEG, tn,
+                          &d->feats);
+    /* 熵取三段中位数：与 RANDOM 判定同源，抗单段误判（如文本尾附 base64 段） */
+    d->entropy = med3(d->feats.entropy_h, d->feats.entropy_m, d->feats.entropy_t);
+    free(seg);
 
     d->klass = omnic_classify_ext(path);
     if (d->klass == OMNIC_CLS_UNKNOWN && d->entropy >= OMNIC_ENTROPY_SKIP) {
         d->klass = OMNIC_CLS_RANDOM; /* SW-DET-003 */
+    } else {
+        d->klass = omnic_refine_class(d->klass, &d->feats); /* γ 细分（PHASE2 §3.4） */
     }
     d->pe = omnic_policy_lookup(d->klass, o->profile);
     return OMNIC_OK;
@@ -149,7 +186,7 @@ omnic_status omnic_run_compress(const char *path, const omnic_options *o, omnic_
     }
     omnic_reader_init(&f.reader, f.in);
 
-    ret = decide(&f.reader, path, o, &d);
+    ret = decide(f.in, path, o, &d);
     if (ret != OMNIC_OK) goto fail;
 
     rep->klass = d.klass;
@@ -341,7 +378,7 @@ omnic_status omnic_run_analyze(const char *path, omnic_report *rep) {
         return OMNIC_E_SYSTEM;
     }
     omnic_reader_init(&r, in);
-    ret = decide(&r, path, &(omnic_options){OMNIC_PROFILE_BALANCED, NULL, 0, 0, 0, NULL}, &d);
+    ret = decide(in, path, &(omnic_options){OMNIC_PROFILE_BALANCED, NULL, 0, 0, 0, NULL}, &d);
     if (ret == OMNIC_OK) {
         rep->klass = d.klass;
         rep->entropy = d.entropy;

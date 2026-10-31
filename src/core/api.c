@@ -56,6 +56,10 @@ const char *omnic_class_str(omnic_class c) {
         case OMNIC_CLS_MEDIA_RAW: return "raw media";
         case OMNIC_CLS_ALREADY_COMPRESSED: return "already compressed";
         case OMNIC_CLS_RANDOM: return "high entropy";
+        case OMNIC_CLS_NTEXT: return "text/natural";
+        case OMNIC_CLS_CODE: return "text/code";
+        case OMNIC_CLS_GRAPHIC: return "media/graphic";
+        case OMNIC_CLS_PHOTO: return "media/photo";
         case OMNIC_CLS_UNKNOWN: return "unknown";
         default: return "?";
     }

@@ -9,6 +9,7 @@
 #include "core/registry.h"
 #include "core/util.h"
 #include "detect/entropy.h"
+#include "detect/feature.h"
 #include "detect/filetype.h"
 #include "detect/magic.h"
 #include "omnic.h"
@@ -96,8 +97,8 @@ static unsigned rng(void) { return (rng_state = rng_state * 1103515245u + 12345u
 
 /* 3MB 可压缩"文本"：重复词表 + 噪声 */
 static void make_src(void) {
-    static const char *words[] = {"compression", "omnic", "codec", "policy", "stream",
-                                  "entropy", "magic", "format", "block", "zstd"};
+    /* 1024 个合成词的随机句：词表足够大，dup16 落自然语言带 <0.03
+     * （feature_probe 实测校准），γ 细分为 NTEXT */
     FILE *f = fopen(SRC, "wb");
     char buf[4096];
     size_t total = 0;
@@ -105,11 +106,7 @@ static void make_src(void) {
         size_t n = 0;
         int lines = 8;
         for (int i = 0; i < lines; i++) {
-            const char *w = words[rng() % 10];
-            size_t wl = strlen(w);
-            memcpy(buf + n, w, wl);
-            n += wl;
-            buf[n++] = ' ';
+            n += (size_t)snprintf(buf + n, sizeof(buf) - n, "w%u ", (unsigned)((rng() >> 22) % 1024u));
             if (rng() % 7 == 0) buf[n++] = '\n';
         }
         buf[n++] = '\n';
@@ -197,19 +194,75 @@ static char *with_ext(const char *base, const char *ext) {
 }
 
 static void test_policy(void) {
-    for (int c = 0; c <= (int)OMNIC_CLS_RANDOM; c++) {
+    /* 二期细类表（PHASE2_DECIDER_DESIGN §3.4）：γ 细分后进表的 8 类；
+     * 粗类 TEXT/MEDIA_RAW 只作为细分中间态，无表行；STRUCTURED 细分撤销 */
+    static const omnic_class klasses[] = {
+        OMNIC_CLS_NTEXT,             OMNIC_CLS_CODE,      OMNIC_CLS_EXEC, OMNIC_CLS_STRUCTURED,
+        OMNIC_CLS_GRAPHIC,           OMNIC_CLS_PHOTO,     OMNIC_CLS_ALREADY_COMPRESSED,
+        OMNIC_CLS_RANDOM,            OMNIC_CLS_UNKNOWN};
+    for (size_t i = 0; i < sizeof(klasses) / sizeof(klasses[0]); i++) {
         for (int p = 0; p < (int)OMNIC_PROFILE_COUNT; p++) {
-            const omnic_policy_entry *e = omnic_policy_lookup((omnic_class)c, (omnic_profile)p);
+            const omnic_policy_entry *e = omnic_policy_lookup(klasses[i], (omnic_profile)p);
             CHECK(e != NULL);
             if (e != NULL) CHECK(e->codec != NULL && e->codec[0] != '\0');
         }
     }
-    const omnic_policy_entry *e = omnic_policy_lookup(OMNIC_CLS_TEXT, OMNIC_PROFILE_BEST_RATIO);
-    CHECK(e != NULL && strcmp(e->codec, "brotli") == 0);
+    const omnic_policy_entry *e = omnic_policy_lookup(OMNIC_CLS_NTEXT, OMNIC_PROFILE_BEST_RATIO);
+    CHECK(e != NULL && strcmp(e->codec, "xz") == 0);
+    e = omnic_policy_lookup(OMNIC_CLS_CODE, OMNIC_PROFILE_BEST_RATIO);
+    CHECK(e != NULL && strcmp(e->codec, "xz") == 0);
+    e = omnic_policy_lookup(OMNIC_CLS_PHOTO, OMNIC_PROFILE_BEST_RATIO);
+    CHECK(e != NULL && strcmp(e->codec, "xz") == 0);
     e = omnic_policy_lookup(OMNIC_CLS_ALREADY_COMPRESSED, OMNIC_PROFILE_BALANCED);
     CHECK(omnic_policy_is_skip(e));
-    e = omnic_policy_lookup(OMNIC_CLS_TEXT, OMNIC_PROFILE_FAST_COMPRESS);
+    e = omnic_policy_lookup(OMNIC_CLS_NTEXT, OMNIC_PROFILE_FAST_COMPRESS);
     CHECK(e != NULL && strcmp(e->codec, "lz4") == 0);
+}
+
+/* ---- 特征层与细分类（PHASE2_DECIDER_DESIGN §3.3/3.4） ---- */
+static void test_feature(void) {
+    omnic_features g;
+    uint8_t *buf = (uint8_t *)malloc(OMNIC_SAMPLE_SEG);
+    CHECK(buf != NULL);
+    if (buf == NULL) return;
+
+    /* 全零：熵 0、零率 1、窗口重复 1（退化段复用头段） */
+    memset(buf, 0, OMNIC_SAMPLE_SEG);
+    omnic_feature_extract(buf, OMNIC_SAMPLE_SEG, NULL, 0, NULL, 0, &g);
+    CHECK(g.zero_rate > 0.99 && g.entropy_h < 0.01);
+    CHECK(g.dup_rate > 0.95);
+
+    /* 高熵随机：无任何窗口重复 */
+    for (size_t i = 0; i < OMNIC_SAMPLE_SEG; i++) buf[i] = (uint8_t)(rng() >> 24);
+    omnic_feature_extract(buf, OMNIC_SAMPLE_SEG, NULL, 0, NULL, 0, &g);
+    CHECK(g.entropy_h > 7.9 && g.entropy_delta < 0.05);
+    CHECK(g.dup_rate < 0.05 && g.dup_rate_16 < 0.01);
+
+    /* 周期性块（窗口大小整数倍）：4KiB 窗口全同 */
+    for (size_t i = 0; i < OMNIC_SAMPLE_SEG; i++) buf[i] = (uint8_t)(i % 4096);
+    omnic_feature_extract(buf, OMNIC_SAMPLE_SEG, NULL, 0, NULL, 0, &g);
+    CHECK(g.dup_rate > 0.95);
+
+    /* γ 判据（PHASE2 §3.4 实测校准）：CODE/NTEXT、GRAPHIC/PHOTO、其余不细分 */
+    omnic_features t = {0};
+    t.printable = 0.95;
+    t.dup_rate_16 = 0.6;
+    CHECK(omnic_refine_class(OMNIC_CLS_TEXT, &t) == OMNIC_CLS_CODE);
+    t.dup_rate_16 = 0.02; /* 实测自然语言带：dickens 0.001 / enwik8 0.022 */
+    CHECK(omnic_refine_class(OMNIC_CLS_TEXT, &t) == OMNIC_CLS_NTEXT);
+    t.printable = 0.6; /* 不可打印文本不进 CODE */
+    t.dup_rate_16 = 0.6;
+    CHECK(omnic_refine_class(OMNIC_CLS_TEXT, &t) == OMNIC_CLS_NTEXT);
+    omnic_features mv = {0};
+    mv.dup_rate = 0.5;
+    CHECK(omnic_refine_class(OMNIC_CLS_MEDIA_RAW, &mv) == OMNIC_CLS_GRAPHIC);
+    mv.dup_rate = 0.01;
+    CHECK(omnic_refine_class(OMNIC_CLS_MEDIA_RAW, &mv) == OMNIC_CLS_PHOTO);
+    omnic_features sd = {0};
+    sd.entropy_delta = 2.0;
+    CHECK(omnic_refine_class(OMNIC_CLS_STRUCTURED, &sd) == OMNIC_CLS_STRUCTURED);
+    CHECK(omnic_refine_class(OMNIC_CLS_EXEC, &sd) == OMNIC_CLS_EXEC);
+    free(buf);
 }
 
 static void test_detect(void) {
@@ -325,7 +378,7 @@ static void test_auto_and_skip(void) {
 
     /* analyze */
     CHECK(omnic_analyze(SRC, &rep) == OMNIC_OK);
-    CHECK(rep.klass == OMNIC_CLS_TEXT && rep.entropy < 6.0);
+    CHECK(rep.klass == OMNIC_CLS_NTEXT && rep.entropy < 6.0);
 }
 
 /* 截断检测（SYS-DEC-003 子集）：截去尾部 10 字节——必然落在最后一个
@@ -1013,6 +1066,7 @@ int main(void) {
     cleanup_all();
     make_src();
     test_policy();
+    test_feature();
     test_detect();
     test_auto_and_skip();
     test_roundtrip_full("zstd");

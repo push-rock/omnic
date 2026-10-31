@@ -135,6 +135,7 @@ set(OMNIC_SRC
   src/core/util.c
   src/codec/codec_util.c
   src/detect/entropy.c
+  src/detect/feature.c
   src/detect/filetype.c
   src/detect/magic.c
   src/policy/policy.c
@@ -232,6 +233,10 @@ target_link_libraries(omnic PRIVATE omnic_core)
 
 # ---- bench（A7 / TST-PERF-001：适配层损耗基准 + README 数据源） ----
 add_executable(omnic_bench tools/bench.c tools/bench_zng.c)
+# 特征探针（判据阈值校准 / corpora 特征统计，PHASE2_DECIDER_DESIGN）
+add_executable(feature_probe tools/feature_probe.c)
+target_link_libraries(feature_probe PRIVATE omnic_core)
+target_compile_definitions(feature_probe PRIVATE ${OMNIC_DEFS})
 target_link_libraries(omnic_bench PRIVATE omnic_core)
 target_compile_definitions(omnic_bench PRIVATE ${OMNIC_DEFS})
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
@@ -267,13 +272,13 @@ endif()
 # MinGW：全静态链接 runtime（libgcc/libstdc++/winpthread，snappy 引入 C++ 与
 # zstd MT 引入 pthread），保证单二进制分发（BUS-005）
 if(WIN32 AND NOT MSVC)
-  foreach(_t omnic omnic_bench test_core)
+  foreach(_t omnic omnic_bench test_core feature_probe)
     target_link_options(${_t} PRIVATE -static)
   endforeach()
 endif()
 
 # omnic 自身代码按严格 C11 编译（C_EXTENSIONS OFF）；第三方库走编译器默认（gnu 模式）
-foreach(_t omnic omnic_bench omnic_core test_core)
+foreach(_t omnic omnic_bench omnic_core test_core feature_probe)
   set_target_properties(${_t} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 endforeach()
 
