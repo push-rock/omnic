@@ -1,0 +1,118 @@
+.TH OMNIC 1 "2026-10-31" "omnic 0.1.0" "User Commands"
+.SH NAME
+omnic \- universal compressor with automatic codec selection
+.SH SYNOPSIS
+.B omnic
+.I command
+.RI [ options ]
+.IR file ...
+.SH DESCRIPTION
+.B omnic
+compresses and decompresses files across 16 formats. On compression it
+samples the file (4 MiB entropy estimate), classifies it (extension
+first, entropy fallback), and looks up a compiled-in policy table to
+pick codec and level for the requested profile. Already-compressed and
+high-entropy files are skipped by default. Decompression auto-detects
+the format from magic bytes (extension as fallback) and works on
+products of the official CLIs of every supported codec.
+.SH COMMANDS
+.TP
+.BR c ", " compress
+Compress each file. Output is
+.IR file . ext
+(next to the input unless
+.B \-\-output\-dir
+is given). The source file is removed on success unless
+.B \-k
+is given.
+.TP
+.BR d ", " decompress
+Decompress each file; format is auto-detected.
+.TP
+.B analyze
+Classify files and print the decision (type, entropy, codec, level,
+reason) without compressing.
+.TP
+.B list
+List compiled-in codecs, levels, and recognized formats.
+.TP
+.BR version ", " help
+Print version / usage.
+.SH OPTIONS
+.TP
+.BR "\-c, \-\-codec " \fINAME\fR
+Override the policy table and use codec
+.IR NAME
+(see
+.BR list ).
+.TP
+.BR "\-l, \-\-level " \fIN\fR
+Override the level.
+.TP
+.BR "\-p, \-\-profile " \fINAME\fR
+One of
+.BR fast_compress " (fc)," fast_decompress " (fd)," best_ratio " (br)," balanced
+(bl, default).
+.TP
+.BR "\-T, \-\-threads " \fIN\fR
+Thread hint (accepted; most codecs are single-threaded in this build).
+.TP
+.BR "\-o, \-\-output\-dir " \fIDIR\fR
+Write outputs into
+.IR DIR .
+.TP
+.BR "\-f, \-\-force"
+Compress even when the input looks already-compressed or random.
+.TP
+.BR "\-k, \-\-keep"
+Keep the source file.
+.TP
+.BR "\-q, \-\-quiet"
+Suppress the per-file report line.
+.TP
+.BR "\-x, \-\-explain"
+Print the classification and reason for the decision.
+.TP
+.BR "\-V, \-\-version ", "\-h, \-\-help"
+Version / usage.
+.SH FORMATS
+Compression (codec, extension, levels):
+zstd .zst \-5..22, lz4 .lz4 0..12, xz .xz 0..9, lzma .lzma 0..9,
+zlib .gz 0..9, zlib-stream .zlib 0..9, raw-deflate .zz 0..9,
+zlib-ng .gz 0..9, libdeflate .gz 0..12, brotli .br 0..11,
+snappy .snappy 1..2, lzfse .lzfse 0.
+Decode-only: lzip .lz, lzvn .lzvn, bzip2 .bz2, compress .Z.
+.PP
+.B raw-deflate
+carries no checksum; a corrupted stream can decode silently
+(format-inherent, same as any raw inflate implementation).
+.SH EXIT STATUS
+0 on success; non-zero on error (bad usage, I/O failure, unrecognized
+or corrupted input).
+.SH EXAMPLES
+.PP
+Compress with automatic selection:
+.PP
+.RS
+.nf
+omnic c notes.txt
+.RE
+.PP
+Best ratio, show why:
+.PP
+.RS
+.nf
+omnic c \-\-profile best_ratio \-\-explain photos/
+.RE
+.PP
+Round-trip a specific codec at a specific level:
+.PP
+.RS
+.nf
+omnic c \-c zstd \-l 19 data.bin
+omnic d data.bin.zst
+.RE
+.SH SEE ALSO
+Project README (formats, benchmarks, policy table) at
+.UR https://github.com/push-rock/omnic
+.UE .

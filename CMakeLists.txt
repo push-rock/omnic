@@ -273,3 +273,9 @@ endif()
 foreach(_t omnic omnic_bench omnic_core test_core)
   set_target_properties(${_t} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 endforeach()
+
+# ---- install（BUS-005：单二进制分发） ----
+include(GNUInstallDirs)
+install(TARGETS omnic RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(FILES man/omnic.1 DESTINATION ${CMAKE_INSTALL_MANDIR}/man1)
+install(FILES LICENSE THIRD_PARTY_NOTICES.md DESTINATION ${CMAKE_INSTALL_DOCDIR})

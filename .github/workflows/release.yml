@@ -1,0 +1,48 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  dist:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            cc: gcc
+            gen: ""
+            pack: tar.gz
+          - os: macos-14
+            cc: clang
+            gen: ""
+            pack: tar.gz
+          - os: windows-latest
+            cc: gcc
+            gen: "MinGW Makefiles"
+            pack: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=dist ${{ matrix.gen && format('-G "{0}"', matrix.gen) || '' }}
+        env:
+          CC: ${{ matrix.cc }}
+      - name: build
+        run: cmake --build build -j --config Release
+      - name: test
+        run: ctest --test-dir build --output-on-failure -C Release
+      - name: install and pack
+        shell: bash
+        run: |
+          cmake --install build --prefix dist
+          name="omnic-${{ github.ref_name }}-${{ matrix.os }}"
+          if [ "${{ matrix.pack }}" = "zip" ]; then
+            (cd dist && zip -r "../${name}.zip" .)
+          else
+            (cd dist && tar -czf "../${name}.tar.gz" .)
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: omnic-*
