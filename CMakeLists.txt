@@ -250,6 +250,17 @@ add_test(NAME core COMMAND test_core)
 # 紧验收线由本地正式跑数把关
 add_test(NAME bench_smoke COMMAND omnic_bench --size 16 --rounds 3 --check 40)
 
+# TST-DEC-001 fuzz 冒烟：损坏输入（截断/位翻转/边界）只报错、不崩溃不挂死；
+# raw-deflate 无校验和，静默错解为格式固有（python zlib 同），脚本内豁免
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND AND OMNIC_CODEC_LZFSE)
+  add_executable(fuzz_lzvn_gen tools/fuzz_lzvn_gen.c)
+  target_link_libraries(fuzz_lzvn_gen PRIVATE lzfse_static)
+  add_test(NAME fuzz_smoke
+           COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/fuzz_smoke.py --quick
+           WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
 # MinGW：全静态链接 runtime（libgcc/libstdc++/winpthread，snappy 引入 C++ 与
 # zstd MT 引入 pthread），保证单二进制分发（BUS-005）
 if(WIN32 AND NOT MSVC)

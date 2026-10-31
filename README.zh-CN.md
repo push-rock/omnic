@@ -68,7 +68,7 @@ omnic list                     列出算法与支持的格式
 | snappy 1.3.1 | .snappy | 1..2 | 官方 framing 格式（magic + CRC32C + 64KB 分块） |
 | lzfse 1.0 | .lzfse | — | 单一速率点 |
 | zlib-stream | .zlib | 0..9 | RFC 1950 包装，同一 zlib 库 |
-| raw-deflate | .zz | 0..9 | 无头 deflate 流，后缀识别 |
+| raw-deflate | .zz | 0..9 | 无头 deflate 流，后缀识别；无校验和，损坏流可能静默错解（格式固有） |
 | lzma | .lzma | 0..9 | lzma-alone 容器，走 liblzma |
 | lzvn | — | 仅解码 | "bvn" 流，与 lzfse 共用块解码器 |
 | lzip | .lz | 仅解码 | lzip 容器（v0/v1），走 liblzma，多 member |

@@ -68,7 +68,7 @@ omnic list                       list codecs and recognized formats
 | snappy 1.3.1 | .snappy | 1..2 | official framing format (magic + CRC32C + 64 KB chunks) |
 | lzfse 1.0 | .lzfse | — | single speed point |
 | zlib-stream | .zlib | 0..9 | RFC 1950 wrapper, same zlib library |
-| raw-deflate | .zz | 0..9 | headerless deflate, recognized by extension |
+| raw-deflate | .zz | 0..9 | headerless deflate, recognized by extension; no checksum — corrupted streams can decode silently (format-inherent) |
 | lzma | .lzma | 0..9 | lzma-alone container, via liblzma |
 | lzvn | — | decode only | "bvn" streams, shares the lzfse block decoder |
 | lzip | .lz | decode only | lzip container (v0/v1), via liblzma, multi-member |
