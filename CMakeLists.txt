@@ -249,6 +249,9 @@ add_test(NAME core COMMAND test_core)
 # 个位数；40% 线容纳 CI 共享 runner 抖动，专抓量级回归（如 read_all 翻倍类），
 # 紧验收线由本地正式跑数把关
 add_test(NAME bench_smoke COMMAND omnic_bench --size 16 --rounds 3 --check 40)
+# CI 共享 runner 偶发调度干扰（实测同代码 worst 77% 虚高的偶发）——失败自动重跑一次：
+# 偶发重跑即恢复，真实回归重跑仍挂，门禁效力不变
+set_tests_properties(bench_smoke PROPERTIES RETRY_FAIL TRUE)
 
 # TST-DEC-001 fuzz 冒烟：损坏输入（截断/位翻转/边界）只报错、不崩溃不挂死；
 # raw-deflate 无校验和，静默错解为格式固有（python zlib 同），脚本内豁免
