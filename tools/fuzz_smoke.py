@@ -20,14 +20,15 @@ import tempfile
 import time
 
 OMNIC_DEFAULT = None
+SRC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # tools/ 的上级
 
 
 def find_default_omnic():
-    """单配置生成器在 build/，MSVC 多配置在 build/Release/。"""
+    """单配置生成器在 build/，MSVC 多配置在 build/Release/；相对源根锚定（与 cwd 无关）。"""
     cands = []
     for sub in ("", "Release/"):
         for name in ("omnic.exe", "omnic"):
-            p = os.path.join("build", sub + name)
+            p = os.path.join(SRC_ROOT, "build", sub + name)
             if os.path.isfile(p):
                 return p
             cands.append(p)
@@ -138,7 +139,7 @@ def main():
         cases.append((f"{codec}", newart, payload))
 
     # decode-only：.Z 样本 + 内嵌 blob
-    z = os.path.join("tests", "files", "z_text.Z")
+    z = os.path.join(SRC_ROOT, "tests", "files", "z_text.Z")
     if os.path.isfile(z):
         cases.append(("compress(.Z)", os.path.abspath(z), None))
     bz = os.path.join(work, "good_bzip2.bz2")
@@ -153,7 +154,7 @@ def main():
     gen = None
     for sub in ("", "Release/"):
         for name in ("fuzz_lzvn_gen.exe", "fuzz_lzvn_gen"):
-            p = os.path.join("build", sub + name)
+            p = os.path.join(SRC_ROOT, "build", sub + name)
             if os.path.isfile(p):
                 gen = p
                 break
