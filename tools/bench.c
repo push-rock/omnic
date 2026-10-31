@@ -733,7 +733,7 @@ int main(int argc, char **argv) {
     free(corpus);
 
     /* 注册表驱动的 codec 集合（按启用条件组装） */
-    static const int lv_zstd[] = {-3, 1, 3, 6, 9, 12, 16, 19};
+    static const int lv_zstd[] = {-3, -1, 1, 3, 6, 8, 9, 12, 16, 19};
     static const int lv_lz4[] = {0, 3, 9, 12};
     static const int lv_zlib[] = {1, 6, 9};
     static const int lv_ldef[] = {1, 6, 12};
