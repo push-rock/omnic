@@ -92,7 +92,7 @@ python tools/plot_bench.py bench.csv -o assets/bench
 
 ## How it picks
 
-The policy table is compiled in (`src/policy/policy_table.gen.c`), initialized from lzbench measurements, and regenerable from real data by the offline training pipeline (`tools/train`, Python: `bench.py` → CSV → `fit.py` → C table). Deciding is a table lookup — microseconds, no model runtime.
+The policy table is compiled in (`src/policy/policy_table.gen.c`), initialized from lzbench measurements; a data-driven retraining pipeline is planned for phase 2. Deciding is a table lookup — microseconds, no model runtime.
 
 ## License
 
