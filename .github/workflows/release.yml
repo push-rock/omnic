@@ -42,7 +42,7 @@ jobs:
           cmake --install build --prefix dist
           name="omnic-${{ github.ref_name }}-${{ matrix.os }}"
           if [ "${{ matrix.pack }}" = "zip" ]; then
-            (cd dist && zip -r "../${name}.zip" .)
+            powershell -NoProfile -Command "Compress-Archive -Path dist/* -DestinationPath ${name}.zip"
           else
             (cd dist && tar -czf "../${name}.tar.gz" .)
           fi
