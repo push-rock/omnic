@@ -847,7 +847,7 @@ int main(int argc, char **argv) {
                    bc->label, bc->ops->name, lvl, ratio, c_base, c_adapt, -c_loss, d_base, d_adapt,
                    -d_loss);
             if (csv != NULL)
-                fprintf(csv, "%s,%s,%d,%.2f,%.1f,%.1f,%.2f,%.1f,%.1f,%.2f\n", bc->label, bc->ops->name,
+                fprintf(csv, "%s,%s,%d,%.4f,%.1f,%.1f,%.2f,%.1f,%.1f,%.2f\n", bc->label, bc->ops->name,
                         lvl, ratio, c_base, c_adapt, c_loss, d_base, d_adapt, d_loss);
         }
     }

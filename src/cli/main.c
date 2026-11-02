@@ -58,7 +58,7 @@ static int cmd_list(void) {
 int main(int argc, char **argv) {
     omnic_args a;
     omnic_report rep;
-    int rc = 0;
+    int rc = (int)OMNIC_OK;
 
     if (omnic_parse_args(argc, argv, &a) != 0) {
         usage(stderr);
@@ -97,7 +97,7 @@ int main(int argc, char **argv) {
             omnic_print_report(a.files[i], &rep, &a.opts);
         } else {
             fprintf(stderr, "omnic: %s\n", omnic_last_error());
-            if (st > rc) rc = st;
+            if ((int)st > rc) rc = (int)st;
         }
     }
     free(a.files);
