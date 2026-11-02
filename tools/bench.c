@@ -665,18 +665,17 @@ static double base_run(base_c_fn bc, base_d_fn bd, const char *in_path, const ch
     return omnic_now_sec() - t0;
 }
 
-static double median3(double a, double b, double c) {
-    if (a > b) { double t = a; a = b; b = t; }
-    if (b > c) { double t = b; b = c; c = t; }
-    if (a > b) b = a;
-    return b;
-}
-
-/* 轮数 1 取单值，2 取均值，3 取中位（上限 3） */
+/* 轮数 1 取单值，多轮取最小耗时（最快轮）。
+ * CI 宿主存在秒级两态速度切换（ubuntu clang 实测 zstd 解压基线/适配反相关
+ * ±300%，SMT 邻核/节流噪声穿透奇偶交替的中位数）；解压无随机路径，
+ * 最快轮即最少被噪声干扰的测量，且对基线/适配对称。 */
 static double pick(double *v, int rounds) {
-    if (rounds == 1) return v[0];
-    if (rounds == 2) return (v[0] + v[1]) / 2.0;
-    return median3(v[0], v[1], v[2]);
+    if (rounds < 1) return v[0];
+    double m = v[0];
+    for (int i = 1; i < rounds; i++) {
+        if (v[i] < m) m = v[i];
+    }
+    return m;
 }
 
 int main(int argc, char **argv) {
