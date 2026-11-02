@@ -1,12 +1,15 @@
 """pareto: 前沿与档位规则的共享实现（PHASE2_DECIDER_DESIGN §1.3/§3.6 预注册）。
 
-支配口径（与 J1 一致）: a ⊳ b ⟺ 全维不劣 ∧ 至少一维严格（速度维 >10% 优势才计入严格）。
+支配口径（与 J1 一致）: a ⊳ b ⟺ 全维不劣 ∧ 至少一维实质严格。
+  速度维 >10% 优势才计入严格（时序噪声容差）；ρ 维相对差 >0.5% 才计入严格
+  （舍入/并列容差，与 br 并列裁决一致；实现期修正 #6，见文档 §3.8）。
 聚合口径: v = geomean_i(v_i)（速度比率语义）; rho = mean_i(rho_i)（等权, 与 LOO 单位一致）。
 """
 import csv
 import math
 
 STRICT_SPEED = 1.10
+STRICT_RHO = 1.005
 
 
 def load_matrix(path):
@@ -26,7 +29,8 @@ def dominates(a, b, kmax=('vc', 'vd'), kmin=('rho',)):
     ge = all(a[k] >= b[k] for k in kmax) and all(a[k] <= b[k] for k in kmin)
     if not ge:
         return False
-    strict = any(a[k] >= b[k] * STRICT_SPEED for k in kmax) or any(a[k] < b[k] for k in kmin)
+    strict = (any(a[k] >= b[k] * STRICT_SPEED for k in kmax)
+              or any(a[k] * STRICT_RHO < b[k] for k in kmin))
     return strict
 
 
@@ -58,7 +62,13 @@ def aggregate(matrices):
 def bal_distance(p, front):
     """预注册式：前沿区间对数归一化 x̂ = ln(x/x_min)/ln(x_max/x_min)，d = √[(1-v̂c)²+(1-v̂d)²+ρ̂²]。"""
     def norm(val, lo, hi):
-        return 0.0 if hi <= lo else math.log(val / lo) / math.log(hi / lo)
+        # lo<=0（如 pattern 语料 brotli 把 ρ 压到舍入为 0）时 log 归一化退化，
+        # 取极限语义：val<=lo 已最优，val>lo 为最远
+        if hi <= lo:
+            return 0.0
+        if lo <= 0.0:
+            return 0.0 if val <= 0.0 else 1.0
+        return math.log(val / lo) / math.log(hi / lo)
     vcs = [x['vc'] for x in front]
     vds = [x['vd'] for x in front]
     rhos = [x['rho'] for x in front]
@@ -98,10 +108,12 @@ def pick_profiles(points):
     bal = min(fr, key=lambda x: bal_distance(x, fr))
     pick['bal'] = {'codec': bal['codec'], 'level': bal['level']}
 
-    # BR: argmin rho（并列 <0.5% 取 vd 高者）
+    # BR: argmin rho，并列带（<0.5%）先按容器生态裁决再取 vd 高者。
+    # 实现期修正 #7（2026-11-02 人工裁决登记）：lzma_alone 与 xz 同引擎，
+    # ρ 微优 <0.5pp 且解压差 <5%，属舍入并列；.xz 生态兼容性远优，并列时固定取 xz。
     br = min(fr, key=lambda x: (x['rho'], -x['vd']))
     near = [x for x in fr if x['rho'] < br['rho'] * 1.005]
-    br = max(near, key=lambda x: x['vd']) if len(near) > 1 else br
+    br = max(near, key=lambda x: (x['codec'] == 'xz', x['vd'])) if len(near) > 1 else br
     pick['br'] = {'codec': br['codec'], 'level': br['level']}
     return pick
 

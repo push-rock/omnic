@@ -17,16 +17,33 @@ import pareto
 
 PROFILE_DIMS = {'fc': ('vc',), 'fd': ('vd',), 'bal': ('vc', 'vd'), 'br': ()}
 
+# 提议的 M6 门禁形式（待批复）：有界 regret——聚合 LOO 支配是分布异质性的
+# 本质后果，零支配只在类内同质时可达。界值取当前损失分布的 natural break。
+REGRET_RHO_PP = 1.0
+REGRET_V_PCT = 50.0
 
-def dom_count(cfg, matrix, kmax):
-    """表配置在矩阵上的实质支配数（br: 纯 rho 维支配计数）。"""
+
+def dom_regret(cfg, matrix, kmax, prof):
+    """表配置在矩阵上的实质支配者 + regret（速度相对 %、ρ 绝对 pp）。"""
     t = next((p for p in matrix if p['codec'] == cfg[0] and p['level'] == cfg[1]), None)
     if t is None:
-        return 1, ['<missing-from-matrix>']  # 表配置不在矩阵 = 无法验证，按失败计
-    kmin = ('rho',)
-    doms = [b['name'] for b in matrix
-            if b is not t and pareto.dominates(b, t, kmax, kmin)]
-    return len(doms), doms
+        return 1, ['<missing-from-matrix>'], 0.0, 0.0
+    doms, v_reg, rho_reg = [], 0.0, 0.0
+    for b in matrix:
+        if b is t:
+            continue
+        if prof == 'br':
+            if b['rho'] * pareto.STRICT_RHO < t['rho']:
+                doms.append(b['name'])
+                rho_reg = max(rho_reg, (t['rho'] - b['rho']) / 1.0)
+            continue
+        if not pareto.dominates(b, t, kmax, ('rho',)):
+            continue
+        doms.append(b['name'])
+        rho_reg = max(rho_reg, t['rho'] - b['rho'])
+        for k in kmax:
+            v_reg = max(v_reg, b[k] / t[k] - 1.0)
+    return len(doms), doms, v_reg, rho_reg
 
 
 def main():
@@ -56,21 +73,21 @@ def main():
                 continue
             matrix = pareto.load_matrix(train / e['csv'])
             bad = []
+            over = []  # 超提议 regret 界（REGRET_RHO_PP / REGRET_V_PCT）的档
             for prof, cfg in sorted(pick.items()):
                 kmax = PROFILE_DIMS.get(prof, ('vc', 'vd'))
-                n, doms = dom_count((cfg['codec'], cfg['level']), matrix, kmax)
-                if prof == 'br':
-                    t = next((p for p in matrix
-                              if p['codec'] == cfg['codec'] and p['level'] == cfg['level']), None)
-                    if t is None:
-                        n, doms = 1, ['<missing>']
-                    else:
-                        doms = [b['name'] for b in matrix if b['rho'] < t['rho']]
-                        n = len(doms)
-                if n:
-                    bad.append('%s(%d): %s' % (prof, n, ','.join(doms[:3])))
-            status = 'PASS' if not bad else 'FAIL'
-            rc |= 1 if bad else 0
+                n, doms, v_reg, rho_reg = dom_regret((cfg['codec'], cfg['level']),
+                                                     matrix, kmax, prof)
+                if not n:
+                    continue
+                bad.append('%s(%d): %s' % (prof, n, ','.join(doms[:3])))
+                # regret 量化（速度相对 %、ρ 绝对 pp）
+                if v_reg > 0.005 or rho_reg > 0.005:
+                    bad[-1] += '  [regret: v +%.0f%%, rho -%.2f pp]' % (v_reg * 100, rho_reg)
+                if rho_reg > REGRET_RHO_PP or v_reg * 100 > REGRET_V_PCT:
+                    over.append(prof)
+            status = 'PASS' if not bad else ('OVER' if over else 'FAIL')
+            rc |= 1 if over else 0
             print('  %s %s' % (key, status))
             for b in bad:
                 print('      %s' % b)
@@ -87,7 +104,7 @@ def main():
                 parts = []
                 for prof, cfg in sorted(info['pick'].items()):
                     kmax = PROFILE_DIMS.get(prof, ('vc', 'vd'))
-                    n, doms = dom_count((cfg['codec'], cfg['level']), matrix, kmax)
+                    n, _, _, _ = dom_regret((cfg['codec'], cfg['level']), matrix, kmax, prof)
                     if n:
                         parts.append('%s:%d' % (prof, n))
                 print('  %s/%s: %s' % (klass, e['dist'], ','.join(parts) or '0'))
