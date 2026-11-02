@@ -14,7 +14,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <file...>  # prints feature-vector CSV\n", argv[0]);
         return 2;
     }
-    printf("path,H_h,H_m,H_t,delta,printable,line_cv,dup4k,dup16,zero,coarse,refined\n");
+    printf("path,H_h,H_m,H_t,delta,printable,line_cv,dup4k,dup16,zero,cond_h,blockent_cv,delta_h,coarse,refined\n");
     for (int i = 1; i < argc; i++) {
         FILE *f = fopen(argv[i], "rb");
         if (f == NULL) {
@@ -36,9 +36,10 @@ int main(int argc, char **argv) {
         omnic_feature_extract(seg, hn, seg + SEG, mn, seg + 2 * SEG, tn, &g);
         omnic_class coarse = omnic_classify_ext(argv[i]);
         omnic_class fine = omnic_refine_class(coarse, &g);
-        printf("%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%s\n", argv[i], g.entropy_h,
+        printf("%s,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%s,%s\n", argv[i], g.entropy_h,
                g.entropy_m, g.entropy_t, g.entropy_delta, g.printable, g.line_cv, g.dup_rate,
-               g.dup_rate_16, g.zero_rate, omnic_class_str(coarse), omnic_class_str(fine));
+               g.dup_rate_16, g.zero_rate, g.cond_h, g.blockent_cv, g.delta_h,
+               omnic_class_str(coarse), omnic_class_str(fine));
         fclose(f);
         free(seg);
     }

@@ -14,3 +14,14 @@ double omnic_entropy(const uint8_t *p, size_t n) {
     }
     return h;
 }
+
+double omnic_entropy_u32(const uint32_t *hist, int k, size_t n) {
+    if (n == 0) return 0.0;
+    double h = 0.0;
+    for (int i = 0; i < k; i++) {
+        if (hist[i] == 0) continue;
+        double pr = (double)hist[i] / (double)n;
+        h -= pr * log2(pr);
+    }
+    return h;
+}

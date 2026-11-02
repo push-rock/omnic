@@ -46,7 +46,9 @@ typedef enum {
     OMNIC_CLS_NTEXT,              /* 自然语言文本（TEXT 细分） */
     OMNIC_CLS_CODE,               /* 源代码/标记语言（TEXT 细分） */
     OMNIC_CLS_GRAPHIC,            /* 合成图/图形位图（MEDIA_RAW 细分） */
-    OMNIC_CLS_PHOTO               /* 照片/噪声主导位图（MEDIA_RAW 细分） */
+    OMNIC_CLS_PHOTO,              /* 照片/噪声主导位图（MEDIA_RAW 细分） */
+    OMNIC_CLS_SYNTH_PIC           /* 合成图案位图（MEDIA_RAW 细分：d4k<0.30 且 cond_h<2.0，
+                                    * M6 训练对齐第三轮细分，见 feature.c 注） */
 } omnic_class;
 
 /* 支持的压缩流格式（需求 4.4 节清单） */

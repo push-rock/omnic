@@ -14,6 +14,9 @@ typedef struct omnic_features {
     double dup_rate;                        /* 4KiB 窗口重复率（合成图块重复 vs 照片噪声） */
     double dup_rate_16;                     /* 16B 对齐 n-gram 重复率（token 级，CODE 检测） */
     double zero_rate;                       /* 零字节率（三段合计） */
+    double cond_h;                          /* 中段相邻字节条件熵 H(Xi|Xi-1)（顺序结构强度） */
+    double blockent_cv;                     /* 中段 64 块熵变异系数（块均匀性） */
+    double delta_h;                         /* 中段 H(X) - H(Xi-Xi-1)（差分熵降，平滑度） */
 } omnic_features;
 
 /* 三段允许退化：中/尾段为空时复用头段（单段文件）。 */

@@ -60,6 +60,7 @@ const char *omnic_class_str(omnic_class c) {
         case OMNIC_CLS_CODE: return "text/code";
         case OMNIC_CLS_GRAPHIC: return "media/graphic";
         case OMNIC_CLS_PHOTO: return "media/photo";
+        case OMNIC_CLS_SYNTH_PIC: return "media/synth_pic";
         case OMNIC_CLS_UNKNOWN: return "unknown";
         default: return "?";
     }

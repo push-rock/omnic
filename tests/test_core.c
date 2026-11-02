@@ -216,7 +216,7 @@ static void test_policy(void) {
     e = omnic_policy_lookup(OMNIC_CLS_ALREADY_COMPRESSED, OMNIC_PROFILE_BALANCED);
     CHECK(omnic_policy_is_skip(e));
     e = omnic_policy_lookup(OMNIC_CLS_NTEXT, OMNIC_PROFILE_FAST_COMPRESS);
-    CHECK(e != NULL && strcmp(e->codec, "lz4") == 0);
+    CHECK(e != NULL && strcmp(e->codec, "zstd") == 0); /* M6 fit: ntext FC=zstd/-1 */
 }
 
 /* ---- 特征层与细分类（PHASE2_DECIDER_DESIGN §3.3/3.4） ---- */
@@ -256,7 +256,11 @@ static void test_feature(void) {
     omnic_features mv = {0};
     mv.dup_rate = 0.5;
     CHECK(omnic_refine_class(OMNIC_CLS_MEDIA_RAW, &mv) == OMNIC_CLS_GRAPHIC);
+    /* M6 第三轮细分：cond_h<2.0 合成图案（走查 0.19~1.30），>=2.0 照片
+     * （mr/x-ray/wall 2.75~5.62），阈值居 1.45bit 空 gap 中点 */
     mv.dup_rate = 0.01;
+    CHECK(omnic_refine_class(OMNIC_CLS_MEDIA_RAW, &mv) == OMNIC_CLS_SYNTH_PIC);
+    mv.cond_h = 4.0; /* 真实照片带 */
     CHECK(omnic_refine_class(OMNIC_CLS_MEDIA_RAW, &mv) == OMNIC_CLS_PHOTO);
     omnic_features sd = {0};
     sd.entropy_delta = 2.0;
@@ -266,15 +270,16 @@ static void test_feature(void) {
 }
 
 /* FC 档候选试压（PHASE2 §3.5）：≥32MiB、reason 含实测数字、roundtrip 完整。
- * SRC 自然文本 ×11（≥32MiB）：自然文本上 zstd-3 的 ρ 稳定优于 lz4
- * （一期实测），验证预算内选优方向。 */
+ * SRC 自然文本 ×11（≥32MiB），.txt 扩展名走 text/ntext——FC=zstd/-1
+ * （2nd: lz4/0）触发试压，自然文本上 zstd 的 ρ 胜 lz4（一期实测）。
+ * 无扩展名会落 UNKNOWN 兜底（熵细分，不走文本特征），不触发试压。 */
 static void test_trial(void) {
     omnic_options o = def_opts();
     omnic_report rep;
-    const char *path = "omnic_test_trial.tar";
-    const char *ref = "omnic_test_trial_ref.tar";
-    rm("omnic_test_trial.tar.zst");
-    rm("omnic_test_trial.tar.lz4"); /* 上次运行的残留（试压胜者不定） */
+    const char *path = "omnic_test_trial.txt";
+    const char *ref = "omnic_test_trial_ref.txt";
+    rm("omnic_test_trial.txt.zst");
+    rm("omnic_test_trial.txt.lz4"); /* 上次运行的残留（试压胜者不定） */
     rm(path);
     rm(ref);
 
@@ -303,9 +308,9 @@ static void test_trial(void) {
     CHECK(strcmp(rep.codec, "zstd") == 0); /* 自然文本 zstd-3 ρ 胜 lz4（预算内选优） */
 
     o.flags |= OMNIC_F_FORCE; /* def_opts 的 KEEP 保留了源文件，解压需覆盖 */
-    CHECK(omnic_decompress("omnic_test_trial.tar.zst", &o, &rep) == OMNIC_OK);
+    CHECK(omnic_decompress("omnic_test_trial.txt.zst", &o, &rep) == OMNIC_OK);
     CHECK(files_equal(path, ref));
-    rm("omnic_test_trial.tar.zst");
+    rm("omnic_test_trial.txt.zst");
     rm(path);
     rm(ref);
 }
