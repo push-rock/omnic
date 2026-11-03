@@ -1,4 +1,4 @@
-/* 决策表（SW-POL-002）。由 fit.json 生成（2026-11-02），覆盖类: code, exec, graphic, ntext, photo, structured, synth_pic。
+/* 决策表（SW-POL-002）。由 fit.json 生成（2026-11-03），覆盖类: code, exec, graphic, ntext, photo, structured, synth_pic。
  * 结构: 8 类 x 4 档 = 32 行；粗类 TEXT/MEDIA_RAW 经 gamma 细分后不进表。
  * 规则与支配口径见 docs/PHASE2_DECIDER_DESIGN.md（本地）；生成勿手改，
  * 手动调整须在表尾登记（SW-TRAIN-002 由 tools/train 生成）。 */
@@ -15,7 +15,7 @@ const omnic_policy_entry omnic_policy_entries[] = {
     /* ---- code ---- */
     {OMNIC_CLS_CODE, OMNIC_PROFILE_FAST_COMPRESS, "zstd", 1, "source code: zstd -1 (fastest compression)", "snappy", 1},
     {OMNIC_CLS_CODE, OMNIC_PROFILE_FAST_DECOMPRESS, "lz4", 12, "source code: lz4 -12 (fast decompress)", NULL, 0},
-    {OMNIC_CLS_CODE, OMNIC_PROFILE_BALANCED, "zstd", 8, "source code: zstd -8 (balanced)", NULL, 0},
+    {OMNIC_CLS_CODE, OMNIC_PROFILE_BALANCED, "zstd", 9, "source code: zstd -9 (balanced)", NULL, 0},
     {OMNIC_CLS_CODE, OMNIC_PROFILE_BEST_RATIO, "xz", 9, "source code: xz -9 (best ratio)", NULL, 0},
 
     /* ---- exec ---- */
