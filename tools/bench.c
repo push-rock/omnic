@@ -700,7 +700,7 @@ int main(int argc, char **argv) {
         else die("usage: omnic_bench [--size MiB] [--rounds N] [--csv FILE] [--check pct] [--only name] [--corpus FILE]...");
     }
     if (rounds < 1) rounds = 1;
-    if (rounds > 3) rounds = 3;
+    if (rounds > 9) rounds = 9; /* 上限防呆；M6 复测支持 ≥5 轮的噪声观察 */
 
     uint8_t *corpus;
     size_t src_len;
