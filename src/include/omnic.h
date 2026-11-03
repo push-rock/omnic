@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define OMNIC_VERSION "0.1.0"
+#define OMNIC_VERSION "0.2.0"
 
 /* 统一状态码，与 CLI 退出码同源（SW-CLI-002） */
 typedef enum {
