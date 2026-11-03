@@ -743,7 +743,7 @@ int main(int argc, char **argv) {
     bench_codec cs[16];
     int ncs = 0;
 #ifdef OMNIC_CODEC_ZSTD
-    cs[ncs++] = (bench_codec){&omnic_codec_zstd, "zstd", base_zstd_c, base_zstd_d, lv_zstd, 8};
+    cs[ncs++] = (bench_codec){&omnic_codec_zstd, "zstd", base_zstd_c, base_zstd_d, lv_zstd, 10};
 #endif
 #ifdef OMNIC_CODEC_LZ4
     cs[ncs++] = (bench_codec){&omnic_codec_lz4, "lz4", base_lz4_c, base_lz4_d, lv_lz4, 4};
@@ -782,7 +782,7 @@ int main(int argc, char **argv) {
                 "dec_base_mbs,dec_adapt_mbs,dec_loss_pct\n");
     }
 
-    printf("omnic_bench: %s corpus (%.1f MiB), %d round(s) (median)\n",
+    printf("omnic_bench: %s corpus (%.1f MiB), %d round(s) (min)\n",
            ncfiles > 0 ? "file" : "synthetic", (double)src_len / 1048576.0, rounds);
     printf("%-12s %-12s %5s %7s %26s %26s\n", "codec", "format", "level", "ratio", "compress MB/s",
            "decompress MB/s");

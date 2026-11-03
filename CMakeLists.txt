@@ -226,6 +226,11 @@ if(OMNIC_LIBS)
 endif()
 # log2 等数学函数在 Linux 上位于独立的 libm；Windows (CRT) 与 macOS (libSystem) 自动链接
 target_link_libraries(omnic_core PUBLIC $<$<PLATFORM_ID:Linux>:m>)
+# MinGW：snappy 等第三方为 C++ 源，静态链后按符号集可能拉入 libstdc++ DLL 依赖；
+# 统一静态化 GCC 运行时（仅消运行时 DLL 依赖，系统 DLL 不动），工具 exe 可直接分发
+if(WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU")
+  add_link_options(-static-libgcc -static-libstdc++)
+endif()
 
 # ---- CLI ----
 add_executable(omnic src/cli/argp.c src/cli/main.c src/cli/report.c)
@@ -237,6 +242,10 @@ add_executable(omnic_bench tools/bench.c tools/bench_zng.c)
 add_executable(feature_probe tools/feature_probe.c)
 target_link_libraries(feature_probe PRIVATE omnic_core)
 target_compile_definitions(feature_probe PRIVATE ${OMNIC_DEFS})
+# 游戏包 per-file 基准（M6 外部用例，README 数据源）
+add_executable(omnic_gamepack tools/gamepack.c)
+target_link_libraries(omnic_gamepack PRIVATE omnic_core)
+target_compile_definitions(omnic_gamepack PRIVATE ${OMNIC_DEFS})
 target_link_libraries(omnic_bench PRIVATE omnic_core)
 target_compile_definitions(omnic_bench PRIVATE ${OMNIC_DEFS})
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
