@@ -242,10 +242,13 @@ add_executable(omnic_bench tools/bench.c tools/bench_zng.c)
 add_executable(feature_probe tools/feature_probe.c)
 target_link_libraries(feature_probe PRIVATE omnic_core)
 target_compile_definitions(feature_probe PRIVATE ${OMNIC_DEFS})
-# 游戏包 per-file 基准（M6 外部用例，README 数据源）
-add_executable(omnic_gamepack tools/gamepack.c)
-target_link_libraries(omnic_gamepack PRIVATE omnic_core)
-target_compile_definitions(omnic_gamepack PRIVATE ${OMNIC_DEFS})
+# 游戏包 per-file 基准（M6 外部用例，README 数据源）。QPC 计时 + direct.h + dirent.h
+# 组合仅 MinGW 工具链齐备（POSIX 层 + Win32 层），MSVC/非 Windows 不编。
+if(WIN32 AND NOT MSVC)
+  add_executable(omnic_gamepack tools/gamepack.c)
+  target_link_libraries(omnic_gamepack PRIVATE omnic_core)
+  target_compile_definitions(omnic_gamepack PRIVATE ${OMNIC_DEFS})
+endif()
 target_link_libraries(omnic_bench PRIVATE omnic_core)
 target_compile_definitions(omnic_bench PRIVATE ${OMNIC_DEFS})
 if(NOT MSVC AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
