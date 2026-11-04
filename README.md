@@ -22,7 +22,7 @@ report.json.xz: xz
 
 lzbench benchmarks 50+ compressors, but no mainstream tool routes between them. `zstd --adapt` adapts levels *within* one codec; 7-Zip doesn't care whether the input is JSON or a bitmap. omnic closes that gap:
 
-- **Compress**: classify the input (extension + 4 MB entropy sample), then look up a policy table — *7 data classes × 4 preference profiles* — to pick `(codec, level)`.
+- **Compress**: classify the input (extension routing + 3-segment sample: 256 KiB head/middle/tail, 8 features), then look up a policy table — *8 data classes × 4 preference profiles* — to pick `(codec, level)`. A full decision takes about a millisecond, most of it I/O.
 - **Prefer**: `--profile fast_compress | fast_decompress | best_ratio | balanced`.
 - **Decompress**: recognize the format by magic number first, extension as fallback. Native formats only, so every output can be unpacked by the official tools of that codec.
 - **Skip incompressible data**: already-compressed inputs (jpeg/zip/…) and high-entropy data (≥7.5 bits/byte) are skipped with a warning; `--force` overrides.
@@ -81,7 +81,7 @@ All adapters share one interface (`src/codec/ac_*.c`), so adding a codec is a si
 
 ![codec landscape](assets/bench.svg)
 
-Speed vs ratio for the compressors, measured through omnic's streaming adapter layer on the [Silesia corpus](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia) (212 MiB, 12 real-world files; median of 3 rounds). Reproduce with the bundled tool:
+Speed vs ratio for the compressors, measured through omnic's streaming adapter layer on the [Silesia corpus](https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia) (212 MiB, 12 real-world files; fastest of 3 rounds). Reproduce with the bundled tool:
 
 ```
 omnic_bench --rounds 3 --csv bench.csv --corpus silesia/dickens --corpus silesia/mozilla ... (12 files)
@@ -92,7 +92,33 @@ python tools/plot_bench.py bench.csv -o assets/bench
 
 ## How it picks
 
-The policy table is compiled in (`src/policy/policy_table.gen.c`), initialized from lzbench measurements; a data-driven retraining pipeline is planned for phase 2. Deciding is a table lookup — microseconds, no model runtime.
+The decision pipeline runs in about **1 ms** (dominated by I/O: three 256 KiB segments sampled from head/middle/tail — the first-order entropy is already converged at that size, so a 4 GB file costs no more than a 4 MB one):
+
+1. **Extension routing** maps known extensions to a coarse class (unknown extensions fall back to content).
+2. **8 features** (entropy, printable ratio, 16 B / 4 KiB window duplicate rates, byte-pair conditional entropy, block-entropy CV, delta entropy…) refine the coarse class into one of **7 content classes** — `natural_text`, `source_code`, `structured`, `graphic`, `synthetic_pic` (flat synthetic graphics: icons/charts/screenshots), `photo`, `executable` — with `already_compressed` / `random` as skip short-circuits.
+3. **Policy table lookup** returns `(codec, level)` per profile. For large files the `fast_compress` profile trial-compresses its top-2 candidates on a 256 KiB mid-segment under a 50 ms budget before committing.
+4. `--explain` prints the whole chain: class, features, and why that row of the table fired.
+
+The table itself is **measured, not hand-tuned**: `tools/train/` holds the full pipeline (bench → fit → gen). The shipped table is fit from a 22-distribution × 44-config benchmark matrix, and every release is gated by:
+
+- **Leave-one-out regret bound** — refit the table with each distribution held out; the holdout's regret against the oracle pick must stay within ρ ≤ 1.0 pp (ratio) and v ≤ 50% (speed).
+- **External validation** on real files never used in training — the fitted table beats the v0.1.0 hand-tuned one at near-zero regret on text/photo/executable.
+- **Survivorship-bias control** — fitted ρ-regret 0.31 pp vs hand-tuned 0.45 pp vs random 2.33 pp.
+
+The failure surface is documented rather than hidden: 5 of 22 distributions exceed the regret bound, all traced to intra-class polymorphism (real photos vs themed bitmaps, 64- vs 32-bit binaries). Adding more corpora was measured and does *not* fix it — the fix is a finer class split, listed as future work.
+
+## Real-world: game asset tree vs Oodle Kraken
+
+A 152.5 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files — PNG textures, Lua scripts, Ogg sounds, models, fonts) packed through the decision layer, per-file:
+
+| profile | ratio | decompress | vs Kraken-5* |
+|---|---|---|---|
+| `balanced` (zstd 9) | 59.5% | **1060 MiB/s** | ~79% faster |
+| `best_ratio` (xz 6) | **57.0%** | 82 MiB/s | 0.8 pp smaller |
+
+The decision layer correctly passes through the 54% already-compressed assets (PNG/Ogg) instead of wasting time re-compressing them — that is where most of the decompression win comes from. For comparison, forcing zstd-19 over the whole tree lands at 57.9% / 579 MiB/s: the classifier's per-class routing matches a global max-compression policy on ratio while decompressing ~2× faster.
+
+\* Kraken is a commercial codec without public binaries; the comparison uses same-machine cross-calibrated anchors (third-party Silesia measurements + local zstd/lz4 anchor matrix, geometric-mean machine factor). Numbers are converted estimates with ±8% sensitivity, methodology documented in the repo. Draw your own conclusions.
 
 ## License
 
