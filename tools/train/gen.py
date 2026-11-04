@@ -22,6 +22,7 @@ CLS = [
     ('exec', 'EXEC', 'exec'),
     ('structured', 'STRUCTURED', 'structured'),
     ('graphic', 'GRAPHIC', 'graphic'),
+    ('synth_pic', 'SYNTH_PIC', 'synthetic graphic'),
     ('photo', 'PHOTO', 'photo'),
     ('already_compressed', 'ALREADY_COMPRESSED', 'already compressed'),
     ('random', 'RANDOM', 'high entropy >=7.5 bits/byte'),
@@ -138,6 +139,7 @@ def main():
     fitted_classes = fit.get('classes', fit)
     baseline = parse_current(args.baseline)
     rows = build_rows(baseline, fitted_classes)
+    out_count = len(rows)
     src_note = ('由 %s 生成（%s），覆盖类: %s。'
                 % (Path(args.fit).name, time.strftime('%Y-%m-%d'),
                    ', '.join(sorted(fitted_classes)) or '无'))
@@ -157,7 +159,7 @@ def main():
             print('  ' + l)
     else:
         Path(args.out).write_text(text, encoding='utf-8')
-        print('gen: 写入 %s（32 行，覆盖类: %s）' % (args.out, ', '.join(sorted(fitted_classes)) or '无'))
+        print('gen: 写入 %s（%d 行，覆盖类: %s）' % (args.out, out_count, ', '.join(sorted(fitted_classes)) or '无'))
 
 
 if __name__ == '__main__':

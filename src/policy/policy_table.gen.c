@@ -1,4 +1,4 @@
-/* 决策表（SW-POL-002）。由 fit.json 生成（2026-11-03），覆盖类: code, exec, graphic, ntext, photo, structured, synth_pic。
+/* 决策表（SW-POL-002）。由 fit.json 生成（2026-11-04），覆盖类: code, exec, graphic, ntext, photo, structured, synth_pic。
  * 结构: 8 类 x 4 档 = 32 行；粗类 TEXT/MEDIA_RAW 经 gamma 细分后不进表。
  * 规则与支配口径见 docs/PHASE2_DECIDER_DESIGN.md（本地）；生成勿手改，
  * 手动调整须在表尾登记（SW-TRAIN-002 由 tools/train 生成）。 */
@@ -35,6 +35,12 @@ const omnic_policy_entry omnic_policy_entries[] = {
     {OMNIC_CLS_GRAPHIC, OMNIC_PROFILE_FAST_DECOMPRESS, "zlib-ng", 9, "graphic: zlib-ng -9 (fast decompress)", NULL, 0},
     {OMNIC_CLS_GRAPHIC, OMNIC_PROFILE_BALANCED, "zlib-ng", 9, "graphic: zlib-ng -9 (balanced)", NULL, 0},
     {OMNIC_CLS_GRAPHIC, OMNIC_PROFILE_BEST_RATIO, "brotli", 11, "graphic: brotli -11 (best ratio)", NULL, 0},
+
+    /* ---- synth_pic ---- */
+    {OMNIC_CLS_SYNTH_PIC, OMNIC_PROFILE_FAST_COMPRESS, "brotli", 9, "synthetic graphic: brotli -9 (fastest compression)", "snappy", 1},
+    {OMNIC_CLS_SYNTH_PIC, OMNIC_PROFILE_FAST_DECOMPRESS, "brotli", 9, "synthetic graphic: brotli -9 (fast decompress)", NULL, 0},
+    {OMNIC_CLS_SYNTH_PIC, OMNIC_PROFILE_BALANCED, "zstd", 1, "synthetic graphic: zstd -1 (balanced)", NULL, 0},
+    {OMNIC_CLS_SYNTH_PIC, OMNIC_PROFILE_BEST_RATIO, "brotli", 9, "synthetic graphic: brotli -9 (best ratio)", NULL, 0},
 
     /* ---- photo ---- */
     {OMNIC_CLS_PHOTO, OMNIC_PROFILE_FAST_COMPRESS, "snappy", 1, "photo: snappy -1 (fastest compression)", NULL, 0},
