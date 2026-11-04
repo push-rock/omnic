@@ -107,18 +107,39 @@ The table itself is **measured, not hand-tuned**: `tools/train/` holds the full 
 
 The failure surface is documented rather than hidden: 5 of 22 distributions exceed the regret bound, all traced to intra-class polymorphism (real photos vs themed bitmaps, 64- vs 32-bit binaries). Adding more corpora was measured and does *not* fix it — the fix is a finer class split, listed as future work.
 
-## Real-world: game asset tree vs Oodle Kraken
+## Real-world: a game asset tree
 
-A 152.5 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files — PNG textures, Lua scripts, Ogg sounds, models, fonts) packed through the decision layer, per-file:
+One 152.5 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files — PNG textures, Lua scripts, Ogg sounds, models, fonts, DLLs). All numbers same machine, single thread (i7-12700).
 
-| profile | ratio | decompress | vs Kraken-5* |
+**Packed as one stream** — archive-then-compress, the protocol external benchmarks (lzbench, Oodle's published figures) use:
+
+| configuration | ratio | compress | decompress |
 |---|---|---|---|
-| `balanced` (zstd 9) | 59.5% | **1060 MiB/s** | ~79% faster |
-| `best_ratio` (xz 6) | **57.0%** | 82 MiB/s | 0.8 pp smaller |
+| xz -9 (library ratio max) | 56.8% | 3.5 MiB/s | 81 MiB/s |
+| brotli -11 | 57.0% | 0.7 | 211 |
+| **omnic `best_ratio`** → xz 6 | **57.0%** | 3.9 | 79 |
+| Oodle Kraken-5* | ~57.8% | — | ~590 |
+| zstd -19 (local Kraken-5 proxy) | 57.9% | 5.4 | 579 |
+| **omnic `balanced`** → zstd 9 | 59.5% | 84 | 652 / **1060†** |
+| lz4 -12 (speed anchor) | 66.0% | 23 | 718 |
 
-The decision layer correctly passes through the 54% already-compressed assets (PNG/Ogg) instead of wasting time re-compressing them — that is where most of the decompression win comes from. For comparison, forcing zstd-19 over the whole tree lands at 57.9% / 579 MiB/s: the classifier's per-class routing matches a global max-compression policy on ratio while decompressing ~2× faster.
+- `balanced` decompresses at **1060 MiB/s — 1.8× Kraken-5's estimated 590** — paying 1.7 pp of ratio for it.
+- `best_ratio` beats Kraken-5's ratio by **0.8 pp** at 1/7th its decompress speed.
+- zstd-19, the codec the classifier treats as Kraken-5's local equivalent, matches it within measurement noise (0.15 pp / 2% on Silesia).
+- No single configuration beats Kraken on both axes at once — no codec in the library occupies that design point. The profile system is how you pick a side.
 
-\* Kraken is a commercial codec without public binaries; the comparison uses same-machine cross-calibrated anchors (third-party Silesia measurements + local zstd/lz4 anchor matrix, geometric-mean machine factor). Numbers are converted estimates with ±8% sensitivity, methodology documented in the repo. Draw your own conclusions.
+**Per-file** — omnic's default semantics: each file decided individually, output stays randomly accessible:
+
+| configuration | whole-tree ratio | compressible subset | compress | decompress |
+|---|---|---|---|---|
+| omnic `balanced` | 68.3% | 31.9% | 9.6 MiB/s | 21.5 MiB/s |
+| omnic `best_ratio` | 66.4% | 27.8% | 1.0 | 24.1 |
+| zstd -19 on everything | 64.8% | 28.6% | 0.8 | 27.5 |
+
+Per-file costs ~7 pp of ratio (15 KB average files lose cross-file redundancy vs the single stream) and decompress throughput (per-file context setup, ~0.7 ms × 8,586). What it buys: the decision layer routes the **54% already-compressed assets straight to storage** — zero CPU, byte-identical, no double-compression — and any file can be pulled out without touching the rest. Per-file is the right mode when files are assets you load individually; pack-then-compress when they are not.
+
+\* Kraken has no public binary. Its figures are converted estimates: third-party same-machine Silesia measurements of Kraken 2-6, cross-calibrated through a geometric-mean machine factor from five zstd levels; ±8% sensitivity. zstd-19 independently reproduces the Kraken-5 anchor on Silesia, which is why it serves as the proxy row above.
+† 1060 = omnic's streaming product path (frame-to-frame dictionary reuse); 652 = one-shot library call on the same data.
 
 ## License
 
