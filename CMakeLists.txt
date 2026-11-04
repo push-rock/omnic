@@ -265,7 +265,7 @@ add_test(NAME core COMMAND test_core)
 # 初始化等固定成本占比过高（mac 4MB 实测 zstd 低档虚高 ~18%），16MB 稀释到
 # 个位数；40% 线容纳 CI 共享 runner 抖动，专抓量级回归（如 read_all 翻倍类），
 # 紧验收线由本地正式跑数把关
-add_test(NAME bench_smoke COMMAND omnic_bench --size 16 --rounds 3 --check 40)
+add_test(NAME bench_smoke COMMAND omnic_bench --size 16 --rounds 5 --check 40)
 # CI 共享 runner 偶发调度干扰（实测同代码 worst 77% 虚高的偶发）——失败自动重跑一次：
 # 偶发重跑即恢复，真实回归重跑仍挂，门禁效力不变
 set_tests_properties(bench_smoke PROPERTIES RETRY_FAIL TRUE)
