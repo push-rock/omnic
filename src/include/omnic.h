@@ -1,4 +1,4 @@
-/* omnic - universal compressor
+﻿/* omnic - universal compressor
  * Public API of libomnic (INT-LIB-001).
  * See docs/ARCHITECTURE.md for the design baseline. */
 #ifndef OMNIC_H
@@ -12,7 +12,7 @@
 extern "C" {
 #endif
 
-#define OMNIC_VERSION "0.2.0"
+#define OMNIC_VERSION "0.2.1"
 
 /* 统一状态码，与 CLI 退出码同源（SW-CLI-002） */
 typedef enum {
