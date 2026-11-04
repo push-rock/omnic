@@ -796,7 +796,7 @@ int main(int argc, char **argv) {
         if (only != NULL && strcmp(only, bc->label) != 0) continue;
         for (int li = 0; li < bc->nlevels; li++) {
             int lvl = bc->levels[li];
-            double ac[3], ab[3], dc[3], db[3]; /* adapt/base × 压缩/解压 */
+            double ac[9], ab[9], dc[9], db[9]; /* adapt/base × 压缩/解压；容量对齐 --rounds 上限 9 */
             size_t comp_len = 0;
             for (int r = 0; r < rounds; r++) {
                 size_t dlen = 0;
