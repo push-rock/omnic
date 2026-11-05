@@ -181,6 +181,10 @@ static char *arc_dup_name(const char *s) {
     return p;
 }
 
+static int cmp_strp(const void *a, const void *b) {
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
 /* ---- 索引明文序列化：块表(32B/块) ‖ 条目表(name_len/name/26B[+mtime8]) ---- */
 static int arc_index_serialize(const arc_block *blk, size_t nblk, const arc_entry *ent,
                                size_t nent, int has_mtime, bytebuf *out) {
@@ -280,6 +284,21 @@ static omnic_status arc_index_parse(const uint8_t *p, size_t n, uint32_t nent,
         } else if (ix->ent[i].type != 1) {
             return OMNIC_E_DATA;
         }
+    }
+    /* 条目名唯一性（§4.1）：指针排序后查相邻，O(n log n) */
+    if (nent > 1) {
+        const char **names = (const char **)malloc((size_t)nent * sizeof(char *));
+        if (names == NULL) return OMNIC_E_SYSTEM;
+        for (uint32_t i = 0; i < nent; i++) names[i] = ix->ent[i].name;
+        qsort(names, nent, sizeof(char *), cmp_strp);
+        for (uint32_t i = 1; i < nent; i++) {
+            if (strcmp(names[i - 1], names[i]) == 0) {
+                omnic_set_error("duplicate entry name in archive: %s", names[i]);
+                free(names);
+                return OMNIC_E_DATA;
+            }
+        }
+        free(names);
     }
     return OMNIC_OK;
 }
@@ -444,7 +463,9 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
         goto fail;
     }
     uint64_t arc_pos = ARC_HDR, data_off = ARC_HDR;
-    uint64_t block_max = (uint64_t)OMNIC_ARC_BLOCK_MIB * 1024u * 1024u;
+    uint64_t block_max = (o != NULL && o->block_mib > 0 && o->block_mib <= 1024)
+                             ? (uint64_t)o->block_mib * 1024u * 1024u
+                             : (uint64_t)OMNIC_ARC_BLOCK_MIB * 1024u * 1024u;
 
     uint8_t hdr[ARC_HDR];
     memset(hdr, 0, sizeof(hdr));

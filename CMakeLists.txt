@@ -263,6 +263,13 @@ add_executable(test_core tests/test_core.c)
 target_link_libraries(test_core PRIVATE omnic_core)
 add_test(NAME core COMMAND test_core)
 
+if(OMNIC_CODEC_ZSTD)
+  add_executable(test_archive tests/test_archive.c)
+  target_link_libraries(test_archive PRIVATE omnic_core)
+  target_compile_definitions(test_archive PRIVATE ${OMNIC_DEFS})
+  add_test(NAME archive COMMAND test_archive)
+endif()
+
 # TST-PERF-001 冒烟：16MB×3 轮中位 + 量级线（40%）。小语料下 reader/writer
 # 初始化等固定成本占比过高（mac 4MB 实测 zstd 低档虚高 ~18%），16MB 稀释到
 # 个位数；40% 线容纳 CI 共享 runner 抖动，专抓量级回归（如 read_all 翻倍类），
@@ -286,13 +293,13 @@ endif()
 # MinGW：全静态链接 runtime（libgcc/libstdc++/winpthread，snappy 引入 C++ 与
 # zstd MT 引入 pthread），保证单二进制分发（BUS-005）
 if(WIN32 AND NOT MSVC)
-  foreach(_t omnic omnic_bench test_core feature_probe)
+  foreach(_t omnic omnic_bench test_core feature_probe test_archive)
     target_link_options(${_t} PRIVATE -static)
   endforeach()
 endif()
 
 # omnic 自身代码按严格 C11 编译（C_EXTENSIONS OFF）；第三方库走编译器默认（gnu 模式）
-foreach(_t omnic omnic_bench omnic_core test_core feature_probe)
+foreach(_t omnic omnic_bench omnic_core test_core feature_probe test_archive)
   set_target_properties(${_t} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 endforeach()
 

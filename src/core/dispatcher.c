@@ -448,7 +448,9 @@ omnic_status omnic_run_analyze(const char *path, const omnic_options *o, omnic_r
         return OMNIC_E_SYSTEM;
     }
     omnic_reader_init(&r, in);
-    if (o == NULL) o = &(omnic_options){OMNIC_PROFILE_BALANCED, NULL, 0, 0, 0, NULL};
+    if (o == NULL)
+        o = &(omnic_options){.profile = OMNIC_PROFILE_BALANCED, .codec = NULL, .level = 0,
+                             .threads = 0, .flags = 0u, .output_dir = NULL};
     ret = decide(in, path, o, &d);
     if (ret == OMNIC_OK) {
         rep->klass = d.klass;

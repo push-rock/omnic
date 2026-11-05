@@ -69,6 +69,14 @@ static int parse_long_opt(omnic_args *a, int argc, char **argv, int *i) {
     } else if (strcmp(arg, "--dir") == 0) {
         if (need_value(argc, argv, i, &v, arg) != 0) return 1;
         a->opts.output_dir = v;
+    } else if (strcmp(arg, "--block-size") == 0) {
+        if (need_value(argc, argv, i, &v, arg) != 0) return 1;
+        int m = atoi(v);
+        if (m < 1 || m > 1024) {
+            fprintf(stderr, "omnic: --block-size must be 1..1024 MiB (got '%s')\n", v);
+            return 1;
+        }
+        a->opts.block_mib = m;
     } else if (strcmp(arg, "--profile") == 0) {
         if (need_value(argc, argv, i, &v, arg) != 0) return 1;
         if (profile_from_str(v, &a->opts.profile) != 0) {

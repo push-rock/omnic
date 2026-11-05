@@ -33,6 +33,7 @@ static void usage(FILE *out) {
           "  -q, --quiet\n"
           "  --per-file          pack: one block per file (fast single-file extract)\n"
           "  --no-skip           pack: compress already-compressed assets too\n"
+          "  --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)\n"
           "  --file <path>       unpack: extract only this entry (repeatable)\n"
           "  --list              unpack: list entries without extracting\n"
           "  --verify            unpack: verify archive without extracting\n",

@@ -81,6 +81,7 @@ typedef struct omnic_options {
     int threads;           /* 0 = 单线程 */
     unsigned flags;        /* OMNIC_F_* */
     const char *output_dir;
+    int block_mib;         /* 归档 solid 块上限（MiB）；0 = 默认 64（ARCHIVE_SPEC §5.1） */
 } omnic_options;
 
 #define OMNIC_F_FORCE 0x01u   /* 覆盖已存在输出；强制压缩不可压缩数据 */
