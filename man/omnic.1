@@ -1,6 +1,6 @@
-﻿.TH OMNIC 1 "2026-11-04" "omnic 0.2.1" "User Commands"
+﻿.TH OMNIC 1 "2026-11-05" "omnic 0.3.0" "User Commands"
 .SH NAME
-omnic \- universal compressor with automatic codec selection
+omnic \- universal compressor with automatic codec selection and .omnic archives
 .SH SYNOPSIS
 .B omnic
 .I command
@@ -15,6 +15,13 @@ pick codec and level for the requested profile. Already-compressed and
 high-entropy files are skipped by default. Decompression auto-detects
 the format from magic bytes (extension as fallback) and works on
 products of the official CLIs of every supported codec.
+.PP
+It also packs directory trees into
+.B .omnic
+archives: files are classified, grouped into per-codec buckets, and
+compressed as 64 MiB solid blocks. Already-compressed assets are
+stored as-is. A corrupted block can never take the rest of the archive
+down \- extraction skips it and reports every affected file.
 .SH COMMANDS
 .TP
 .BR c ", " compress
@@ -27,7 +34,26 @@ is given). The source file is removed on success unless
 is given.
 .TP
 .BR d ", " decompress
-Decompress each file; format is auto-detected.
+Decompress each file; format is auto-detected. A
+.B .omnic
+archive (by magic bytes) is extracted as a whole tree.
+.TP
+.B pack
+Pack a directory tree into a
+.BR .omnic .
+Default output is
+.IR dir .omnic ;
+refuses if the output would land inside the source tree.
+.TP
+.B unpack
+Extract a
+.B .omnic
+archive. Supports selective extraction
+.RB ( \-\-file ),
+listing
+.RB ( \-\-list )
+and verification without writing
+.RB ( \-\-verify ).
 .TP
 .B analyze
 Classify files and print the decision (type, entropy, codec, level,
@@ -58,11 +84,24 @@ One of
 Thread hint (accepted; most codecs are single-threaded in this build).
 .TP
 .BR "\-o, \-\-output\-dir " \fIDIR\fR
-Write outputs into
+Compressed outputs go into
 .IR DIR .
+For
+.B pack
+this is the archive path; for
+.B unpack
+it is the output root (same as
+.BR \-C ).
+.TP
+.BR "\-C, \-\-dir " \fIDIR\fR
+.B unpack
+output root directory.
 .TP
 .BR "\-f, \-\-force"
 Compress even when the input looks already-compressed or random.
+For
+.BR unpack " \-\-file ,
+overwrite an existing target file.
 .TP
 .BR "\-k, \-\-keep"
 Keep the source file.
@@ -71,7 +110,35 @@ Keep the source file.
 Suppress the per-file report line.
 .TP
 .BR "\-x, \-\-explain"
-Print the classification and reason for the decision.
+Print the classification and reason for the decision. With
+.B pack ,
+print the per-file decision lines.
+.TP
+.BR "\-\-per\-file"
+.BR pack :
+one block per file (millisecond single-file extraction, worse ratio).
+.TP
+.BR "\-\-no\-skip"
+.BR pack :
+compress already-compressed assets too, instead of storing them as-is.
+.TP
+.BR "\-\-block\-size " \fIN\fR
+.BR pack :
+solid block limit in MiB, 1..1024 (default 64).
+.TP
+.BR "\-\-file " \fIPATH\fR
+.BR unpack :
+extract only the named archive entry (repeatable; entries sharing a
+block are decompressed once).
+.TP
+.BR "\-\-list"
+.BR unpack :
+list entries (name, size, block codec, block ratio) without reading
+the data area.
+.TP
+.BR "\-\-verify"
+.BR unpack :
+fully decompress and check both CRC layers without writing any files.
 .TP
 .BR "\-V, \-\-version ", "\-h, \-\-help"
 Version / usage.
@@ -112,7 +179,23 @@ Round-trip a specific codec at a specific level:
 omnic c \-c zstd \-l 19 data.bin
 omnic d data.bin.zst
 .RE
+.PP
+Pack a tree, list it, pull one file out:
+.PP
+.RS
+.nf
+omnic pack project/ \-o backup.omnic
+omnic unpack backup.omnic \-\-list
+omnic unpack backup.omnic \-\-file project/src/main.c \-C restore/
+.RE
+.PP
+Check an archive after a bad download, without writing anything:
+.PP
+.RS
+.nf
+omnic unpack backup.omnic \-\-verify
+.RE
 .SH SEE ALSO
-Project README (formats, benchmarks, policy table) at
+Project README (formats, benchmarks, archive format) at
 .UR https://github.com/push-rock/omnic
 .UE .
