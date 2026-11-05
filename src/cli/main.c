@@ -5,6 +5,8 @@
 
 #include "cli/argp.h"
 #include "cli/report.h"
+#include "core/archive.h"
+#include "core/fs.h"
 #include "core/registry.h"
 #include "core/util.h"
 
@@ -23,11 +25,17 @@ static void usage(FILE *out) {
           "  -c, --codec <name>  force a codec (see: omnic list)\n"
           "  -l, --level <n>     codec-native level\n"
           "  -T, --threads <n>   worker threads (zstd)\n"
-          "  -o, --output-dir <dir>\n"
+          "  -o, --output-dir <dir>  pack: output archive path; unpack: output dir (same as -C)\n"
+          "  -C, --dir <dir>     unpack: output root directory\n"
           "  -f, --force         overwrite output; compress incompressible data anyway\n"
           "  -k, --keep          keep the source file (default: remove after success)\n"
           "  -x, --explain       print the decision rationale\n"
-          "  -q, --quiet\n",
+          "  -q, --quiet\n"
+          "  --per-file          pack: one block per file (fast single-file extract)\n"
+          "  --no-skip           pack: compress already-compressed assets too\n"
+          "  --file <path>       unpack: extract only this entry (repeatable)\n"
+          "  --list              unpack: list entries without extracting\n"
+          "  --verify            unpack: verify archive without extracting\n",
           out);
 }
 
@@ -59,12 +67,43 @@ static int cmd_list(void) {
 
 /* .omnic 归档魔数探测（d 自动分流用） */
 static int is_omnic_archive(const char *path) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = omnic_fs_fopen(path, "rb");
     if (f == NULL) return 0;
     char m[8];
     size_t r = fread(m, 1, sizeof(m), f);
     fclose(f);
     return r == sizeof(m) && memcmp(m, "OMNICARC", 8) == 0;
+}
+
+/* unpack/d 的统一归档处理：--list / --verify / --file / 整树（SPEC §5.2） */
+static int run_unpack(const char *arc, const omnic_args *a) {
+    omnic_report rep;
+    memset(&rep, 0, sizeof(rep));
+    omnic_status st;
+    if ((a->opts.flags & OMNIC_F_LIST) != 0) {
+        st = omnic_arc_list(arc, &a->opts);
+        if (st != OMNIC_OK) fprintf(stderr, "omnic: %s\n", omnic_last_error());
+        return st == OMNIC_OK ? 0 : (int)st;
+    }
+    if ((a->opts.flags & OMNIC_F_VERIFY) != 0) {
+        st = omnic_arc_verify(arc, &a->opts, &rep);
+        if (st != OMNIC_OK && omnic_last_error()[0] != '\0')
+            fprintf(stderr, "omnic: %s\n", omnic_last_error());
+        return st == OMNIC_OK ? 0 : (int)st;
+    }
+    char def_dir[4096];
+    snprintf(def_dir, sizeof(def_dir), "%s_out", arc);
+    const char *dir = (a->opts.output_dir != NULL) ? a->opts.output_dir : def_dir;
+    if (a->n_only > 0)
+        st = omnic_unpack_files(arc, dir, a->only, (size_t)a->n_only, &a->opts, &rep);
+    else
+        st = omnic_unpack(arc, dir, &a->opts, &rep);
+    if (st == OMNIC_OK) {
+        printf("%s: extracted %llu bytes\n", arc, (unsigned long long)rep.out_bytes);
+    } else if (omnic_last_error()[0] != '\0') {
+        fprintf(stderr, "omnic: %s\n", omnic_last_error());
+    }
+    return st == OMNIC_OK ? 0 : (int)st;
 }
 
 static int cmd_pack_unpack(const omnic_args *a) {
@@ -79,10 +118,8 @@ static int cmd_pack_unpack(const omnic_args *a) {
             const char *arc = (a->opts.output_dir != NULL) ? a->opts.output_dir : def_arc;
             st = omnic_pack(a->files[i], arc, &a->opts, &rep);
         } else {
-            char def_dir[4096];
-            snprintf(def_dir, sizeof(def_dir), "%s_out", a->files[i]);
-            const char *dir = (a->opts.output_dir != NULL) ? a->opts.output_dir : def_dir;
-            st = omnic_unpack(a->files[i], dir, &a->opts, &rep);
+            rc = run_unpack(a->files[i], a);
+            continue;
         }
         if (st == OMNIC_OK) {
             printf("%s: %llu -> %llu bytes (%.2f%%), %.2fs\n", a->files[i],
@@ -126,16 +163,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(a.cmd, "d") == 0) {
             if (is_omnic_archive(a.files[i])) {
                 /* .omnic 归档自动分流（SPEC §5.2）："omnic d 什么都能解"心智 */
-                char def_dir[4096];
-                snprintf(def_dir, sizeof(def_dir), "%s_out", a.files[i]);
-                const char *dir = (a.opts.output_dir != NULL) ? a.opts.output_dir : def_dir;
-                st = omnic_unpack(a.files[i], dir, &a.opts, &rep);
-                if (st == OMNIC_OK)
-                    printf("%s: extracted %llu bytes\n", a.files[i],
-                           (unsigned long long)rep.out_bytes);
-                else
-                    fprintf(stderr, "omnic: %s\n", omnic_last_error());
-                if ((int)st > rc) rc = (int)st;
+                rc = run_unpack(a.files[i], &a);
                 continue;
             }
             st = omnic_decompress(a.files[i], &a.opts, &rep);

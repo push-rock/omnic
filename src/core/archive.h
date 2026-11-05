@@ -17,5 +17,12 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
                         const omnic_options *o, omnic_report *rep);
 omnic_status omnic_unpack(const char *archive_path, const char *dest_dir,
                           const omnic_options *o, omnic_report *rep);
+/* CLI 层扩展（SPEC §5.2：v1 归 CLI，公共 API v2 再评估） */
+omnic_status omnic_unpack_files(const char *archive_path, const char *dest_dir,
+                                const char *const *names, size_t n_names,
+                                const omnic_options *o, omnic_report *rep);
+omnic_status omnic_arc_verify(const char *archive_path, const omnic_options *o,
+                              omnic_report *rep);
+omnic_status omnic_arc_list(const char *archive_path, const omnic_options *o);
 
 #endif /* OMNIC_ARCHIVE_H */

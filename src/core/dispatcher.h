@@ -8,7 +8,7 @@
 /* 已由 api.c 保证 rep 非空、o 非空。 */
 omnic_status omnic_run_compress(const char *path, const omnic_options *o, omnic_report *rep);
 omnic_status omnic_run_decompress(const char *path, const omnic_options *o, omnic_report *rep);
-/* 只探测+决策，不落盘（SW-DET-004） */
-omnic_status omnic_run_analyze(const char *path, omnic_report *rep);
+/* 只探测+决策，不落盘（SW-DET-004）；o=NULL 时按 balanced 决策 */
+omnic_status omnic_run_analyze(const char *path, const omnic_options *o, omnic_report *rep);
 
 #endif /* OMNIC_DISPATCHER_H */

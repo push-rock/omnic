@@ -173,9 +173,36 @@ FILE *omnic_fs_fopen(const char *utf8_path, const char *mode) {
     return _wfopen(wpath, wmode);
 }
 
+char *omnic_fs_abspath(const char *path) {
+    wchar_t wpath[OMNIC_FS_PATH_MAX], wfull[OMNIC_FS_PATH_MAX];
+    if (utf8_to_w16(path, wpath, OMNIC_FS_PATH_MAX) == 0) return NULL;
+    DWORD n = GetFullPathNameW(wpath, OMNIC_FS_PATH_MAX, wfull, NULL);
+    if (n == 0 || n >= OMNIC_FS_PATH_MAX) return NULL;
+    int need = WideCharToMultiByte(CP_UTF8, 0, wfull, -1, NULL, 0, NULL, NULL);
+    if (need <= 0) return NULL;
+    char *out = (char *)malloc((size_t)need);
+    if (out == NULL) return NULL;
+    if (WideCharToMultiByte(CP_UTF8, 0, wfull, -1, out, need, NULL, NULL) != need) {
+        free(out);
+        return NULL;
+    }
+    for (char *p = out; *p != '\0'; p++)
+        if (*p == '\\') *p = '/';
+    return out;
+}
+
+int omnic_fs_path_inside(const char *root_abs, const char *path_abs) {
+    size_t rn = strlen(root_abs);
+    while (rn > 0 && root_abs[rn - 1] == '/') rn--; /* 剥尾斜杠 */
+    if (rn == 0) return 1;
+    if (_strnicmp(path_abs, root_abs, rn) != 0) return 0; /* Windows 卷不敏感 */
+    return path_abs[rn] == '/';
+}
+
 #else /* POSIX */
 
 #include <dirent.h>
+#include <unistd.h>
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -269,6 +296,35 @@ omnic_status omnic_fs_set_mtime(const char *path, long long mtime) {
 
 FILE *omnic_fs_fopen(const char *utf8_path, const char *mode) {
     return fopen(utf8_path, mode);
+}
+
+char *omnic_fs_abspath(const char *path) {
+    char buf[OMNIC_FS_PATH_MAX];
+    if (realpath(path, buf) != NULL) {
+        char *out = (char *)malloc(strlen(buf) + 1);
+        if (out != NULL) strcpy(out, buf);
+        return out;
+    }
+    /* 目标尚不存在（pack 输出）：cwd 拼接 */
+    if (path[0] == '/') {
+        char *out = (char *)malloc(strlen(path) + 1);
+        if (out != NULL) strcpy(out, path);
+        return out;
+    }
+    char cwd[OMNIC_FS_PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) == NULL) return NULL;
+    if (snprintf(buf, sizeof(buf), "%s/%s", cwd, path) >= (int)sizeof(buf)) return NULL;
+    char *out = (char *)malloc(strlen(buf) + 1);
+    if (out != NULL) strcpy(out, buf);
+    return out;
+}
+
+int omnic_fs_path_inside(const char *root_abs, const char *path_abs) {
+    size_t rn = strlen(root_abs);
+    while (rn > 0 && root_abs[rn - 1] == '/') rn--;
+    if (rn == 0) return 1;
+    if (strncmp(path_abs, root_abs, rn) != 0) return 0;
+    return path_abs[rn] == '/';
 }
 
 #endif /* _WIN32 */

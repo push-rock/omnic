@@ -12,6 +12,9 @@
 
 #include "core/fs.h"
 #include "core/util.h"
+#include "core/blockio.h"
+#include "core/dispatcher.h"
+#include "core/registry.h"
 
 #ifndef OMNIC_CODEC_ZSTD
 /* 格式固有依赖 zstd（INDEX_ZSTD 恒置位）；无 zstd 构建 stub 保 lib ABI */
@@ -226,9 +229,12 @@ static omnic_status arc_index_parse(const uint8_t *p, size_t n, uint32_t nent,
             ix->blk[i].comp_size = get64(r + 12);
             ix->blk[i].raw_size = get64(r + 20);
             ix->blk[i].crc = get32(r + 28);
-            if (ix->blk[i].comp_size == 0 || ix->blk[i].raw_size == 0 ||
-                ix->blk[i].raw_size > (1u << 30)) /* D14 炸弹预检 */
+            if (ix->blk[i].comp_size == 0 && ix->blk[i].raw_size == 0) {
+                /* 空块（仅含 0 字节文件的 store 块）合法，块区零字节 */
+            } else if (ix->blk[i].comp_size == 0 || ix->blk[i].raw_size == 0 ||
+                       ix->blk[i].raw_size > (1u << 30)) { /* D14 炸弹预检 */
                 return OMNIC_E_DATA;
+            }
         }
         p += (size_t)nblk * ARC_BLK_ROW;
         n -= (size_t)nblk * ARC_BLK_ROW;
@@ -278,6 +284,89 @@ static omnic_status arc_index_parse(const uint8_t *p, size_t n, uint32_t nent,
     return OMNIC_OK;
 }
 
+/* ---- pack 决策与分桶（A4，AR-PKG-001..004）----
+ * 桶 = 同 (codec,level) 建议的文件聚合（D10：字典共享域 ≈ codec 相同性）；
+ * skip 类进 store 桶（--no-skip 时视同 unknown 走 zstd/19，实验口径）。 */
+typedef struct {
+    char codec[16];
+    int level;
+    int is_store;
+    size_t *idx; /* pack 文件序（指向 fs/ent 数组） */
+    size_t n, cap;
+    unsigned long long total;
+} arc_bucket;
+
+static int bucket_push(arc_bucket *b, size_t file_i, unsigned long long sz) {
+    if (b->n == b->cap) {
+        size_t cap = b->cap ? b->cap * 2 : 8;
+        size_t *p = (size_t *)realloc(b->idx, cap * sizeof(size_t));
+        if (p == NULL) return -1;
+        b->idx = p;
+        b->cap = cap;
+    }
+    b->idx[b->n++] = file_i;
+    b->total += sz;
+    return 0;
+}
+
+static void buckets_free(arc_bucket *b, size_t nb) {
+    for (size_t i = 0; i < nb; i++) free(b[i].idx);
+    free(b);
+}
+
+/* 桶序确定性：大小降序，平局按 (codec,level) 字典序 */
+static int bucket_cmp(const void *pa, const void *pb) {
+    const arc_bucket *a = (const arc_bucket *)pa, *b = (const arc_bucket *)pb;
+    if (a->total != b->total) return a->total > b->total ? -1 : 1;
+    int c = strcmp(a->codec, b->codec);
+    if (c != 0) return c;
+    return a->level - b->level;
+}
+
+/* 决策 pass 的逐文件计划 */
+typedef struct {
+    char codec[16];
+    int level;
+    int store;
+} file_plan;
+
+/* 块表扩容入表（offset 相对 data_off） */
+static int arc_block_new(arc_index *ix, size_t *cap, uint8_t fmt, uint8_t level,
+                         uint64_t offset) {
+    if (ix->nblk == *cap) {
+        size_t c = *cap ? *cap * 2 : 64;
+        arc_block *b = (arc_block *)realloc(ix->blk, c * sizeof(arc_block));
+        if (b == NULL) return -1;
+        ix->blk = b;
+        *cap = c;
+    }
+    memset(&ix->blk[ix->nblk], 0, sizeof(arc_block));
+    ix->blk[ix->nblk].fmt = fmt;
+    ix->blk[ix->nblk].level = level;
+    ix->blk[ix->nblk].offset = offset;
+    ix->nblk++;
+    return 0;
+}
+
+/* 内存块压缩（块写出与桶级试压共用；ops 须 can_compress） */
+static omnic_status arc_compress_mem(const uint8_t *buf, size_t n,
+                                     const omnic_codec_ops *ops, int level, int threads,
+                                     uint8_t **out, size_t *out_len) {
+    omnic_reader r;
+    omnic_writer w;
+    omnic_reader_init_mem(&r, buf, n);
+    omnic_writer_init_mem(&w);
+    omnic_status st = ops->compress(&r, &w, level, threads);
+    uint8_t *m = omnic_writer_mem_drain(&w, out_len);
+    omnic_reader_fini(&r);
+    if (st != OMNIC_OK) {
+        free(m);
+        return st;
+    }
+    *out = m;
+    return OMNIC_OK;
+}
+
 /* ---- pack（A3：store-only；A4 接决策分桶与压缩块）---- */
 omnic_status omnic_pack(const char *root, const char *archive_path,
                         const omnic_options *o, omnic_report *rep) {
@@ -287,6 +376,23 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     if (rep == NULL) rep = &tmp;
     memset(rep, 0, sizeof(*rep));
     FILE *f = NULL; /* 早期 goto fail 路径需要（初始化先于全部 goto） */
+    file_plan *plan = NULL;
+    arc_bucket *bkts = NULL;
+    size_t nb = 0;
+
+    /* T1/AR-ERR-002：输出归档不得位于源树内（自吞风险） */
+    {
+        char *ra = omnic_fs_abspath(root);
+        char *pa = omnic_fs_abspath(archive_path);
+        int inside = (ra != NULL && pa != NULL && omnic_fs_path_inside(ra, pa));
+        free(ra);
+        free(pa);
+        if (inside) {
+            omnic_set_error("output archive is inside the source tree: %s — use -o outside %s",
+                            archive_path, root);
+            return OMNIC_E_USAGE;
+        }
+    }
 
     size_t n = 0, skipped = 0;
     omnic_fs_entry *fs = omnic_fs_walk(root, &n, &skipped);
@@ -350,12 +456,18 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     put64(hdr + 20, data_off);
     if (fwrite(hdr, 1, sizeof(hdr), f) != sizeof(hdr)) goto io_fail;
 
-    size_t blk_cap = 64;
-    ix.blk = (arc_block *)malloc(blk_cap * sizeof(arc_block));
+    size_t tbl_cap = 64;
+    ix.blk = (arc_block *)malloc(tbl_cap * sizeof(arc_block));
     if (ix.blk == NULL) goto oom;
     double t0 = omnic_now_sec();
-    uint32_t blk_crc = 0;
-    int blk_open = 0;
+    unsigned quiet = (o != NULL && (o->flags & OMNIC_F_QUIET));
+    unsigned explain = (o != NULL && (o->flags & OMNIC_F_EXPLAIN));
+    int per_file = (o != NULL && (o->flags & OMNIC_F_PER_FILE));
+    int threads = (o != NULL) ? o->threads : 0;
+
+    /* ---- 决策 pass：逐文件分类建议（~1ms/文件，决策器只采样不落盘） ---- */
+    plan = (file_plan *)calloc(n ? n : 1, sizeof(file_plan));
+    if (plan == NULL) goto oom;
     for (size_t i = 0; i < n; i++) {
         if (ix.ent[i].type == 1) continue;
         char src[OMNIC_FS_PATH_MAX * 2];
@@ -363,62 +475,268 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
             omnic_set_error("path too long: %s", fs[i].rel);
             goto fail;
         }
-        FILE *in = omnic_fs_fopen(src, "rb");
-        if (in == NULL) {
-            omnic_set_error("cannot read source file: %s", src);
-            goto fail;
+        omnic_report arep;
+        memset(&arep, 0, sizeof(arep));
+        if (omnic_run_analyze(src, o, &arep) != OMNIC_OK) goto fail;
+        if (strcmp(arep.codec, OMNIC_SKIP_CODEC) == 0) arep.skipped = true; /* 哨兵兜底 */
+        if (arep.skipped && o != NULL && (o->flags & OMNIC_F_NO_SKIP)) {
+            /* --no-skip：已压资产视同 unknown 入压缩桶（实验口径 zstd/19） */
+            snprintf(plan[i].codec, sizeof(plan[i].codec), "zstd");
+            plan[i].level = 19;
+        } else if (arep.skipped || fs[i].size == 0) {
+            /* SYS-CMP-003 skip 直通；0 字节文件按规格 §4.5 归 store（压空流无意义） */
+            plan[i].store = 1;
+        } else {
+            snprintf(plan[i].codec, sizeof(plan[i].codec), "%s", arep.codec);
+            plan[i].level = arep.level;
         }
-        if (!blk_open ||
-            (ix.blk[ix.nblk - 1].raw_size > 0 &&
-             (ix.blk[ix.nblk - 1].raw_size + fs[i].size > block_max ||
-              fs[i].size > block_max))) {
-            if (ix.nblk == blk_cap) {
-                blk_cap *= 2;
-                arc_block *b = (arc_block *)realloc(ix.blk, blk_cap * sizeof(arc_block));
-                if (b == NULL) {
-                    fclose(in);
-                    goto oom;
-                }
-                ix.blk = b;
-            }
-            memset(&ix.blk[ix.nblk], 0, sizeof(arc_block));
-            ix.blk[ix.nblk].fmt = 0; /* store */
-            ix.blk[ix.nblk].offset = arc_pos - data_off;
-            ix.nblk++;
-            blk_crc = 0;
-            blk_open = 1;
-        }
-        arc_block *b = &ix.blk[ix.nblk - 1];
-        ix.ent[i].block_id = (uint32_t)(ix.nblk - 1);
-        ix.ent[i].in_off = b->raw_size;
-        ix.ent[i].size = fs[i].size;
-        uint32_t file_crc = 0;
-        uint8_t buf[64 * 1024];
-        size_t r;
-        while ((r = fread(buf, 1, sizeof(buf), in)) > 0) {
-            if (fwrite(buf, 1, r, f) != r) {
-                fclose(in);
-                goto io_fail;
-            }
-            arc_pos += r;
-            b->raw_size += r;
-            b->comp_size = b->raw_size;
-            file_crc = arc_crc32(file_crc, buf, r);
-            blk_crc = arc_crc32(blk_crc, buf, r);
-        }
-        int bad = ferror(in);
-        fclose(in);
-        if (bad) {
-            omnic_set_error("read failed: %s", src);
-            goto fail;
-        }
-        ix.ent[i].crc = file_crc;
+        if (explain)
+            printf("  %s: %s -> %s\n", fs[i].rel, omnic_class_str(arep.klass),
+                   plan[i].store ? "pass-through" : plan[i].codec);
         rep->in_bytes += fs[i].size;
     }
-    if (blk_open) {
-        arc_block *b = &ix.blk[ix.nblk - 1];
-        b->crc = blk_crc;
+    if (!quiet)
+        printf("  classified %llu entries in %.2fs\n", (unsigned long long)n,
+                omnic_now_sec() - t0);
+
+    /* ---- 分桶（D10：同 (codec,level) 聚合；per-file 模式每文件独立桶） ---- */
+    for (size_t i = 0; i < n; i++) {
+        if (ix.ent[i].type == 1) continue;
+        arc_bucket *t = NULL;
+        if (plan[i].store) {
+            for (size_t k = 0; k < nb; k++)
+                if (bkts[k].is_store) { t = &bkts[k]; break; }
+            if (t == NULL) {
+                t = (arc_bucket *)realloc(bkts, (nb + 1) * sizeof(arc_bucket));
+                if (t == NULL) goto oom;
+                bkts = t;
+                t = &bkts[nb++];
+                memset(t, 0, sizeof(*t));
+                t->is_store = 1;
+            }
+        } else if (per_file) {
+            t = (arc_bucket *)realloc(bkts, (nb + 1) * sizeof(arc_bucket));
+            if (t == NULL) goto oom;
+            bkts = t;
+            t = &bkts[nb++];
+            memset(t, 0, sizeof(*t));
+            snprintf(t->codec, sizeof(t->codec), "%s", plan[i].codec);
+            t->level = plan[i].level;
+        } else {
+            for (size_t k = 0; k < nb; k++)
+                if (!bkts[k].is_store && bkts[k].level == plan[i].level &&
+                    strcmp(bkts[k].codec, plan[i].codec) == 0) {
+                    t = &bkts[k];
+                    break;
+                }
+            if (t == NULL) {
+                t = (arc_bucket *)realloc(bkts, (nb + 1) * sizeof(arc_bucket));
+                if (t == NULL) goto oom;
+                bkts = t;
+                t = &bkts[nb++];
+                memset(t, 0, sizeof(*t));
+                snprintf(t->codec, sizeof(t->codec), "%s", plan[i].codec);
+                t->level = plan[i].level;
+            }
+        }
+        if (bucket_push(t, i, fs[i].size) != 0) goto oom;
     }
+    /* 桶序统一 qsort（大小降序；store 桶自然沉浮由总量决定）——确定性 */
+    qsort(bkts, nb, sizeof(arc_bucket), bucket_cmp);
+
+    /* ---- 桶写出 ---- */
+    for (size_t bi = 0; bi < nb; bi++) {
+        arc_bucket *b = &bkts[bi];
+        if (b->is_store) {
+            /* store：流式块（A3 路径），双 CRC 边写边算 */
+            uint32_t blk_crc = 0;
+            int blk_open = 0;
+            for (size_t fi = 0; fi < b->n; fi++) {
+                size_t i = b->idx[fi];
+                char src[OMNIC_FS_PATH_MAX * 2];
+                if (snprintf(src, sizeof(src), "%s/%s", root, fs[i].rel) >= (int)sizeof(src)) {
+                    omnic_set_error("path too long: %s", fs[i].rel);
+                    goto fail;
+                }
+                FILE *in = omnic_fs_fopen(src, "rb");
+                if (in == NULL) {
+                    omnic_set_error("cannot read source file: %s", src);
+                    goto fail;
+                }
+                uint64_t cur = blk_open ? ix.blk[ix.nblk - 1].raw_size : 0;
+                if (!blk_open || (cur > 0 && (cur + fs[i].size > block_max ||
+                                              fs[i].size > block_max))) {
+                    if (blk_open) ix.blk[ix.nblk - 1].crc = blk_crc;
+                    if (arc_block_new(&ix, &tbl_cap, 0, 0, arc_pos - data_off) != 0) {
+                        fclose(in);
+                        goto oom;
+                    }
+                    blk_crc = 0;
+                    blk_open = 1;
+                }
+                arc_block *cb = &ix.blk[ix.nblk - 1];
+                ix.ent[i].block_id = (uint32_t)(ix.nblk - 1);
+                ix.ent[i].in_off = cb->raw_size;
+                ix.ent[i].size = fs[i].size;
+                uint32_t file_crc = 0;
+                uint8_t buf[64 * 1024];
+                size_t r;
+                while ((r = fread(buf, 1, sizeof(buf), in)) > 0) {
+                    if (fwrite(buf, 1, r, f) != r) {
+                        fclose(in);
+                        goto io_fail;
+                    }
+                    arc_pos += r;
+                    cb->raw_size += r;
+                    cb->comp_size = cb->raw_size;
+                    file_crc = arc_crc32(file_crc, buf, r);
+                    blk_crc = arc_crc32(blk_crc, buf, r);
+                }
+                int bad = ferror(in);
+                fclose(in);
+                if (bad) {
+                    omnic_set_error("read failed: %s", src);
+                    goto fail;
+                }
+                ix.ent[i].crc = file_crc;
+            }
+            if (blk_open) ix.blk[ix.nblk - 1].crc = blk_crc;
+            continue;
+        }
+
+        /* 压缩桶：内存块 + 桶级双候选（AR-PKG-003）。
+         * 双候选仅 best_ratio 档：B 候选 xz/9 是 ratio 冲刺；速度档（BAL/FC/FD）
+         * 查表即用——把 xz/9 塞给速度档用户会让 pack 时间失控（实测 BAL 19s）。 */
+        const omnic_codec_ops *ops = omnic_codec_find(b->codec);
+        if (ops == NULL || !ops->can_compress) {
+            omnic_set_error("codec not available for bucket: %s", b->codec);
+            goto fail;
+        }
+        int level = b->level;
+        omnic_profile prof = (o != NULL) ? o->profile : OMNIC_PROFILE_BALANCED;
+        const omnic_codec_ops *alt = NULL;
+        if (prof == OMNIC_PROFILE_BEST_RATIO && b->total >= (4u << 20) &&
+            !(strcmp(b->codec, "xz") == 0 && level >= 9)) {
+            alt = omnic_codec_find("xz"); /* 桶级双候选的 B 候选 */
+        }
+        size_t fi = 0;
+        int first = 1;
+        while (fi < b->n) {
+            /* 构块（文件边界对齐，单文件超限独立成块） */
+            size_t bcap_bytes = (size_t)block_max;
+            uint8_t *blk = NULL;
+            uint64_t blk_len = 0;
+            while (fi < b->n) {
+                size_t i = b->idx[fi];
+                if (blk_len > 0 && blk_len + fs[i].size > block_max) break;
+                if (blk == NULL || fs[i].size + blk_len > bcap_bytes) {
+                    size_t want = blk == NULL ? (size_t)block_max : (size_t)(fs[i].size + blk_len);
+                    if (want < (size_t)(fs[i].size + blk_len)) want = (size_t)(fs[i].size + blk_len);
+                    uint8_t *nb2 = (uint8_t *)realloc(blk, want);
+                    if (nb2 == NULL) {
+                        free(blk);
+                        goto oom;
+                    }
+                    blk = nb2;
+                    bcap_bytes = want;
+                }
+                char src[OMNIC_FS_PATH_MAX * 2];
+                if (snprintf(src, sizeof(src), "%s/%s", root, fs[i].rel) >= (int)sizeof(src)) {
+                    free(blk);
+                    omnic_set_error("path too long: %s", fs[i].rel);
+                    goto fail;
+                }
+                FILE *in = omnic_fs_fopen(src, "rb");
+                if (in == NULL) {
+                    free(blk);
+                    omnic_set_error("cannot read source file: %s", src);
+                    goto fail;
+                }
+                uint32_t file_crc = 0;
+                size_t got = 0;
+                while (got < fs[i].size) {
+                    size_t r = fread(blk + blk_len, 1, (size_t)(fs[i].size - got), in);
+                    if (r == 0) break;
+                    file_crc = arc_crc32(file_crc, blk + blk_len, r);
+                    blk_len += r;
+                    got += r;
+                }
+                int bad = ferror(in);
+                fclose(in);
+                if (bad || got != fs[i].size) {
+                    free(blk);
+                    omnic_set_error("read failed: %s", src);
+                    goto fail;
+                }
+                ix.ent[i].block_id = (uint32_t)ix.nblk; /* 本块即将入表 */
+                ix.ent[i].in_off = blk_len - fs[i].size;
+                ix.ent[i].size = fs[i].size;
+                ix.ent[i].crc = file_crc;
+                fi++;
+            }
+            /* 压缩（首块且桶 ≥4MiB 时双候选全量试压，AR-PKG-003） */
+            uint8_t *out = NULL;
+            size_t out_len = 0;
+            if (first && alt != NULL) {
+                uint8_t *oa = NULL, *ob = NULL;
+                size_t la = 0, lb = 0;
+                omnic_status sa = arc_compress_mem(blk, (size_t)blk_len, ops, level, threads, &oa, &la);
+                if (sa != OMNIC_OK) {
+                    free(blk);
+                    goto fail;
+                }
+                omnic_status sb = arc_compress_mem(blk, (size_t)blk_len, alt, 9, threads, &ob, &lb);
+                if (sb != OMNIC_OK) {
+                    free(oa);
+                    free(blk);
+                    goto fail;
+                }
+                if (lb < la) {
+                    free(oa);
+                    out = ob;
+                    out_len = lb;
+                    ops = alt;
+                    level = 9;
+                } else {
+                    free(ob);
+                    out = oa;
+                    out_len = la;
+                }
+            } else {
+                if (arc_compress_mem(blk, (size_t)blk_len, ops, level, threads, &out, &out_len) !=
+                    OMNIC_OK) {
+                    free(blk);
+                    goto fail;
+                }
+            }
+            first = 0;
+            free(blk);
+            if (arc_block_new(&ix, &tbl_cap, (uint8_t)ops->fmt, (uint8_t)level,
+                              arc_pos - data_off) != 0) {
+                free(out);
+                goto oom;
+            }
+            arc_block *cb = &ix.blk[ix.nblk - 1];
+            cb->comp_size = out_len;
+            cb->raw_size = blk_len;
+            cb->crc = arc_crc32(0, out, out_len);
+            if (fwrite(out, 1, out_len, f) != out_len) {
+                free(out);
+                goto io_fail;
+            }
+            arc_pos += out_len;
+            free(out);
+            if (!quiet)
+                printf("  block: %s/%d  %llu -> %zu bytes (%.2f%%)\n", ops->name, level,
+                       (unsigned long long)blk_len, out_len,
+                       blk_len ? 100.0 * (double)out_len / (double)blk_len : 0.0);
+        }
+    }
+    buckets_free(bkts, nb);
+    bkts = NULL;
+    nb = 0;
+    free(plan);
+    plan = NULL;
     rep->seconds = omnic_now_sec() - t0;
 
     /* 索引（zstd）+ Footer；n_blocks 回填 Header */
@@ -473,6 +791,8 @@ io_fail:
 oom:
     omnic_set_error("out of memory");
 fail:
+    free(plan);
+    buckets_free(bkts, nb);
     arc_index_mem_free(&ix);
     free(fs);
     if (f != NULL) fclose(f);
@@ -480,137 +800,284 @@ fail:
 }
 
 /* ---- unpack ---- */
-omnic_status omnic_unpack(const char *archive_path, const char *dest_dir,
-                          const omnic_options *o, omnic_report *rep) {
-    (void)o;
-    if (archive_path == NULL) return OMNIC_E_USAGE;
-    omnic_report tmp;
-    if (rep == NULL) rep = &tmp;
-    memset(rep, 0, sizeof(*rep));
-    const char *dstroot = (dest_dir != NULL) ? dest_dir : ".";
 
+static int arc_file_exists(const char *path) {
+    FILE *f = omnic_fs_fopen(path, "rb");
+    if (f == NULL) return 0;
+    fclose(f);
+    return 1;
+}
+
+/* 打开归档并解析索引（unpack/list/verify 共用，§4.1 打开顺序）。
+ * 成功时 *out_f 与 *ix 归调用方清理（fclose / arc_index_mem_free）。 */
+static omnic_status arc_open_index(const char *archive_path, FILE **out_f, arc_index *ix) {
     FILE *f = omnic_fs_fopen(archive_path, "rb");
     if (f == NULL) {
         omnic_set_error("cannot open archive: %s", archive_path);
         return OMNIC_E_SYSTEM;
     }
-    /* Header 验（magic/version）；Footer 锚定 + 交叉校验 */
     uint8_t hdr[ARC_HDR], ftr[ARC_FTR];
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) || memcmp(hdr, ARC_MAGIC_H, 8) != 0) {
         omnic_set_error("not a valid .omnic archive (bad header magic)");
-        goto data_fail;
+        fclose(f);
+        return OMNIC_E_DATA;
     }
     if (get16(hdr + 8) != OMNIC_ARC_VERSION) {
         omnic_set_error("unsupported .omnic version %u", get16(hdr + 8));
-        goto data_fail;
+        fclose(f);
+        return OMNIC_E_DATA;
     }
     if (fseek(f, -(long)sizeof(ftr), SEEK_END) != 0 ||
         fread(ftr, 1, sizeof(ftr), f) != sizeof(ftr) || memcmp(ftr, ARC_MAGIC_F, 8) != 0) {
         omnic_set_error("not a valid .omnic archive (bad footer magic)");
-        goto data_fail;
+        fclose(f);
+        return OMNIC_E_DATA;
     }
     uint64_t index_off = get64(ftr + 8), index_comp = get64(ftr + 16);
     uint32_t index_crc = get32(ftr + 24);
     uint32_t nent = get16(ftr + 28), nblk = get16(ftr + 30);
     if (get32(hdr + 16) != nent || get32(hdr + 12) != nblk) {
         omnic_set_error("archive header/footer mismatch — corrupt archive");
-        goto data_fail;
+        fclose(f);
+        return OMNIC_E_DATA;
     }
-    if (index_off < ARC_HDR || index_comp == 0 || index_comp > (1u << 30)) goto data_fail;
-
+    if (index_off < ARC_HDR || index_comp == 0 || index_comp > (1u << 30)) {
+        omnic_set_error("archive index out of range — corrupt archive");
+        fclose(f);
+        return OMNIC_E_DATA;
+    }
     uint8_t *zbuf = (uint8_t *)malloc((size_t)index_comp);
-    if (zbuf == NULL) goto sys_fail;
-    if (arc_seek(f, index_off) != 0 || fread(zbuf, 1, (size_t)index_comp, f) != (size_t)index_comp) {
+    if (zbuf == NULL) {
+        fclose(f);
+        return OMNIC_E_SYSTEM;
+    }
+    if (arc_seek(f, index_off) != 0 ||
+        fread(zbuf, 1, (size_t)index_comp, f) != (size_t)index_comp) {
         free(zbuf);
-        goto data_fail;
+        omnic_set_error("archive index truncated — cannot list or extract");
+        fclose(f);
+        return OMNIC_E_DATA;
     }
     if (arc_crc32(0, zbuf, (size_t)index_comp) != index_crc) {
         free(zbuf);
         omnic_set_error("archive index corrupted — cannot list or extract");
-        goto data_fail;
+        fclose(f);
+        return OMNIC_E_DATA;
     }
     uint64_t plain_cap = ZSTD_getFrameContentSize(zbuf, (size_t)index_comp);
-    if (plain_cap == 0 || plain_cap == ZSTD_CONTENTSIZE_ERROR || plain_cap == ZSTD_CONTENTSIZE_UNKNOWN ||
-        plain_cap > (64u << 20)) {
+    if (plain_cap == 0 || plain_cap == ZSTD_CONTENTSIZE_ERROR ||
+        plain_cap == ZSTD_CONTENTSIZE_UNKNOWN || plain_cap > (64u << 20)) {
         free(zbuf);
-        goto data_fail;
+        fclose(f);
+        return OMNIC_E_DATA;
     }
     uint8_t *plain = (uint8_t *)malloc((size_t)plain_cap);
     if (plain == NULL) {
         free(zbuf);
-        goto sys_fail;
+        fclose(f);
+        return OMNIC_E_SYSTEM;
     }
     size_t plain_n = ZSTD_decompress(plain, (size_t)plain_cap, zbuf, (size_t)index_comp);
     free(zbuf);
     if (ZSTD_isError(plain_n)) {
         free(plain);
-        goto data_fail;
+        omnic_set_error("archive index corrupted — cannot list or extract");
+        fclose(f);
+        return OMNIC_E_DATA;
     }
-    arc_index ix;
-    omnic_status pst = arc_index_parse(plain, plain_n, nent, nblk, 1, &ix);
+    omnic_status pst = arc_index_parse(plain, plain_n, nent, nblk, 1, ix);
     free(plain);
     if (pst == OMNIC_E_SYSTEM) {
-        goto sys_fail;
+        fclose(f);
+        return OMNIC_E_SYSTEM;
     }
     if (pst != OMNIC_OK) {
         if (omnic_last_error()[0] == '\0') omnic_set_error("corrupt archive index");
-        goto data_fail;
+        fclose(f);
+        return OMNIC_E_DATA;
     }
+    *out_f = f;
+    return OMNIC_OK;
+}
 
-    if (omnic_fs_mkdir_p(dstroot) != OMNIC_OK) goto sys_fail;
-    /* 目录条目先行（含空目录） */
-    for (size_t i = 0; i < ix.nent; i++) {
-        if (ix.ent[i].type != 1) continue;
-        char *dst = (char *)malloc(strlen(dstroot) + strlen(ix.ent[i].name) + 2);
-        if (dst == NULL) goto sys_fail_ix;
-        sprintf(dst, "%s/%s", dstroot, ix.ent[i].name);
-        omnic_status st = omnic_fs_mkdir_p(dst);
-        if (st == OMNIC_OK) omnic_fs_set_mtime(dst, ix.ent[i].mtime);
-        free(dst);
-        if (st != OMNIC_OK) {
-            omnic_set_error("cannot create directory under %s", dstroot);
-            goto sys_fail_ix;
+/* T2 模板：坏块报告含受影响条目名（至多 10 个，§5.4） */
+static void report_bad_block(const arc_index *ix, size_t bi, unsigned fmt, unsigned quiet) {
+    if (quiet) return;
+    fprintf(stderr, "omnic: block %zu (fmt %u) corrupted — skipped, affected:", bi, fmt);
+    size_t shown = 0;
+    for (size_t i = 0; i < ix->nent && shown < 10; i++)
+        if (ix->ent[i].type == 0 && ix->ent[i].block_id == (uint32_t)bi) {
+            fprintf(stderr, " %s", ix->ent[i].name);
+            shown++;
+        }
+    fprintf(stderr, "\n");
+}
+
+/* unpack_core：整树提取 / --file 过滤提取 / --verify 校验三种形态共用。
+ * only!=NULL 时仅解命中条目所在块；verify_only 时不落盘只验双层 CRC。 */
+static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
+                                const char *const *only, size_t n_only, int verify_only,
+                                const omnic_options *o, omnic_report *rep) {
+    if (archive_path == NULL) return OMNIC_E_USAGE;
+    omnic_report tmp;
+    if (rep == NULL) rep = &tmp;
+    memset(rep, 0, sizeof(*rep));
+    const char *dstroot = (dest_dir != NULL) ? dest_dir : ".";
+    unsigned quiet = (o != NULL && (o->flags & OMNIC_F_QUIET));
+
+    FILE *f = NULL;
+    arc_index ix;
+    omnic_status ost = arc_open_index(archive_path, &f, &ix);
+    if (ost != OMNIC_OK) return ost;
+
+    /* --file 名匹配：未命中即用法错误（可操作）；命中标记条目与所需块 */
+    unsigned char *want_ent = NULL, *want_blk = NULL;
+    size_t *blk_ents = NULL;
+    if (n_only > 0) {
+        want_ent = (unsigned char *)calloc(ix.nent ? ix.nent : 1, 1);
+        want_blk = (unsigned char *)calloc(ix.nblk ? ix.nblk : 1, 1);
+        if (want_ent == NULL || want_blk == NULL) goto sys_fail_ix;
+        size_t missing = 0;
+        for (size_t k = 0; k < n_only; k++) {
+            size_t i;
+            for (i = 0; i < ix.nent; i++) {
+                if (ix.ent[i].type == 0 && strcmp(ix.ent[i].name, only[k]) == 0) break;
+            }
+            if (i == ix.nent) {
+                fprintf(stderr, "omnic: --file not in archive: %s\n", only[k]);
+                missing++;
+            } else {
+                want_ent[i] = 1;
+                want_blk[ix.ent[i].block_id] = 1;
+            }
+        }
+        if (missing > 0) {
+            free(want_ent);
+            free(want_blk);
+            arc_index_mem_free(&ix);
+            fclose(f);
+            return OMNIC_E_USAGE;
+        }
+    }
+    /* 每块条目数（坏块时按条目口径计失败，汇总 extracted N/M 准确） */
+    blk_ents = (size_t *)calloc(ix.nblk ? ix.nblk : 1, sizeof(size_t));
+    if (blk_ents == NULL) goto sys_fail_ix;
+    for (size_t i = 0; i < ix.nent; i++)
+        if (ix.ent[i].type == 0) blk_ents[ix.ent[i].block_id]++;
+
+    if (!verify_only && want_ent == NULL && omnic_fs_mkdir_p(dstroot) != OMNIC_OK)
+        goto sys_fail_ix;
+    /* 目录条目先行（含空目录；仅全量提取） */
+    if (!verify_only && want_ent == NULL) {
+        for (size_t i = 0; i < ix.nent; i++) {
+            if (ix.ent[i].type != 1) continue;
+            char *dst = (char *)malloc(strlen(dstroot) + strlen(ix.ent[i].name) + 2);
+            if (dst == NULL) goto sys_fail_ix;
+            sprintf(dst, "%s/%s", dstroot, ix.ent[i].name);
+            omnic_status st = omnic_fs_mkdir_p(dst);
+            if (st == OMNIC_OK) omnic_fs_set_mtime(dst, ix.ent[i].mtime);
+            free(dst);
+            if (st != OMNIC_OK) {
+                omnic_set_error("cannot create directory under %s", dstroot);
+                goto sys_fail_ix;
+            }
         }
     }
 
-    /* 逐块解 store 段（压缩块为 A4 桩）；坏块跳过隔离 */
-    size_t extracted = 0, failed = 0;
-    uint8_t *blk_mem = NULL;
+    /* 逐块解压切条目；坏块跳过隔离（AR-ERR-001，T2 模板） */
+    size_t extracted = 0, failed = 0, blocks_ok = 0;
+    uint8_t *blk_mem = NULL; /* store 块复用缓冲 */
     uint64_t blk_cap = 0;
     for (size_t bi = 0; bi < ix.nblk; bi++) {
         const arc_block *b = &ix.blk[bi];
-        if (b->fmt != 0) {
-            omnic_set_error("compressed block (fmt %u) requires newer build", b->fmt);
-            failed++;
-            continue;
-        }
-        if (blk_cap < b->raw_size) {
-            uint8_t *m = (uint8_t *)realloc(blk_mem, (size_t)b->raw_size);
-            if (m == NULL) {
-                free(blk_mem);
-                goto sys_fail_ix;
+        if (want_blk != NULL && !want_blk[bi]) continue; /* --file：无目标条目的块不解 */
+        uint8_t *raw = NULL; /* 本块原始字节视图（store=blk_mem，压缩=解压产物） */
+        if (b->fmt == 0) {
+            if (blk_cap < b->raw_size) {
+                uint8_t *m = (uint8_t *)realloc(blk_mem, (size_t)b->raw_size);
+                if (m == NULL) goto sys_fail_ix;
+                blk_mem = m;
+                blk_cap = b->raw_size;
             }
-            blk_mem = m;
-            blk_cap = b->raw_size;
+            if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
+                fread(blk_mem, 1, (size_t)b->raw_size, f) != (size_t)b->raw_size ||
+                arc_crc32(0, blk_mem, (size_t)b->raw_size) != b->crc) {
+                report_bad_block(&ix, bi, b->fmt, quiet);
+                failed += blk_ents[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
+                continue;
+            }
+            raw = blk_mem;
+        } else {
+            /* 压缩块：读流 → 验流 CRC → 内存解压 → raw_size 一致性 */
+            const omnic_codec_ops *ops = omnic_codec_for_fmt((omnic_fmt_id)b->fmt);
+            uint8_t *cbuf = (uint8_t *)malloc((size_t)b->comp_size);
+            if (cbuf == NULL || ops == NULL || !ops->can_decompress) {
+                free(cbuf);
+                if (ops == NULL || !ops->can_decompress)
+                    omnic_set_error("block %zu: no decoder for format %u", bi, b->fmt);
+                else
+                    omnic_set_error("out of memory");
+                failed += blk_ents[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
+                continue;
+            }
+            if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
+                fread(cbuf, 1, (size_t)b->comp_size, f) != (size_t)b->comp_size ||
+                arc_crc32(0, cbuf, (size_t)b->comp_size) != b->crc) {
+                free(cbuf);
+                report_bad_block(&ix, bi, b->fmt, quiet);
+                failed += blk_ents[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
+                continue;
+            }
+            omnic_reader rr;
+            omnic_writer ww;
+            omnic_reader_init_mem(&rr, cbuf, (size_t)b->comp_size);
+            omnic_writer_init_mem(&ww);
+            omnic_status dst2 = ops->decompress(&rr, &ww);
+            size_t out_len = 0;
+            uint8_t *out_buf = omnic_writer_mem_drain(&ww, &out_len);
+            omnic_reader_fini(&rr);
+            free(cbuf);
+            if (dst2 != OMNIC_OK || out_buf == NULL || out_len != (size_t)b->raw_size) {
+                free(out_buf);
+                report_bad_block(&ix, bi, b->fmt, quiet);
+                failed += blk_ents[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
+                continue;
+            }
+            raw = out_buf;
         }
-        if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
-            fread(blk_mem, 1, (size_t)b->raw_size, f) != (size_t)b->raw_size ||
-            arc_crc32(0, blk_mem, (size_t)b->raw_size) != b->crc) {
-            if (!(o != NULL && (o->flags & OMNIC_F_QUIET)))
-                fprintf(stderr, "omnic: block %zu (fmt %u) corrupted — skipped\n", bi, b->fmt);
-            failed++;
-            continue;
-        }
+        blocks_ok++;
         for (size_t i = 0; i < ix.nent; i++) {
             arc_entry *e = &ix.ent[i];
             if (e->type != 0 || e->block_id != (uint32_t)bi) continue;
+            if (want_ent != NULL && !want_ent[i]) continue;
+            /* 块内偏移越界防御（无溢出写法）；条目 CRC 为双层校验内层（§4.2） */
+            if (e->size > b->raw_size || e->in_off > b->raw_size - e->size ||
+                arc_crc32(0, raw + e->in_off, (size_t)e->size) != e->crc) {
+                if (!quiet)
+                    fprintf(stderr, "omnic: entry corrupted — skipped: %s\n", e->name);
+                failed++;
+                continue;
+            }
+            if (verify_only) { /* --verify：校验通过即计入，不落盘 */
+                rep->out_bytes += e->size;
+                extracted++;
+                continue;
+            }
             size_t dl = strlen(dstroot) + strlen(e->name) + 2;
             char *dst = (char *)malloc(dl);
             if (dst == NULL) {
-                free(blk_mem);
+                if (raw != blk_mem) free(raw);
                 goto sys_fail_ix;
             }
             sprintf(dst, "%s/%s", dstroot, e->name);
+            /* --file 目标已存在且未 -f → 拒绝（T5） */
+            if (want_ent != NULL && arc_file_exists(dst) &&
+                !(o != NULL && (o->flags & OMNIC_F_FORCE))) {
+                omnic_set_error("'%s' already exists — use -f to overwrite", dst);
+                free(dst);
+                failed++;
+                continue;
+            }
             /* 父目录兜底（条目序外缺失时） */
             char *slash = strrchr(dst, '/');
             if (slash != NULL) {
@@ -630,7 +1097,7 @@ omnic_status omnic_unpack(const char *archive_path, const char *dest_dir,
                 failed++;
                 continue;
             }
-            size_t wsz = fwrite(blk_mem + e->in_off, 1, (size_t)e->size, out);
+            size_t wsz = fwrite(raw + e->in_off, 1, (size_t)e->size, out);
             fclose(out);
             if (wsz != (size_t)e->size) {
                 free(dst);
@@ -642,26 +1109,77 @@ omnic_status omnic_unpack(const char *archive_path, const char *dest_dir,
             rep->out_bytes += e->size;
             extracted++;
         }
+        if (raw != blk_mem) free(raw); /* 压缩块的解压产物 */
     }
     free(blk_mem);
+    free(want_ent);
+    free(want_blk);
+    free(blk_ents);
     arc_index_mem_free(&ix);
     fclose(f);
     rep->in_bytes = rep->out_bytes;
-    if (failed > 0 && !(o != NULL && (o->flags & OMNIC_F_QUIET)))
+    if (verify_only) {
+        if (!quiet)
+            printf("verified %zu/%zu files, %zu blocks OK\n", extracted, extracted + failed,
+                   blocks_ok);
+    } else if (failed > 0 && !quiet) {
         fprintf(stderr, "omnic: extracted %zu/%zu files (%zu failed)\n", extracted,
                 extracted + failed, failed);
+    }
     return failed ? OMNIC_E_DATA : OMNIC_OK;
 
-data_fail:
-    fclose(f);
-    return OMNIC_E_DATA;
-sys_fail:
-    fclose(f);
-    return OMNIC_E_SYSTEM;
 sys_fail_ix:
+    free(want_ent);
+    free(want_blk);
+    free(blk_ents);
     arc_index_mem_free(&ix);
     fclose(f);
     return OMNIC_E_SYSTEM;
+}
+
+omnic_status omnic_unpack(const char *archive_path, const char *dest_dir,
+                          const omnic_options *o, omnic_report *rep) {
+    return unpack_core(archive_path, dest_dir, NULL, 0, 0, o, rep);
+}
+
+omnic_status omnic_unpack_files(const char *archive_path, const char *dest_dir,
+                                const char *const *names, size_t n_names,
+                                const omnic_options *o, omnic_report *rep) {
+    return unpack_core(archive_path, dest_dir, names, n_names, 0, o, rep);
+}
+
+omnic_status omnic_arc_verify(const char *archive_path, const omnic_options *o,
+                              omnic_report *rep) {
+    return unpack_core(archive_path, NULL, NULL, 0, 1, o, rep);
+}
+
+/* --list：只读索引不读 Data 区（§5.2）；ratio 为该条目所在块级压缩率 */
+omnic_status omnic_arc_list(const char *archive_path, const omnic_options *o) {
+    if (archive_path == NULL) return OMNIC_E_USAGE;
+    FILE *f = NULL;
+    arc_index ix;
+    omnic_status st = arc_open_index(archive_path, &f, &ix);
+    if (st != OMNIC_OK) return st;
+    if (!(o != NULL && (o->flags & OMNIC_F_QUIET))) {
+        size_t files = 0, dirs = 0;
+        for (size_t i = 0; i < ix.nent; i++) {
+            const arc_entry *e = &ix.ent[i];
+            if (e->type == 1) {
+                printf("%s\t-\tdir\n", e->name);
+                dirs++;
+                continue;
+            }
+            const arc_block *b = &ix.blk[e->block_id];
+            printf("%s\t%llu\t%s\t%.1f%%\n", e->name, (unsigned long long)e->size,
+                   b->fmt == 0 ? "store" : omnic_fmt_str((omnic_fmt_id)b->fmt),
+                   b->raw_size ? 100.0 * (double)b->comp_size / (double)b->raw_size : 0.0);
+            files++;
+        }
+        printf("%zu files, %zu dirs, %zu blocks\n", files, dirs, ix.nblk);
+    }
+    arc_index_mem_free(&ix);
+    fclose(f);
+    return OMNIC_OK;
 }
 
 #endif /* OMNIC_CODEC_ZSTD */

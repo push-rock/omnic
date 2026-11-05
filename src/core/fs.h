@@ -32,4 +32,10 @@ omnic_status omnic_fs_set_mtime(const char *path, long long mtime);
 /* 以 UTF-8 路径打开文件（Windows 内部转宽字符，规避 CRT ANSI fopen 的 GBK 坑） */
 FILE *omnic_fs_fopen(const char *utf8_path, const char *mode);
 
+/* 绝对化路径（不要求存在；分隔符统一 '/'）。返回 malloc 字符串，失败 NULL。 */
+char *omnic_fs_abspath(const char *path);
+
+/* path_abs 是否位于 root_abs 子树内（含平台大小写语义；路径须先 abspath）。 */
+int omnic_fs_path_inside(const char *root_abs, const char *path_abs);
+
 #endif /* OMNIC_FS_H */

@@ -27,6 +27,14 @@ static void push_file(omnic_args *a, const char *f) {
     a->files[a->nfiles++] = f;
 }
 
+static void push_only(omnic_args *a, const char *f) {
+    if (a->n_only == a->only_cap) {
+        a->only_cap = a->only_cap ? a->only_cap * 2 : 8;
+        a->only = (const char **)realloc(a->only, sizeof(char *) * (size_t)a->only_cap);
+    }
+    a->only[a->n_only++] = f;
+}
+
 static int need_value(int argc, char **argv, int *i, const char **out, const char *flag) {
     if (*i + 1 >= argc) {
         fprintf(stderr, "omnic: option '%s' requires a value\n", flag);
@@ -47,6 +55,20 @@ static int parse_long_opt(omnic_args *a, int argc, char **argv, int *i) {
         a->opts.flags |= OMNIC_F_QUIET;
     } else if (strcmp(arg, "--explain") == 0) {
         a->opts.flags |= OMNIC_F_EXPLAIN;
+    } else if (strcmp(arg, "--per-file") == 0) {
+        a->opts.flags |= OMNIC_F_PER_FILE;
+    } else if (strcmp(arg, "--no-skip") == 0) {
+        a->opts.flags |= OMNIC_F_NO_SKIP;
+    } else if (strcmp(arg, "--list") == 0) {
+        a->opts.flags |= OMNIC_F_LIST;
+    } else if (strcmp(arg, "--verify") == 0) {
+        a->opts.flags |= OMNIC_F_VERIFY;
+    } else if (strcmp(arg, "--file") == 0) {
+        if (need_value(argc, argv, i, &v, arg) != 0) return 1;
+        push_only(a, v);
+    } else if (strcmp(arg, "--dir") == 0) {
+        if (need_value(argc, argv, i, &v, arg) != 0) return 1;
+        a->opts.output_dir = v;
     } else if (strcmp(arg, "--profile") == 0) {
         if (need_value(argc, argv, i, &v, arg) != 0) return 1;
         if (profile_from_str(v, &a->opts.profile) != 0) {
@@ -113,6 +135,9 @@ static int parse_short_opt(omnic_args *a, int argc, char **argv, int *i) {
     } else if (strcmp(arg, "-o") == 0) {
         if (need_value(argc, argv, i, &v, arg) != 0) return 1;
         a->opts.output_dir = v;
+    } else if (strcmp(arg, "-C") == 0) {
+        if (need_value(argc, argv, i, &v, arg) != 0) return 1;
+        a->opts.output_dir = v;
     } else if (strcmp(arg, "-h") == 0) {
         a->cmd = "help";
     } else if (strcmp(arg, "-V") == 0) {
@@ -170,6 +195,16 @@ int omnic_parse_args(int argc, char **argv, omnic_args *a) {
          strcmp(a->cmd, "pack") == 0 || strcmp(a->cmd, "unpack") == 0) &&
         a->nfiles == 0) {
         fprintf(stderr, "omnic: '%s' requires at least one file\n", a->cmd);
+        return 1;
+    }
+    int is_unpackish = (strcmp(a->cmd, "unpack") == 0 || strcmp(a->cmd, "d") == 0);
+    if (!is_unpackish &&
+        ((a->opts.flags & (OMNIC_F_LIST | OMNIC_F_VERIFY)) != 0 || a->n_only > 0)) {
+        fprintf(stderr, "omnic: --list/--verify/--file only apply to unpack\n");
+        return 1;
+    }
+    if ((a->opts.flags & OMNIC_F_LIST) != 0 && a->n_only > 0) {
+        fprintf(stderr, "omnic: --list and --file are mutually exclusive\n");
         return 1;
     }
     return 0;

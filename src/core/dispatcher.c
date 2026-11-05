@@ -8,6 +8,7 @@
 
 #include "codec/codec.h"
 #include "core/blockio.h"
+#include "core/fs.h"
 #include "core/registry.h"
 #include "core/util.h"
 #include "detect/entropy.h"
@@ -39,7 +40,7 @@ static void files_close(omnic_files *f, bool rollback) {
 }
 
 static bool file_exists(const char *path) {
-    FILE *f = fopen(path, "rb");
+    FILE *f = omnic_fs_fopen(path, "rb");
     if (f == NULL) return false;
     fclose(f);
     return true;
@@ -237,7 +238,7 @@ omnic_status omnic_run_compress(const char *path, const omnic_options *o, omnic_
     memset(&f, 0, sizeof(f));
     memset(&d, 0, sizeof(d));
 
-    f.in = fopen(path, "rb");
+    f.in = omnic_fs_fopen(path, "rb");
     if (f.in == NULL) {
         omnic_set_error("cannot open '%s': %s", path, strerror(errno));
         return OMNIC_E_SYSTEM;
@@ -297,7 +298,7 @@ omnic_status omnic_run_compress(const char *path, const omnic_options *o, omnic_
         }
         snprintf(f.tmp_path, n, "%s%s", f.out_path, OMNIC_TMP_SUFFIX);
     }
-    f.out = fopen(f.tmp_path, "wb");
+    f.out = omnic_fs_fopen(f.tmp_path, "wb");
     if (f.out == NULL) {
         omnic_set_error("cannot create '%s': %s", f.tmp_path, strerror(errno));
         ret = OMNIC_E_SYSTEM;
@@ -351,7 +352,7 @@ omnic_status omnic_run_decompress(const char *path, const omnic_options *o, omni
 
     memset(&f, 0, sizeof(f));
 
-    f.in = fopen(path, "rb");
+    f.in = omnic_fs_fopen(path, "rb");
     if (f.in == NULL) {
         omnic_set_error("cannot open '%s': %s", path, strerror(errno));
         return OMNIC_E_SYSTEM;
@@ -394,7 +395,7 @@ omnic_status omnic_run_decompress(const char *path, const omnic_options *o, omni
         }
         snprintf(f.tmp_path, n, "%s%s", f.out_path, OMNIC_TMP_SUFFIX);
     }
-    f.out = fopen(f.tmp_path, "wb");
+    f.out = omnic_fs_fopen(f.tmp_path, "wb");
     if (f.out == NULL) {
         omnic_set_error("cannot create '%s': %s", f.tmp_path, strerror(errno));
         ret = OMNIC_E_SYSTEM;
@@ -436,8 +437,8 @@ fail:
     return ret;
 }
 
-omnic_status omnic_run_analyze(const char *path, omnic_report *rep) {
-    FILE *in = fopen(path, "rb");
+omnic_status omnic_run_analyze(const char *path, const omnic_options *o, omnic_report *rep) {
+    FILE *in = omnic_fs_fopen(path, "rb");
     omnic_reader r;
     omnic_decision d;
     omnic_status ret;
@@ -447,7 +448,8 @@ omnic_status omnic_run_analyze(const char *path, omnic_report *rep) {
         return OMNIC_E_SYSTEM;
     }
     omnic_reader_init(&r, in);
-    ret = decide(in, path, &(omnic_options){OMNIC_PROFILE_BALANCED, NULL, 0, 0, 0, NULL}, &d);
+    if (o == NULL) o = &(omnic_options){OMNIC_PROFILE_BALANCED, NULL, 0, 0, 0, NULL};
+    ret = decide(in, path, o, &d);
     if (ret == OMNIC_OK) {
         rep->klass = d.klass;
         rep->entropy = d.entropy;
@@ -455,6 +457,11 @@ omnic_status omnic_run_analyze(const char *path, omnic_report *rep) {
             snprintf(rep->codec, sizeof(rep->codec), "%s", d.pe->codec);
             rep->level = d.pe->level;
             snprintf(rep->reason, sizeof(rep->reason), "%s", d.pe->reason);
+            /* skip 哨兵策略与 run_compress 跳过路径同一语义（SYS-CMP-003） */
+            if (omnic_policy_is_skip(d.pe) || d.klass == OMNIC_CLS_ALREADY_COMPRESSED ||
+                d.klass == OMNIC_CLS_RANDOM) {
+                rep->skipped = true;
+            }
         }
     }
     free(d.seg_base); /* analyze 不试压（纯探测），中段只用于特征 */

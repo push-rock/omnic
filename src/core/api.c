@@ -25,7 +25,7 @@ omnic_status omnic_analyze(const char *path, omnic_report *rep) {
     if (path == NULL) return OMNIC_E_USAGE;
     if (rep == NULL) rep = &tmp;
     memset(rep, 0, sizeof(*rep));
-    return omnic_run_analyze(path, rep);
+    return omnic_run_analyze(path, NULL, rep);
 }
 
 const char *omnic_status_str(omnic_status s) {

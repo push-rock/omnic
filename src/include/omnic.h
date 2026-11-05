@@ -87,6 +87,10 @@ typedef struct omnic_options {
 #define OMNIC_F_KEEP 0x02u    /* 保留源文件 */
 #define OMNIC_F_QUIET 0x04u
 #define OMNIC_F_EXPLAIN 0x08u /* 输出决策依据（SW-POL-003） */
+#define OMNIC_F_PER_FILE 0x10u /* 归档：每文件一块（毫秒级提取，ratio 代价） */
+#define OMNIC_F_NO_SKIP 0x20u  /* 归档：已压缩资产并入压缩桶（ratio 优先） */
+#define OMNIC_F_LIST 0x40u      /* 归档：--list 只列不解 */
+#define OMNIC_F_VERIFY 0x80u   /* 归档：--verify 只校验不落盘 */
 
 /* 采样与决策参数（SYS-CMP-002：决策 ≤50ms）
  * 二期分层采样（PHASE2_DECIDER_DESIGN §3.2）：头/中/尾各 256KiB，
