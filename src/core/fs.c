@@ -1,5 +1,11 @@
 /* fs：见 fs.h。Windows FindFirstFileW / POSIX dirent 双实现。
  * 产品代码要求五平台 CI 全绿，不走 gamepack 的 MinGW-only 路线。 */
+/* _DEFAULT_SOURCE 须先于任何系统头（features.h 首次包含即锁定）：
+ * -std=c11 严格模式下 glibc 默认只暴露 ISO C，futimens/d_type 需显式开启 */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
+
 #include "core/fs.h"
 
 #include <stdio.h>

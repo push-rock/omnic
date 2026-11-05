@@ -1,5 +1,10 @@
 /* 归档回归（ARCHIVE_SPEC §9 矩阵）：四策略 roundtrip、提取形态、损坏隔离、
  * 畸形拒绝。索引注入用 zstd 重写（与 pack 同级 3）。 */
+/* _DEFAULT_SOURCE 须先于任何系统头：-std=c11 严格模式下 dup/dup2/fileno 需显式开启 */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,7 +131,11 @@ static void rm_tree(const char *path) {
     system(cmd);
 }
 
-/* 两树文件集 + 内容 + mtime(±2s) 一致 */
+static int cmp_fs_ent(const void *a, const void *b) {
+    return strcmp(((const omnic_fs_entry *)a)->rel, ((const omnic_fs_entry *)b)->rel);
+}
+
+/* 两树文件集 + 内容 + mtime(±2s) 一致（walk 序在 *nix 上不保证，先排序） */
 static int tree_equal(const char *a, const char *b) {
     size_t na = 0, nb = 0, sk = 0;
     omnic_fs_entry *fa = omnic_fs_walk(a, &na, &sk);
@@ -136,6 +145,8 @@ static int tree_equal(const char *a, const char *b) {
         free(fb);
         return 0;
     }
+    qsort(fa, na, sizeof(*fa), cmp_fs_ent);
+    qsort(fb, nb, sizeof(*fb), cmp_fs_ent);
     int ok = (na == nb);
     if (ok) {
         for (size_t i = 0; i < na && ok; i++) {
