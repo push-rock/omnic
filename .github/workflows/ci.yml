@@ -59,6 +59,16 @@ jobs:
           set -o pipefail
           ctest --test-dir build --output-on-failure -C Release 2>&1 | tee test.log
           exit ${PIPESTATUS[0]}
+      - name: dump test failures as annotations
+        if: failure()
+        shell: bash
+        run: |
+          grep -iE '\*\*\*Failed|tests passed|tests failed' test.log | head -10 | while IFS= read -r line; do
+            echo "::error::$(echo "$line" | cut -c1-250)"
+          done
+          grep -B2 -A30 'Failed' test.log | head -80 | grep -iE 'FAIL|error|assert' | head -20 | while IFS= read -r line; do
+            echo "::error::$(echo "$line" | cut -c1-250)"
+          done
       - name: upload test log on failure
         if: failure()
         uses: actions/upload-artifact@v4
