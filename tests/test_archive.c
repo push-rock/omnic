@@ -297,14 +297,17 @@ static int save_index_plain(const char *arc, uint8_t *plain, size_t n, uint64_t 
     return 0;
 }
 
-/* 定位第 file_i 个（type==0）条目在明文中的偏移 */
-static size_t ent_off(const uint8_t *plain, uint32_t nblk, uint32_t file_i) {
+/* 按名定位条目行偏移：条目序 = walk 序，ext4/APFS 的 readdir 序与 NTFS 字典序
+ * 不同且目录条目(type=1)混杂其间——注入用例禁止按序数定位条目 */
+static long find_ent(const uint8_t *plain, uint32_t nblk, uint32_t nent, const char *name) {
     size_t off = (size_t)nblk * T_BLK_ROW;
-    for (uint32_t i = 0; i < file_i; i++) {
+    size_t nlen = strlen(name);
+    for (uint32_t i = 0; i < nent; i++) {
         uint32_t nl = plain[off] | ((uint32_t)plain[off + 1] << 8);
+        if (nl == nlen && memcmp(plain + off + 2, name, nl) == 0) return (long)off;
         off += 2 + nl + T_ENT_FIX + 8;
     }
-    return off;
+    return -1;
 }
 
 static void flip_byte(const char *path, long off) {
@@ -551,9 +554,12 @@ static void test_corruption(void) {
         uint8_t *pl = load_index_plain(ARC, &n, &io, &nent, &nblk);
         CHECK(pl != NULL);
         if (pl != NULL) {
-            size_t eo = ent_off(pl, nblk, 1); /* 第二个条目（b.txt） */
-            uint32_t nl = pl[eo] | ((uint32_t)pl[eo + 1] << 8);
-            pl[eo + 2 + nl + 22] ^= 0xFF; /* 条目行内 crc 字段（+22） */
+            long eo = find_ent(pl, nblk, nent, "b.txt");
+            CHECK(eo >= 0);
+            if (eo >= 0) {
+                uint32_t nl = (uint32_t)pl[eo] | ((uint32_t)pl[eo + 1] << 8);
+                pl[eo + 2 + nl + 22] ^= 0xFF; /* 条目行内 crc 字段（+22） */
+            }
             CHECK(save_index_plain(ARC, pl, n, io, nent, nblk) == 0);
             { /* FAILDIAG：注入后文件取证（长度 + 尾 32B hex）——CI annotation 直捞 */
                 long dsz = file_size(ARC);
@@ -632,21 +638,17 @@ static void test_malformed(void) {
         uint8_t *pl = load_index_plain(ARC, &n, &io, &nent, &nblk);
         CHECK(pl != NULL);
         if (pl != NULL) {
-            size_t eo = ent_off(pl, nblk, 0); /* 首条目 a.txt */
-            uint32_t nl = pl[eo] | ((uint32_t)pl[eo + 1] << 8);
+            long eo = find_ent(pl, nblk, nent, "b.txt");
+            CHECK(eo >= 0);
             if (inj[c].mode == 0) {
-                memcpy(pl + eo + 2, "../../evil", 9); /* 名长不变覆盖前缀 */
-                pl[eo + 2 + nl - 1] = 'x';
+                if (eo >= 0) memcpy(pl + eo + 2, "../xx", 5); /* 同长覆盖成逃逸路径 */
             } else if (inj[c].mode == 1) {
-                pl[eo] = 0xFF; /* name_len=65535 溢出 */
-                pl[eo + 1] = 0xFF;
+                if (eo >= 0) {
+                    pl[eo] = 0xFF; /* name_len=65535 溢出 */
+                    pl[eo + 1] = 0xFF;
+                }
             } else {
-                size_t eo2 = ent_off(pl, nblk, 1);
-                uint32_t nl2 = pl[eo2] | ((uint32_t)pl[eo2 + 1] << 8);
-                memcpy(pl + eo2 + 2, pl + eo + 2, nl); /* b.txt 名改成 a.txt */
-                pl[eo2] = (uint8_t)(nl & 0xFF);
-                pl[eo2 + 1] = (uint8_t)(nl >> 8);
-                (void)nl2;
+                if (eo >= 0) memcpy(pl + eo + 2, "a.txt", 5); /* b.txt 名改成 a.txt */
             }
             CHECK(save_index_plain(ARC, pl, n, io, nent, nblk) == 0);
             free(pl);
