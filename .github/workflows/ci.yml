@@ -63,10 +63,10 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          grep -iE '\*\*\*Failed|tests passed|tests failed' test.log | head -10 | while IFS= read -r line; do
+          grep -E 'FAILDIAG|^FAIL' test.log | head -30 | while IFS= read -r line; do
             echo "::error::$(echo "$line" | cut -c1-250)"
           done
-          grep -B2 -A30 'Failed' test.log | head -80 | grep -iE 'FAIL|error|assert' | head -20 | while IFS= read -r line; do
+          grep -iE '\*\*\*Failed|tests passed|tests failed' test.log | head -10 | while IFS= read -r line; do
             echo "::error::$(echo "$line" | cut -c1-250)"
           done
       - name: upload test log on failure

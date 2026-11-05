@@ -555,12 +555,29 @@ static void test_corruption(void) {
             uint32_t nl = pl[eo] | ((uint32_t)pl[eo + 1] << 8);
             pl[eo + 2 + nl + 22] ^= 0xFF; /* 条目行内 crc 字段（+22） */
             CHECK(save_index_plain(ARC, pl, n, io, nent, nblk) == 0);
+            { /* FAILDIAG：注入后文件取证（长度 + 尾 32B hex）——CI annotation 直捞 */
+                long dsz = file_size(ARC);
+                FILE *dh = omnic_fs_fopen(ARC, "rb");
+                unsigned char dt[32];
+                if (dh != NULL && dsz >= 32) {
+                    fseek(dh, -32, SEEK_END);
+                    if (fread(dt, 1, 32, dh) == 32) {
+                        printf("FAILDIAG sz=%ld io=%llu tail=", dsz, (unsigned long long)io);
+                        for (int k = 0; k < 32; k++) printf("%02x", dt[k]);
+                        printf("\n");
+                        fflush(stdout);
+                    }
+                    fclose(dh);
+                }
+            }
             free(pl);
         }
     }
     rm_tree("omnic_arc_c4");
     memset(&g_rep, 0, sizeof(g_rep));
     st = omnic_unpack(ARC, "omnic_arc_c4", &o, &g_rep);
+    printf("FAILDIAG st=%d err=%s\n", (int)st, omnic_last_error());
+    fflush(stdout);
     CHECK(st == OMNIC_E_DATA); /* 1 条目失败 */
     CHECK(omnic_fs_fopen("omnic_arc_c4/a.txt", "rb") != NULL); /* 其余完好 */
     rm_tree("omnic_arc_c4");
