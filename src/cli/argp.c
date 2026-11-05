@@ -139,6 +139,10 @@ int omnic_parse_args(int argc, char **argv, omnic_args *a) {
         a->cmd = "d";
     } else if (strcmp(first, "analyze") == 0) {
         a->cmd = "analyze";
+    } else if (strcmp(first, "pack") == 0) {
+        a->cmd = "pack";
+    } else if (strcmp(first, "unpack") == 0) {
+        a->cmd = "unpack";
     } else if (strcmp(first, "list") == 0) {
         a->cmd = "list";
     } else if (strcmp(first, "version") == 0 || strcmp(first, "--version") == 0 ||
@@ -162,7 +166,8 @@ int omnic_parse_args(int argc, char **argv, omnic_args *a) {
         }
     }
 
-    if ((strcmp(a->cmd, "c") == 0 || strcmp(a->cmd, "d") == 0 || strcmp(a->cmd, "analyze") == 0) &&
+    if ((strcmp(a->cmd, "c") == 0 || strcmp(a->cmd, "d") == 0 || strcmp(a->cmd, "analyze") == 0 ||
+         strcmp(a->cmd, "pack") == 0 || strcmp(a->cmd, "unpack") == 0) &&
         a->nfiles == 0) {
         fprintf(stderr, "omnic: '%s' requires at least one file\n", a->cmd);
         return 1;

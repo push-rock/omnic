@@ -129,8 +129,10 @@ endif()
 # ---- libomnic（INT-LIB-001） ----
 set(OMNIC_SRC
   src/core/api.c
+  src/core/archive.c
   src/core/blockio.c
   src/core/dispatcher.c
+  src/core/fs.c
   src/core/registry.c
   src/core/util.c
   src/codec/codec_util.c

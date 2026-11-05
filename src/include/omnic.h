@@ -119,6 +119,13 @@ omnic_status omnic_compress(const char *path, const omnic_options *o, omnic_repo
 omnic_status omnic_decompress(const char *path, const omnic_options *o, omnic_report *rep);
 omnic_status omnic_analyze(const char *path, omnic_report *rep);
 
+/* 归档（ARCHIVE_SPEC，INT-LIB-001 同源）：pack 打包目录树为 .omnic；
+ * unpack 整树还原。options 中仅 profile/FORCE/QUIET/EXPLAIN 生效 */
+omnic_status omnic_pack(const char *root, const char *archive_path,
+                        const omnic_options *o, omnic_report *rep);
+omnic_status omnic_unpack(const char *archive_path, const char *dest_dir,
+                          const omnic_options *o, omnic_report *rep);
+
 const char *omnic_status_str(omnic_status s);
 const char *omnic_profile_str(omnic_profile p);
 const char *omnic_class_str(omnic_class c);

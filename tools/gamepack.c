@@ -183,6 +183,7 @@ int main(int argc, char **argv) {
     const char *root = argv[1];
     const char *work = "gp_work";
     const char *csv_path = NULL;
+    const char *perfile_path = NULL;
     omnic_options o;
     memset(&o, 0, sizeof(o));
     o.profile = OMNIC_PROFILE_BALANCED;
@@ -210,9 +211,21 @@ int main(int argc, char **argv) {
             work = argv[++i];
         } else if (strcmp(argv[i], "--csv") == 0 && i + 1 < argc) {
             csv_path = argv[++i];
+        } else if (strcmp(argv[i], "--perfile") == 0 && i + 1 < argc) {
+            perfile_path = argv[++i];
         }
     }
     if (o.codec != NULL) comp_flags |= OMNIC_F_FORCE; /* 参照模式强压全部（含 skip 类） */
+
+    FILE *pf = NULL; /* --perfile：逐文件决策清单（solid 分桶实验用） */
+    if (perfile_path != NULL) {
+        pf = fopen(perfile_path, "w");
+        if (pf == NULL) {
+            fprintf(stderr, "gamepack: cannot open %s\n", perfile_path);
+            return 1;
+        }
+        fprintf(pf, "path,class,codec,level,skipped,in_bytes,out_bytes\n");
+    }
 
     walk(root);
     unsigned long long total_in = 0;
@@ -262,6 +275,10 @@ int main(int argc, char **argv) {
             g_cls[rep.klass].in_bytes += g_files[i].bytes;
             g_cls[rep.klass].out_bytes += rep.skipped ? g_files[i].bytes : rep.out_bytes;
         }
+        if (pf != NULL)
+            fprintf(pf, "%s,%d,%s,%d,%d,%llu,%llu\n", g_files[i].path, (int)rep.klass,
+                    rep.skipped ? "skip" : rep.codec, rep.level, rep.skipped ? 1 : 0,
+                    g_files[i].bytes, rep.skipped ? g_files[i].bytes : rep.out_bytes);
         codec_agg *a = agg_get(cname);
         if (a != NULL) {
             a->n_files++;
@@ -376,6 +393,7 @@ int main(int argc, char **argv) {
             fclose(c);
         }
     }
+    if (pf != NULL) fclose(pf);
     rm_rf(work);
     return 0;
 }
