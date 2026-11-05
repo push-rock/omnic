@@ -1078,19 +1078,18 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                 failed++;
                 continue;
             }
-            /* 父目录兜底（条目序外缺失时） */
-            char *slash = strrchr(dst, '/');
-            if (slash != NULL) {
-                *slash = '\0';
-                if (omnic_fs_mkdir_p(dst) != OMNIC_OK) {
-                    *slash = '/';
-                    free(dst);
-                    failed++;
-                    continue;
-                }
-                *slash = '/';
-            }
             FILE *out = omnic_fs_fopen(dst, "wb");
+            if (out == NULL) {
+                /* 兜底：目录条目序外缺失（畸形归档）才补建父目录——正常路径
+                 * 目录先行已建全，逐文件 mkdir_p 的 syscall 开销占解压墙钟大头 */
+                char *slash = strrchr(dst, '/');
+                if (slash != NULL) {
+                    *slash = '\0';
+                    omnic_status ms = omnic_fs_mkdir_p(dst);
+                    *slash = '/';
+                    if (ms == OMNIC_OK) out = omnic_fs_fopen(dst, "wb");
+                }
+            }
             if (out == NULL) {
                 omnic_set_error("cannot create: %s", dst);
                 free(dst);
@@ -1098,13 +1097,13 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                 continue;
             }
             size_t wsz = fwrite(raw + e->in_off, 1, (size_t)e->size, out);
+            if (wsz == (size_t)e->size) omnic_fs_set_mtime_stream(out, e->mtime);
             fclose(out);
             if (wsz != (size_t)e->size) {
                 free(dst);
                 failed++;
                 continue;
             }
-            omnic_fs_set_mtime(dst, e->mtime);
             free(dst);
             rep->out_bytes += e->size;
             extracted++;

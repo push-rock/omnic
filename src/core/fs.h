@@ -29,6 +29,9 @@ omnic_status omnic_fs_mkdir_p(const char *path);
 /* 设置文件或目录的 mtime（Unix 秒） */
 omnic_status omnic_fs_set_mtime(const char *path, long long mtime);
 
+/* 在已打开的流上设置 mtime（省一次独立打开）；须在 fclose 前调用 */
+omnic_status omnic_fs_set_mtime_stream(FILE *f, long long mtime);
+
 /* 以 UTF-8 路径打开文件（Windows 内部转宽字符，规避 CRT ANSI fopen 的 GBK 坑） */
 FILE *omnic_fs_fopen(const char *utf8_path, const char *mode);
 

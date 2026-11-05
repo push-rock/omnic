@@ -30,6 +30,7 @@ static int vec_push(entry_vec *ev, const omnic_fs_entry *e) {
 
 #ifdef _WIN32
 
+#include <io.h>
 #include <windows.h>
 
 /* UTF-8 → UTF-16；非法序列回退 CP_ACP（MinGW argv 是 ACP 编码的现实兜底）。
@@ -164,6 +165,17 @@ omnic_status omnic_fs_set_mtime(const char *path, long long mtime) {
     return ok ? OMNIC_OK : OMNIC_E_SYSTEM;
 }
 
+omnic_status omnic_fs_set_mtime_stream(FILE *f, long long mtime) {
+    HANDLE h = (HANDLE)_get_osfhandle(_fileno(f));
+    if (h == INVALID_HANDLE_VALUE) return OMNIC_E_SYSTEM;
+    ULARGE_INTEGER u;
+    u.QuadPart = (unsigned long long)mtime * 10000000ULL + 116444736000000000ULL;
+    FILETIME ft;
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    return SetFileTime(h, NULL, &ft, &ft) ? OMNIC_OK : OMNIC_E_SYSTEM;
+}
+
 FILE *omnic_fs_fopen(const char *utf8_path, const char *mode) {
     wchar_t wpath[OMNIC_FS_PATH_MAX * 2], wmode[8];
     if (utf8_to_w16(utf8_path, wpath, OMNIC_FS_PATH_MAX * 2) == 0) return NULL;
@@ -207,6 +219,7 @@ int omnic_fs_path_inside(const char *root_abs, const char *path_abs) {
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <utime.h>
+#include <time.h>
 
 static int walk_dir(const char *dir, const char *rel, entry_vec *ev, size_t *skipped) {
     DIR *d = opendir(dir);
@@ -292,6 +305,15 @@ omnic_status omnic_fs_set_mtime(const char *path, long long mtime) {
     t.actime = (time_t)mtime;
     t.modtime = (time_t)mtime;
     return utime(path, &t) == 0 ? OMNIC_OK : OMNIC_E_SYSTEM;
+}
+
+omnic_status omnic_fs_set_mtime_stream(FILE *f, long long mtime) {
+    struct timespec ts[2];
+    ts[0].tv_sec = (time_t)mtime;
+    ts[0].tv_nsec = 0;
+    ts[1].tv_sec = (time_t)mtime;
+    ts[1].tv_nsec = 0;
+    return futimens(fileno(f), ts) == 0 ? OMNIC_OK : OMNIC_E_SYSTEM;
 }
 
 FILE *omnic_fs_fopen(const char *utf8_path, const char *mode) {
