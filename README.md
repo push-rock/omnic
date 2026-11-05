@@ -18,25 +18,35 @@ report.json.xz: xz
     61042 -> 1048576 bytes, 0.019s, 55.2 MB/s
 ```
 
-## Why omnic and not just `zstd`?
+## The pitch: every file gets the codec it deserves
 
-If all your files are one type, use that codec's own CLI — omnic will even route you to the same codec. omnic exists for **mixed content**: project directories, datasets, game assets, backups. There you have exactly one default, and it is wrong for most of your files. Same 152.5 MB mixed tree (8,586 files: PNG, Ogg, DLL, Lua, text), one command each:
+omnic reads each file once (~1 ms: three 256 KiB samples, extension routing, 8 features) and routes it to the right codec out of 16. Inside one directory that means different files get different answers:
 
-| your default | ratio | decompress |
-|---|---|---|
-| `gzip -9` | 63.2% | 352 MiB/s |
-| `zstd -3` (zstd CLI default) | 61.0% | 618 MiB/s |
-| `zstd -19` (max squeeze) | 57.9% | 579 MiB/s |
-| `7z` (≈ xz -9) | 56.8% | 81 MiB/s |
-| **`omnic c`** · balanced | 59.5% | **1060 MiB/s** |
-| **`omnic c`** · best_ratio | **57.0%** | 79 MiB/s |
+| in a mixed workspace (72 files, 126 MB) | omnic picks | and gets | zstd -19 would get |
+|---|---|---|---|
+| 22 text files, 35.5 MB | xz 9 | **27.3%** | 28.2% |
+| SQLite database, 24.1 MB | xz 6 | **20.6%** | 22.9% |
+| flat synthetic bitmap, 24 MB | brotli 9 | **24 MB → 928 B** | 24 MB → 3.0 KB |
+| photo bitmap, 26.4 MB | xz 6 | **13.8%** | 15.9% |
+| 35 already-compressed PNG/Ogg | **pass-through** | untouched, zero CPU | re-compressed for ~0.01% of the tree |
 
-(omnic throughput figures are its streaming product path; single-shot library calls measure ~35% slower. Method and full tables below.)
+Same tree, same file-by-file protocol, one command each:
 
-- The `balanced` profile beats `gzip -9` by 3.7 pp of ratio **and** decompresses 3× faster than it; it also beats the `zstd` CLI default on both axes.
-- The `best_ratio` profile lands within 0.2 pp of 7-Zip's ratio — without you having to know which files deserve xz and which are already compressed: the 54% of this tree that is PNG/Ogg passes through untouched, zero CPU, instead of being pointlessly recompressed (try that with `gzip -9` on a folder full of JPEGs).
+| per-file over the whole tree | ratio | compress | decompress |
+|---|---|---|---|
+| `gzip -9` | 26.4% | 38 MiB/s | 347 MiB/s |
+| `zstd -3` (zstd CLI default) | 26.5% | 261 | 658 |
+| `zstd -19` (max squeeze) | 20.4% | 3.2 | 623 |
+| **`omnic c`** · balanced | 24.3% | 85 | **736** |
+| **`omnic c`** · best_ratio | **19.2%** | 3.0 | 188 |
+
+- "Max compression" is not a single algorithm. `best_ratio` beats `zstd -19` by **1.2 pp** — because per-file routing applies the right compressor everywhere instead of one compromise everywhere.
+- `balanced` beats the `zstd` CLI's own default by **2.1 pp of ratio while decompressing faster**, and beats `gzip -9` on all three axes at once.
+- If you first tar the tree into one stream, cross-file redundancy is worth several more pp — the [game-asset-tree section](#real-world-a-game-asset-tree) shows that protocol with a 152.5 MB real game tree.
 
 And one thing no single-codec CLI can give you at all: omnic **decodes 16 formats** — gzip, zlib, raw deflate, zstd, xz, lzma, lzip, bzip2, lz4, brotli, snappy, compress (.Z), lzfse, lzvn, plus both lzma container variants. Someone hands you a `.lzfse` or a 1989 `.Z` file, omnic opens it.
+
+(Test corpus: 16 source files, 3 docs, 8 novels + enwik8, 2 bitmaps, 3 fonts, 1 SQLite DB, 3 DLLs, 35 PNG/Ogg — all real files. Reproduce with `omnic_gamepack`.)
 
 ## What it does
 
