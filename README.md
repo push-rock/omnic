@@ -18,11 +18,31 @@ report.json.xz: xz
     61042 -> 1048576 bytes, 0.019s, 55.2 MB/s
 ```
 
-## Why
+## Why omnic and not just `zstd`?
+
+If all your files are one type, use that codec's own CLI — omnic will even route you to the same codec. omnic exists for **mixed content**: project directories, datasets, game assets, backups. There you have exactly one default, and it is wrong for most of your files. Same 152.5 MB mixed tree (8,586 files: PNG, Ogg, DLL, Lua, text), one command each:
+
+| your default | ratio | decompress |
+|---|---|---|
+| `gzip -9` | 63.2% | 352 MiB/s |
+| `zstd -3` (zstd CLI default) | 61.0% | 618 MiB/s |
+| `zstd -19` (max squeeze) | 57.9% | 579 MiB/s |
+| `7z` (≈ xz -9) | 56.8% | 81 MiB/s |
+| **`omnic c`** · balanced | 59.5% | **1060 MiB/s** |
+| **`omnic c`** · best_ratio | **57.0%** | 79 MiB/s |
+
+(omnic throughput figures are its streaming product path; single-shot library calls measure ~35% slower. Method and full tables below.)
+
+- The `balanced` profile beats `gzip -9` by 3.7 pp of ratio **and** decompresses 3× faster than it; it also beats the `zstd` CLI default on both axes.
+- The `best_ratio` profile lands within 0.2 pp of 7-Zip's ratio — without you having to know which files deserve xz and which are already compressed: the 54% of this tree that is PNG/Ogg passes through untouched, zero CPU, instead of being pointlessly recompressed (try that with `gzip -9` on a folder full of JPEGs).
+
+And one thing no single-codec CLI can give you at all: omnic **decodes 16 formats** — gzip, zlib, raw deflate, zstd, xz, lzma, lzip, bzip2, lz4, brotli, snappy, compress (.Z), lzfse, lzvn, plus both lzma container variants. Someone hands you a `.lzfse` or a 1989 `.Z` file, omnic opens it.
+
+## What it does
 
 lzbench benchmarks 50+ compressors, but no mainstream tool routes between them. `zstd --adapt` adapts levels *within* one codec; 7-Zip doesn't care whether the input is JSON or a bitmap. omnic closes that gap:
 
-- **Compress**: classify the input (extension routing + 3-segment sample: 256 KiB head/middle/tail, 8 features), then look up a policy table — *8 data classes × 4 preference profiles* — to pick `(codec, level)`. A full decision takes about a millisecond, most of it I/O.
+- **Compress**: classify the input (extension routing + 3-segment sample: 256 KiB head/middle/tail, 8 features), then look up a policy table — *7 content classes × 4 preference profiles* — to pick `(codec, level)`. A full decision takes about a millisecond, most of it I/O.
 - **Prefer**: `--profile fast_compress | fast_decompress | best_ratio | balanced`.
 - **Decompress**: recognize the format by magic number first, extension as fallback. Native formats only, so every output can be unpacked by the official tools of that codec.
 - **Skip incompressible data**: already-compressed inputs (jpeg/zip/…) and high-entropy data (≥7.5 bits/byte) are skipped with a warning; `--force` overrides.

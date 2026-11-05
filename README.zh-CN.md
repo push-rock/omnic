@@ -18,7 +18,27 @@ report.json.xz: xz
     61042 -> 1048576 bytes, 0.019s, 55.2 MB/s
 ```
 
-## 为什么做这个项目
+## 凭什么用 omnic，而不是直接 `zstd`？
+
+如果你所有文件都是同一类，用那个压缩器自己的命令行就好——omnic 甚至会把你路由到同一个 codec。omnic 为**混合内容**而生：项目目录、数据集、游戏资产、备份。这种场景下你只能有一个默认选择，而它对大部分文件都是错的。同一棵 152.5 MB 混合文件树（8,586 个文件：PNG、Ogg、DLL、Lua、文本），各自一条命令：
+
+| 你的默认 | 压缩率 | 解压 |
+|---|---|---|
+| `gzip -9` | 63.2% | 352 MiB/s |
+| `zstd -3`（zstd CLI 默认档） | 61.0% | 618 MiB/s |
+| `zstd -19`（极限压缩） | 57.9% | 579 MiB/s |
+| `7z`（≈ xz -9） | 56.8% | 81 MiB/s |
+| **`omnic c`** · balanced | 59.5% | **1060 MiB/s** |
+| **`omnic c`** · best_ratio | **57.0%** | 79 MiB/s |
+
+（omnic 吞吐为流式产品路径口径；库直调单发口径慢约 35%。方法学与完整表格见下文。）
+
+- `balanced` 档比 `gzip -9` 压缩率好 3.7 pp，解压还快 3 倍；对 `zstd` CLI 的默认档是两个维度同时胜。
+- `best_ratio` 档压缩率与 7-Zip 相差 0.2 pp 以内——但**不需要你懂**哪些文件配得上 xz、哪些已经压过：这棵树 54% 的 PNG/Ogg 直接原样落盘、零 CPU，而不是被傻乎乎地再压一遍（拿 `gzip -9` 压一个全是 JPEG 的目录试试）。
+
+还有一样任何单 codec 命令行永远给不了的：omnic **能解 16 种格式**——gzip、zlib、raw deflate、zstd、xz、lzma、lzip、bzip2、lz4、brotli、snappy、compress（.Z）、lzfse、lzvn，外加两个 lzma 容器变体。别人丢给你一个 `.lzfse` 或者 1989 年的 `.Z` 文件，omnic 直接开。
+
+## 它做什么
 
 lzbench 基准测试收录了 50 多种压缩器，但没有任何主流工具在它们之间做路由。`zstd --adapt` 只在单一算法内部自适应级别；7-Zip 不关心输入是 JSON 还是位图。omnic 补上这一环：
 
