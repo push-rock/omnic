@@ -286,6 +286,12 @@ static int save_index_plain(const char *arc, uint8_t *plain, size_t n, uint64_t 
     ftr[30] = (uint8_t)(nblk & 0xFF);
     ftr[31] = (uint8_t)(nblk >> 8);
     fwrite(ftr, 1, 32, f);
+    /* "r+" 不截断：重压索引比原短时尾部残留旧字节，SEEK_END 读 Footer 会落空 */
+#if defined(_WIN32)
+    _chsize(fileno(f), (long)(index_off + zn + 32));
+#else
+    ftruncate(fileno(f), (off_t)(index_off + zn + 32));
+#endif
     fclose(f);
     free(zbuf);
     return 0;
