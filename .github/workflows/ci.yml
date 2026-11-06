@@ -15,7 +15,7 @@ jobs:
             cc: gcc
           - os: ubuntu-22.04
             cc: clang
-          - os: macos-14
+          - os: macos-15
             cc: clang
           - os: windows-latest
             cc: cl
