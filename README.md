@@ -6,16 +6,20 @@
 
 ```
 $ omnic c report.json
-report.json: zstd | balanced | text | level 8
-    1048576 -> 91234 bytes (8.70%), 0.091s, 11.5 MB/s
+report.json: zstd | balanced | text/code | level 9
+    527565 -> 45995 bytes (8.72%), 0.007s, 75.0 MB/s
 
-$ omnic c --profile best_ratio report.json
-report.json: brotli | best_ratio | text | level 11
-    1048576 -> 61042 bytes (5.82%), 0.322s, 3.3 MB/s
+$ omnic c report.json -p best_ratio
+report.json: xz | best_ratio | text/code | level 9
+    527565 -> 32108 bytes (6.09%), 0.110s, 4.8 MB/s
 
-$ omnic d report.json.xz
-report.json.xz: xz
-    61042 -> 1048576 bytes, 0.019s, 55.2 MB/s
+$ omnic c enwik8.txt                          # 24 MB of natural text
+enwik8.txt: zstd | balanced | text/natural | level 6
+    25165824 -> 8241352 bytes (32.75%), 0.287s, 87.7 MB/s
+
+$ omnic d enwik8.txt.zst
+enwik8.txt.zst: zstd
+    8241352 -> 25165824 bytes (305.36%), 0.034s, 748.8 MB/s
 ```
 
 ## The pitch: every file gets the codec it deserves
@@ -130,6 +134,25 @@ python tools/plot_bench.py bench.csv -o assets/bench
 
 `omnic_bench` also measures adapter overhead against direct library calls on the same data: on Silesia, every codec stays within **0.8% on compression and 1.4% on decompression** (reference: i7-12700, GCC 16.2 MinGW-w64; raw numbers in `assets/bench.csv`). Most decompression paths are actually *faster* through omnic (up to +60%: zstd low levels, lz4, snappy): fixed-size chunk buffers stay cache-hot, while one-shot baselines stream through buffers larger than L3. That margin is not free — it comes from seek-based size preallocation for whole-buffer codecs, 1 MiB stdio buffering for small-chunk formats, hardware CRC32C (SSE4.2/ARM64) in the snappy framing, and a block-header pre-scan that sizes lzfse output exactly. `ctest` runs a 40% adapter-overhead smoke gate (`bench_smoke`, synthetic corpus — self-contained and reproducible in CI) on every push; the tight thresholds are enforced by local runs of the same tool.
 
+### What speeds to expect, by regime
+
+Throughput has three regimes, and mixing them up is how "compressors are supposed to be hundreds of MB/s" confusion happens. Single big files first — measured end to end (decision + I/O + compression, best of 3, warm cache, i7-12700):
+
+| 24 MB input | `balanced` | `fast_compress` | `best_ratio` |
+|---|---|---|---|
+| natural text | zstd 6 · 88 MB/s c / 563 d · 32.7% | zstd --fast · 174 / 269 · 52.0% | xz 9 · 2 / 129 · 26.3% |
+| SQLite database | zstd 9 · 53 / 645 · 28.4% | snappy · 365 / 812 · 47.9% | xz 9 · 2 / 131 · 20.6% |
+| photo bitmap | zstd 9 · 75 / 712 · 19.5% | snappy · 441 / 905 · 40.3% | xz 9 · 4 / 195 · 13.8% |
+| flat synthetic bitmap | zlib-ng 9 · 589 / 896 · 0.1% | zstd · 1476 / 1197 · 0.02% | brotli 11 · 25 / 835 · 0.00% |
+
+(c = compress, d = decompress, MB/s of original file size.)
+
+- **Decompression — the operation you actually repeat — runs 563–1,197 MB/s** in every row.
+- Compression speed at a given ratio is the real variable. For scale: `zstd -19`, the closest single-codec ratio peer, runs **3.2–5.4 MiB/s** in the tables below — max-ratio compression is CPU-bound for every tool on earth. `balanced` buys that same ratio class at **53–88 MB/s (16–26× faster)**; `fast_compress` trades ratio for **174–1,476 MB/s**.
+- The flat-bitmap row is why content routing matters: 24 MB of repeating pixels compresses at 589 MB/s under zlib-ng — the data itself is the speed.
+
+**A tree of 8,586 small files is a different regime.** Each ~15 KB file pays ~0.7 ms of decision + open/close + write-out regardless of codec speed, so the whole tree moves at 9.6 MiB/s in `balanced` — the file count sets the pace, not the codec (quantified in the game-tree section). `.omnic` archives exist to fix exactly that: same per-file decisions, but files are concatenated into solid blocks, so packing the tree runs at 31 MB/s while single-file extraction stays at 10–81 ms.
+
 ## How it picks
 
 The decision pipeline runs in about **1 ms** (dominated by I/O: three 256 KiB segments sampled from head/middle/tail — the first-order entropy is already converged at that size, so a 4 GB file costs no more than a 4 MB one):
@@ -185,14 +208,15 @@ Per-file costs ~7 pp of ratio (15 KB average files lose cross-file redundancy vs
 
 `omnic pack` turns the trade-off above into a dial. Every file is classified, but instead of writing 8,586 tiny outputs, same-codec files are concatenated into buckets and compressed as 64 MiB solid blocks. You keep per-file routing *and* cross-file redundancy, in one file:
 
-| strategy | ratio | pack | single file out | when |
-|---|---|---|---|---|
-| solid (default) | **65.8%** | **4.9 s** | 81 ms | backing up a tree |
-| `--per-file` | 68.4% | 8.4 s | **10 ms** | assets you load individually |
-| `--no-skip` | 62.2% | 18.9 s | 81 ms | squeezing every last byte |
-| best_ratio + solid | **63.2%** | 23.9 s | 81 ms | cold storage |
+| strategy | ratio | pack | pack rate | single file out | when |
+|---|---|---|---|---|---|
+| solid (default) | **65.8%** | **4.9 s** | 31 MB/s | 81 ms | backing up a tree |
+| `--per-file` | 68.4% | 8.4 s | 18 MB/s | **10 ms** | assets you load individually |
+| `--no-skip` | 62.2% | 18.9 s | 8 MB/s | 81 ms | squeezing every last byte |
+| best_ratio + solid | **63.2%** | 23.9 s | 6.4 MB/s | 81 ms | cold storage |
+| `zip` (deflate, same tree) | 69.2% | 3.8 s | 40 MB/s | per-file | the incumbent |
 
-(Same 152.5 MB game tree; `zip` deflate on it: 69.2%, 3.8 s. `tar -cf - | xz -9`: 56.8%, but single-stream — you cannot pull one file out without decompressing everything.)
+(`tar -cf - | xz -9` reaches 56.8%, but is single-stream — you cannot pull one file out without decompressing everything.)
 
 What the block layout buys that no plain compressor has:
 
@@ -204,7 +228,17 @@ What the block layout buys that no plain compressor has:
 
 The two profiles keep their meaning: `pack` defaults to `balanced` (the 4.9 s / 65.8% row), `-p best_ratio` switches buckets to xz (the 63.2% row). The format, block table and index layout are frozen as of v1 — published archives stay readable forever; future versions may add fields but never rearrange existing ones.
 
-Decompressing the balanced archive takes ~4.4 s on the same machine, against ~2.5 s for `tar -x` on the equivalent zip. The engine itself accounts for 0.3 s of that (block reads, decompression, both CRC layers over all 152 MB — measured via `--verify`); the rest is Windows file-creation cost that a plain directory copy of the same tree pays too (robocopy, single-threaded: 3.7 s). On the axes where archives compete — ratio, pack speed, selective access, fault tolerance — `.omnic` is ahead; on raw extract throughput under a real-time antivirus it trades ~1.8 s on 8,586 files, which v0.3.1's parallel write path is reserved to close.
+Extracting the balanced archive, and where the time actually goes:
+
+| | wall time | throughput |
+|---|---|---|
+| `omnic unpack` | 4.4 s | 35 MB/s |
+| `bsdtar -xf` on the equivalent zip | 2.5 s | 61 MB/s |
+| plain copy of the tree (robocopy, 1 thread) | 3.7 s | 41 MB/s |
+| `omnic --verify` — read + decompress + both CRC layers, write nothing | 0.59 s | **258 MB/s** |
+| decompression engine share inside `unpack` | 0.3 s | **508 MB/s** |
+
+The 4.4 s wall time is Windows file-creation tax on 8,586 files — a bare copy of the same tree pays 3.7 s of it, real-time antivirus included; the engine itself accounts for 0.3 s. On the axes where archive formats actually compete — ratio, pack speed, selective access, fault tolerance — `.omnic` is ahead; on raw extract throughput under a real-time antivirus it trades ~1.8 s, which the parallel write path reserved for v0.3.1 is meant to close.
 
 ## License
 

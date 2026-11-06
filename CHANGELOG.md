@@ -2,6 +2,20 @@
 
 All notable changes to omnic. Format follows [Keep a Changelog](https://keepachangelog.com); versioning is semantic.
 
+## [Unreleased]
+
+### Fixed
+
+- `omnic analyze` could print an empty codec / level 0 on GCC 16.2 `-O2`/`-O3`
+  builds: the optimizer wrongly eliminates the stack initialization of the
+  all-zero default-options literal, so the decision ran on a garbage profile.
+  The fallback is now a `static const` object in `.bss`, which the compiler
+  cannot elide. `test_core` gained content assertions (codec/level/reason
+  non-empty) so the class of failure is caught wherever it compiles.
+- Decompression reports now state throughput in output MB/s (restored bytes per
+  second), matching zstd/lzbench/Oodle convention; it previously reported
+  compressed-bytes/s, understating decode speed by the compression ratio.
+
 ## [0.3.0] — 2026-11-05
 
 ### Added — `.omnic` archives
