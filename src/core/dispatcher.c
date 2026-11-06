@@ -426,6 +426,8 @@ omnic_status omnic_run_decompress(const char *path, const omnic_options *o, omni
 
     fill_report(rep, ops->name, 0, OMNIC_CLS_UNKNOWN, 0.0, omnic_reader_total(&f.reader),
                 omnic_writer_total(&f.writer), t1 - t0);
+    /* 解压吞吐按行业惯例报输出侧（还原字节/秒），与 zstd/lzbench 口径一致 */
+    rep->mbps = (t1 - t0 > 0.0) ? (double)rep->out_bytes / 1e6 / (t1 - t0) : 0.0;
     rep->fmt = fmt;
 
     files_close(&f, false);
