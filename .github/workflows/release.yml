@@ -46,6 +46,11 @@ jobs:
           else
             (cd dist && tar -czf "../${name}.tar.gz" .)
           fi
+          # 从 CHANGELOG 提取本版本段落作为 release body（## [tag] 起、下个 ## 止）
+          awk -v tag="${{ github.ref_name }}" '
+            /^## /{ if (found) exit; if (index($0, "[" tag "]") > 0) found = 1 }
+            found' CHANGELOG.md > RELEASE_BODY.md
       - uses: softprops/action-gh-release@v2
         with:
           files: omnic-*
+          body_path: RELEASE_BODY.md
