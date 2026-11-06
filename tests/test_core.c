@@ -429,6 +429,11 @@ static void test_auto_and_skip(void) {
     /* analyze */
     CHECK(omnic_analyze(SRC, &rep) == OMNIC_OK);
     CHECK(rep.klass == OMNIC_CLS_NTEXT && rep.entropy < 6.0);
+    /* 决策链内容锚（GCC16.2 曾消除全零 fallback 的初始化导致 codec 空——仅查
+     * 返回值抓不住，必须断言产出物） */
+    CHECK(rep.codec[0] != '\0');
+    CHECK(rep.level > 0);
+    CHECK(rep.reason[0] != '\0');
 }
 
 /* 截断检测（SYS-DEC-003 子集）：截去尾部 10 字节——必然落在最后一个

@@ -456,10 +456,12 @@ static void test_extract(void) {
         CHECK(h != NULL);
         if (h != NULL) {
             dup2(fileno(h), 1);
-            omnic_arc_list(ARC, &(omnic_options){.profile = OMNIC_PROFILE_BALANCED,
-                                                 .codec = NULL, .level = 0, .threads = 0,
-                                                 .flags = 0u, .output_dir = NULL,
-                                                 .block_mib = 0}); /* 非 quiet 才有输出 */
+            /* 全零复合字面量的初始化会被 GCC 16.2 -O2/-O3 消除，static const 免疫 */
+            static const omnic_options lo = {.profile = OMNIC_PROFILE_BALANCED,
+                                             .codec = NULL, .level = 0, .threads = 0,
+                                             .flags = 0u, .output_dir = NULL,
+                                             .block_mib = 0};
+            omnic_arc_list(ARC, &lo); /* 非 quiet 才有输出 */
             fflush(stdout);
             dup2(saved, 1);
             close(saved);

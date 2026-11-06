@@ -448,9 +448,14 @@ omnic_status omnic_run_analyze(const char *path, const omnic_options *o, omnic_r
         return OMNIC_E_SYSTEM;
     }
     omnic_reader_init(&r, in);
-    if (o == NULL)
-        o = &(omnic_options){.profile = OMNIC_PROFILE_BALANCED, .codec = NULL, .level = 0,
-                             .threads = 0, .flags = 0u, .output_dir = NULL};
+    if (o == NULL) {
+        /* 全零复合字面量的栈上初始化会被 GCC 16.2 -O2/-O3 的 DSE 错误消除（地址
+         * 外逸 + IPA 只读分析共谋），static const 落 .bss 由加载器清零，免疫。 */
+        static const omnic_options def = {.profile = OMNIC_PROFILE_BALANCED, .codec = NULL,
+                                          .level = 0, .threads = 0, .flags = 0u,
+                                          .output_dir = NULL};
+        o = &def;
+    }
     ret = decide(in, path, o, &d);
     if (ret == OMNIC_OK) {
         rep->klass = d.klass;
