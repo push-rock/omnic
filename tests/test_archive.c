@@ -674,6 +674,166 @@ static void test_bounds(void) {
     rm_tree(TREE);
 }
 
+/* ---- v0.3.1 并行写盘（DESIGN-parallel-unpack）---- */
+static const char *TREE2 = "omnic_arc_tree2";
+static const char *ARC2 = "omnic_arc_t2.omnic";
+
+static void make_tree_big(void) {
+    rm_tree(TREE2);
+    omnic_fs_mkdir_p(TREE2);
+    static char buf[8 * 1024];
+    char p[512];
+    for (int d = 0; d < 3; d++) { /* 子目录先建：wfile 不建父目录 */
+        snprintf(p, sizeof(p), "%s/d%d", TREE2, d);
+        omnic_fs_mkdir_p(p);
+    }
+    /* 120 文件跨 3 目录：超 ARC_PAR_MIN_JOBS(32) 强制并行路径 */
+    for (int i = 0; i < 120; i++) {
+        size_t n = 64 + (size_t)(i % 7) * 512;
+        fill_text(buf, n);
+        snprintf(p, sizeof(p), "%s/d%d/f%03d.txt", TREE2, i % 3, i);
+        wfile(p, buf, n);
+    }
+    snprintf(p, sizeof(p), "%s/empty.bin", TREE2); /* 空文件 */
+    wfile(p, "", 0);
+    { /* 32KB 高熵（同 make_tree 口径：熵采样下必入 store 块） */
+        static char rbuf[32 * 1024];
+        for (size_t i = 0; i < sizeof(rbuf); i++) rbuf[i] = (char)rng();
+        snprintf(p, sizeof(p), "%s/rand.bin", TREE2);
+        wfile(p, rbuf, sizeof(rbuf));
+    }
+}
+
+static void test_parallel(void) {
+    make_tree_big();
+    CHECK(pack_tree(TREE2, ARC2, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+
+    omnic_options o8 = mkopts(OMNIC_F_QUIET, 0);
+    o8.threads = 8;
+    omnic_options o1 = mkopts(OMNIC_F_QUIET, 0);
+    o1.threads = 1;
+
+    /* P1：-T8 与 -T1 树等价（文件集/内容/mtime），且与源树一致 */
+    rm_tree("omnic_arc_p8");
+    rm_tree("omnic_arc_p1");
+    CHECK(unpack_arc(ARC2, "omnic_arc_p8", o8) == OMNIC_OK);
+    CHECK(unpack_arc(ARC2, "omnic_arc_p1", o1) == OMNIC_OK);
+    CHECK(tree_equal("omnic_arc_p8", "omnic_arc_p1"));
+    CHECK(tree_equal("omnic_arc_p8", TREE2));
+    rm_tree("omnic_arc_p8");
+    rm_tree("omnic_arc_p1");
+
+    /* P2：默认 threads=0 → 8 writers，等价 */
+    rm_tree("omnic_arc_pd");
+    CHECK(unpack_arc(ARC2, "omnic_arc_pd", mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(tree_equal("omnic_arc_pd", TREE2));
+    rm_tree("omnic_arc_pd");
+
+    /* P3：坏块 × 并行：数据区首块（offset 0）翻转 → 该块文件成员全灭、其他块
+     * 成员存活、退出码 2（隔离语义）。块归属从索引直读——不猜分类（LCG 低
+     * 字节"随机"数据实测入压缩桶，只有 0 字节文件按规则必入 store 桶）。 */
+    {
+        size_t n;
+        uint64_t io;
+        uint32_t nent, nblk;
+        uint8_t *pl = load_index_plain(ARC2, &n, &io, &nent, &nblk);
+        CHECK(pl != NULL);
+        char in_b0[512], out_b0[512];
+        int got_in = 0, got_out = 0;
+        long flip_off = -1;
+        if (pl != NULL) {
+            size_t off = (size_t)nblk * T_BLK_ROW;
+            for (uint32_t i = 0; i < nent && !(got_in && got_out); i++) {
+                uint32_t nl = (uint32_t)pl[off] | ((uint32_t)pl[off + 1] << 8);
+                if (pl[off + 2 + nl] == 0) { /* 文件条目 */
+                    uint32_t bid = (uint32_t)pl[off + 4 + nl] | ((uint32_t)pl[off + 5 + nl] << 8);
+                    if (bid == 0 && !got_in) {
+                        memcpy(in_b0, pl + off + 2, nl);
+                        in_b0[nl] = '\0';
+                        got_in = 1;
+                    } else if (bid != 0 && !got_out) {
+                        memcpy(out_b0, pl + off + 2, nl);
+                        out_b0[nl] = '\0';
+                        got_out = 1;
+                    }
+                }
+                off += 2 + nl + T_ENT_FIX + 8;
+            }
+            /* 块 0 行：fmt@0 comp@12 raw@20；存储域 = store?raw:comp，翻其中点 */
+            uint64_t comp = 0, raw = 0;
+            for (int b = 0; b < 8; b++) comp |= (uint64_t)pl[b + 12] << (8 * b);
+            for (int b = 0; b < 8; b++) raw |= (uint64_t)pl[b + 20] << (8 * b);
+            uint64_t stored = (pl[0] == 0) ? raw : comp;
+            if (stored > 0) flip_off = (long)(28 + stored / 2); /* 28 = ARC_HDR */
+            free(pl);
+        }
+        CHECK(got_in);
+        if (nblk > 1) CHECK(got_out);
+        CHECK(flip_off > 0);
+        if (flip_off > 0) flip_byte(ARC2, flip_off);
+        rm_tree("omnic_arc_pc");
+        CHECK(unpack_arc(ARC2, "omnic_arc_pc", o8) == OMNIC_E_DATA);
+        if (got_in) {
+            char dst[600];
+            snprintf(dst, sizeof(dst), "omnic_arc_pc/%s", in_b0);
+            CHECK(omnic_fs_fopen(dst, "rb") == NULL); /* 坏块成员缺失 */
+        }
+        if (nblk > 1 && got_out) {
+            char dst[600];
+            snprintf(dst, sizeof(dst), "omnic_arc_pc/%s", out_b0);
+            CHECK(omnic_fs_fopen(dst, "rb") != NULL); /* 好块成员存活 */
+        }
+        rm_tree("omnic_arc_pc");
+    }
+
+    /* P4：条目 CRC 注入 × 并行：单条目失败、其余完好 */
+    CHECK(pack_tree(TREE2, ARC2, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    {
+        size_t n;
+        uint64_t io;
+        uint32_t nent, nblk;
+        uint8_t *pl = load_index_plain(ARC2, &n, &io, &nent, &nblk);
+        CHECK(pl != NULL);
+        if (pl != NULL) {
+            long eo = find_ent(pl, nblk, nent, "d0/f000.txt");
+            CHECK(eo >= 0);
+            if (eo >= 0) {
+                uint32_t nl = (uint32_t)pl[eo] | ((uint32_t)pl[eo + 1] << 8);
+                pl[eo + 2 + nl + 22] ^= 0xFF; /* 条目行内 crc 字段 */
+            }
+            CHECK(save_index_plain(ARC2, pl, n, io, nent, nblk) == 0);
+            free(pl);
+        }
+    }
+    rm_tree("omnic_arc_pe");
+    CHECK(unpack_arc(ARC2, "omnic_arc_pe", o8) == OMNIC_E_DATA);
+    CHECK(omnic_fs_fopen("omnic_arc_pe/d1/f001.txt", "rb") != NULL);
+    CHECK(omnic_fs_fopen("omnic_arc_pe/rand.bin", "rb") != NULL);
+    rm_tree("omnic_arc_pe");
+
+    /* P5：--file 批量(≥32) 走并行路径，批量抽取正确（需干净归档：P4 有注入） */
+    CHECK(pack_tree(TREE2, ARC2, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    {
+        static char nbuf[40][16];
+        static const char *names[40];
+        for (int i = 0; i < 40; i++) {
+            snprintf(nbuf[i], sizeof(nbuf[i]), "d%d/f%03d.txt", i % 3, i);
+            names[i] = nbuf[i];
+        }
+        rm_tree("omnic_arc_pf");
+        omnic_options of = mkopts(OMNIC_F_QUIET, 0);
+        of.threads = 8;
+        memset(&g_rep, 0, sizeof(g_rep));
+        CHECK(omnic_unpack_files(ARC2, "omnic_arc_pf", names, 40, &of, &g_rep) == OMNIC_OK);
+        CHECK(omnic_fs_fopen("omnic_arc_pf/d0/f000.txt", "rb") != NULL);
+        CHECK(omnic_fs_fopen("omnic_arc_pf/d0/f039.txt", "rb") != NULL);
+        rm_tree("omnic_arc_pf");
+    }
+
+    remove(ARC2);
+    rm_tree(TREE2);
+}
+
 int main(void) {
     test_roundtrip();
     test_roundtrip_edges();
@@ -682,6 +842,7 @@ int main(void) {
     test_corruption();
     test_malformed();
     test_bounds();
+    test_parallel();
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

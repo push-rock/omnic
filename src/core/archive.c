@@ -4,6 +4,11 @@
  * unpack：Header/Footer 双端校验 → 索引 CRC + 结构校验 → 逐块解压切条目，
  * 坏块跳过隔离（AR-ERR-001）。CRC-32 自带（懒初始化表），不绑可选 codec。
  * A3 范围：store 块 only；压缩块与决策分桶在 A4 接入（fmt!=0 当前为桩）。 */
+/* _DEFAULT_SOURCE 须先于任何系统头（同 fs.c）：严格 C11 下 pthread 声明需显式开启 */
+#if !defined(_WIN32) && !defined(_DEFAULT_SOURCE)
+#define _DEFAULT_SOURCE 1
+#endif
+
 #include "core/archive.h"
 
 #include <stdio.h>
@@ -15,6 +20,7 @@
 #include "core/blockio.h"
 #include "core/dispatcher.h"
 #include "core/registry.h"
+#include "core/arc_sync.h"
 
 #ifndef OMNIC_CODEC_ZSTD
 /* 格式固有依赖 zstd（INDEX_ZSTD 恒置位）；无 zstd 构建 stub 保 lib ABI */
@@ -934,6 +940,223 @@ static void report_bad_block(const arc_index *ix, size_t bi, unsigned fmt, unsig
     fprintf(stderr, "\n");
 }
 
+/* ---- 解包并行写盘（DESIGN-parallel-unpack，v0.3.1）----
+ * 建盘路径是解包墙钟大头（8,586 文件 3.8s：syscall+AV 延迟，非 CPU），解码仅
+ * 0.56s。主线程逐块解码 + worker 池并行落盘，解码被写盘掩盖。
+ * 语义：坏块/条目校验/存在性全在主线程派发前拦截（顺序确定），worker 只做
+ * 纯 I/O；提取/失败计数与串行路径同一口径。 */
+#define ARC_NWRITER_DEFAULT 8
+#define ARC_NWRITER_MAX 64
+#define ARC_PAR_MIN_JOBS 32 /* 低于此数走串行：--file 单提取不付池启动成本 */
+#define ARC_SLOT_RING 4     /* 在飞块上限 = 背压；内存上界 ≈ 4 × block_max */
+
+/* 落盘一个条目（串行/并行共用）。dst 为完整目标路径。
+ * 返回 0=成功 1=无法创建 2=写入不完整。 */
+static int write_entry(const char *dst, const uint8_t *data, const arc_entry *e) {
+    int opened = 0;
+    omnic_status st = omnic_fs_write_file(dst, data, (size_t)e->size, e->mtime, &opened);
+    if (st != OMNIC_OK && opened == 0) {
+        /* 兜底：目录条目序外缺失（畸形归档）才补建父目录——正常路径目录先行
+         * 已建全，逐文件 mkdir_p 的 syscall 开销占解压墙钟大头 */
+        char *slash = strrchr(dst, '/');
+        if (slash != NULL) {
+            *slash = '\0';
+            omnic_status ms = omnic_fs_mkdir_p(dst);
+            *slash = '/';
+            if (ms == OMNIC_OK)
+                st = omnic_fs_write_file(dst, data, (size_t)e->size, e->mtime, &opened);
+        }
+    }
+    if (st == OMNIC_OK) return 0;
+    return opened ? 2 : 1;
+}
+
+/* 解码单块为裸字节（store 直读 / 压缩流解压，块层 CRC 先行）。
+ * 返回 0=成功 1=数据损坏（坏块口径）2=无解码器 3=OOM。 */
+static int decode_block(FILE *f, const arc_block *b, uint8_t **raw) {
+    if (b->fmt == 0) { /* store：直读（+1 防 raw_size==0 的 malloc(0)） */
+        uint8_t *m = (uint8_t *)malloc((size_t)b->raw_size + 1);
+        if (m == NULL) return 3;
+        if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
+            fread(m, 1, (size_t)b->raw_size, f) != (size_t)b->raw_size ||
+            arc_crc32(0, m, (size_t)b->raw_size) != b->crc) {
+            free(m);
+            return 1;
+        }
+        *raw = m;
+        return 0;
+    }
+    const omnic_codec_ops *ops = omnic_codec_for_fmt((omnic_fmt_id)b->fmt);
+    if (ops == NULL || !ops->can_decompress) return 2;
+    uint8_t *cbuf = (uint8_t *)malloc((size_t)b->comp_size);
+    if (cbuf == NULL) return 3;
+    if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
+        fread(cbuf, 1, (size_t)b->comp_size, f) != (size_t)b->comp_size ||
+        arc_crc32(0, cbuf, (size_t)b->comp_size) != b->crc) {
+        free(cbuf);
+        return 1;
+    }
+    omnic_reader rr;
+    omnic_writer ww;
+    omnic_reader_init_mem(&rr, cbuf, (size_t)b->comp_size);
+    omnic_writer_init_mem(&ww);
+    omnic_status st = ops->decompress(&rr, &ww);
+    size_t out_len = 0;
+    uint8_t *out_buf = omnic_writer_mem_drain(&ww, &out_len);
+    omnic_reader_fini(&rr);
+    free(cbuf);
+    if (st != OMNIC_OK || out_buf == NULL || out_len != (size_t)b->raw_size) {
+        free(out_buf);
+        return 1;
+    }
+    *raw = out_buf;
+    return 0;
+}
+
+typedef struct arc_job {
+    size_t ent_idx;
+    int slot;
+    struct arc_job *next;
+} arc_job;
+
+typedef struct {
+    uint8_t *buf; /* busy 期间有效；pending 归零即回收 */
+    size_t pending;
+    int busy;
+} arc_wslot;
+
+typedef struct {
+    const arc_index *ix; /* 只读共享 */
+    const char *dstroot;
+    int8_t *result;      /* [ent] 0=成功 1=无法创建 2=短写 3=OOM */
+    arc_mutex_t mu;
+    arc_cond_t cv_work;  /* worker：队列空且未停机 */
+    arc_cond_t cv_done;  /* producer：槽释放 */
+    arc_job *head, *tail;
+    arc_wslot slot[ARC_SLOT_RING];
+    int shutdown;
+    arc_thread_t tid[ARC_NWRITER_MAX];
+    int nworkers;
+} arc_pool;
+
+/* worker：纯 I/O 落盘。槽数据在 pending 归零前保证有效（无锁读安全：
+ * enqueue 的锁序建立 happens-before）；结果码经 result 数组回传，
+ * 主线程 drain 后按条目序渲染。 */
+ARC_THREAD_FN writer_main(void *arg) {
+    arc_pool *p = (arc_pool *)arg;
+    for (;;) {
+        arc_mutex_lock(&p->mu);
+        while (p->head == NULL && !p->shutdown) arc_cond_wait(&p->cv_work, &p->mu);
+        arc_job *j = p->head;
+        if (j != NULL) {
+            p->head = j->next;
+            if (p->head == NULL) p->tail = NULL;
+        }
+        arc_mutex_unlock(&p->mu);
+        if (j == NULL) break; /* 停机且队列已清空 */
+        const arc_entry *e = &p->ix->ent[j->ent_idx];
+        int rc = 3;
+        size_t dl = strlen(p->dstroot) + strlen(e->name) + 2;
+        char *dst = (char *)malloc(dl);
+        if (dst != NULL) {
+            snprintf(dst, dl, "%s/%s", p->dstroot, e->name);
+            rc = write_entry(dst, p->slot[j->slot].buf + e->in_off, e);
+            free(dst);
+        }
+        arc_mutex_lock(&p->mu);
+        p->result[j->ent_idx] = (int8_t)rc;
+        arc_wslot *s = &p->slot[j->slot];
+        if (--s->pending == 0) {
+            free(s->buf);
+            s->buf = NULL;
+            s->busy = 0;
+        }
+        arc_mutex_unlock(&p->mu);
+        free(j);
+        arc_cond_broadcast(&p->cv_done);
+    }
+    ARC_THREAD_RET_OK;
+}
+
+/* 起 worker 池；失败（无一线程可建）返回 -1，调用方退回串行路径。 */
+static int pool_init(arc_pool *p, const arc_index *ix, const char *dstroot, int writers) {
+    memset(p, 0, sizeof(*p));
+    p->ix = ix;
+    p->dstroot = dstroot;
+    p->result = (int8_t *)calloc(ix->nent ? ix->nent : 1, 1);
+    if (p->result == NULL) return -1;
+    arc_mutex_init(&p->mu);
+    arc_cond_init(&p->cv_work);
+    arc_cond_init(&p->cv_done);
+    for (int i = 0; i < writers; i++) {
+        if (arc_thread_create(&p->tid[i], writer_main, p) != 0) break;
+        p->nworkers++;
+    }
+    if (p->nworkers == 0) {
+        free(p->result);
+        return -1;
+    }
+    return 0;
+}
+
+/* 等待并占用一个空闲槽（背压：在飞块数 ≤ ARC_SLOT_RING）。
+ * 占用期间 buf 由主线程填充（pending==0，无 worker 触碰）。 */
+static int pool_acquire_slot(arc_pool *p) {
+    arc_mutex_lock(&p->mu);
+    for (;;) {
+        for (int s = 0; s < ARC_SLOT_RING; s++) {
+            if (!p->slot[s].busy) {
+                p->slot[s].busy = 1;
+                p->slot[s].buf = NULL;
+                p->slot[s].pending = 0;
+                arc_mutex_unlock(&p->mu);
+                return s;
+            }
+        }
+        arc_cond_wait(&p->cv_done, &p->mu);
+    }
+}
+
+/* 派发写作业；OOM 按该条目失败记账（语义同 worker 的 rc=3）。 */
+static void pool_enqueue(arc_pool *p, size_t ent_idx, int slot) {
+    arc_job *j = (arc_job *)malloc(sizeof(*j));
+    arc_mutex_lock(&p->mu);
+    if (j == NULL) {
+        p->result[ent_idx] = 3;
+    } else {
+        j->ent_idx = ent_idx;
+        j->slot = slot;
+        j->next = NULL;
+        if (p->tail != NULL) p->tail->next = j;
+        else p->head = j;
+        p->tail = j;
+        p->slot[slot].pending++;
+    }
+    arc_mutex_unlock(&p->mu);
+    if (j != NULL) arc_cond_signal(&p->cv_work);
+}
+
+/* 块的条目全在派发前被拦截（CRC/存在性）→ 槽零作业，主线程自回收。
+ * decode 失败路径复用（buf 可能为 NULL）。 */
+static void pool_release_if_empty(arc_pool *p, int slot) {
+    arc_mutex_lock(&p->mu);
+    if (p->slot[slot].busy && p->slot[slot].pending == 0) {
+        free(p->slot[slot].buf);
+        p->slot[slot].buf = NULL;
+        p->slot[slot].busy = 0;
+    }
+    arc_mutex_unlock(&p->mu);
+}
+
+/* 停机：置位后广播，worker 排空队列即退出（全部作业完成才 join 返回）。 */
+static void pool_shutdown(arc_pool *p) {
+    arc_mutex_lock(&p->mu);
+    p->shutdown = 1;
+    arc_mutex_unlock(&p->mu);
+    arc_cond_broadcast(&p->cv_work);
+    for (int i = 0; i < p->nworkers; i++) arc_thread_join(p->tid[i]);
+}
+
 /* unpack_core：整树提取 / --file 过滤提取 / --verify 校验三种形态共用。
  * only!=NULL 时仅解命中条目所在块；verify_only 时不落盘只验双层 CRC。 */
 static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
@@ -953,7 +1176,7 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
 
     /* --file 名匹配：未命中即用法错误（可操作）；命中标记条目与所需块 */
     unsigned char *want_ent = NULL, *want_blk = NULL;
-    size_t *blk_ents = NULL;
+    size_t *blk_cnt = NULL, *blk_off = NULL, *ent_ord = NULL;
     if (n_only > 0) {
         want_ent = (unsigned char *)calloc(ix.nent ? ix.nent : 1, 1);
         want_blk = (unsigned char *)calloc(ix.nblk ? ix.nblk : 1, 1);
@@ -980,11 +1203,28 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
             return OMNIC_E_USAGE;
         }
     }
-    /* 每块条目数（坏块时按条目口径计失败，汇总 extracted N/M 准确） */
-    blk_ents = (size_t *)calloc(ix.nblk ? ix.nblk : 1, sizeof(size_t));
-    if (blk_ents == NULL) goto sys_fail_ix;
+    /* 分桶（D8）：非目录条目按 block_id 计数排序，替代逐块 O(nent) 全表扫描；
+     * 桶计数即坏块失败口径（原 blk_ents）。njobs = 待写作业总数。 */
+    blk_cnt = (size_t *)calloc(ix.nblk ? ix.nblk : 1, sizeof(size_t));
+    blk_off = (size_t *)malloc((ix.nblk + 1) * sizeof(size_t));
+    ent_ord = (size_t *)malloc((ix.nent ? ix.nent : 1) * sizeof(size_t));
+    if (blk_cnt == NULL || blk_off == NULL || ent_ord == NULL) goto sys_fail_ix;
+    size_t njobs = 0;
     for (size_t i = 0; i < ix.nent; i++)
-        if (ix.ent[i].type == 0) blk_ents[ix.ent[i].block_id]++;
+        if (ix.ent[i].type == 0) {
+            blk_cnt[ix.ent[i].block_id]++;
+            if (want_ent == NULL || want_ent[i]) njobs++;
+        }
+    blk_off[0] = 0;
+    for (size_t bi = 0; bi < ix.nblk; bi++) blk_off[bi + 1] = blk_off[bi] + blk_cnt[bi];
+    {
+        size_t *cur = (size_t *)calloc(ix.nblk ? ix.nblk : 1, sizeof(size_t));
+        if (cur == NULL) goto sys_fail_ix;
+        for (size_t i = 0; i < ix.nent; i++)
+            if (ix.ent[i].type == 0)
+                ent_ord[blk_off[ix.ent[i].block_id] + cur[ix.ent[i].block_id]++] = i;
+        free(cur);
+    }
 
     if (!verify_only && want_ent == NULL && omnic_fs_mkdir_p(dstroot) != OMNIC_OK)
         goto sys_fail_ix;
@@ -1005,72 +1245,45 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
         }
     }
 
+    /* 并行判定：verify/单线程/小作业量走串行原路径（--file 单提取 8.7ms 不启池） */
+    int writers = ARC_NWRITER_DEFAULT;
+    if (o != NULL && o->threads == 1) writers = 1;
+    else if (o != NULL && o->threads > 1) writers = o->threads;
+    if (writers > ARC_NWRITER_MAX) writers = ARC_NWRITER_MAX;
+    arc_pool pool;
+    int parallel = (!verify_only && writers > 1 && njobs >= ARC_PAR_MIN_JOBS &&
+                    pool_init(&pool, &ix, dstroot, writers) == 0);
+    unsigned char *went = NULL;
+    if (parallel) {
+        went = (unsigned char *)calloc(ix.nent ? ix.nent : 1, 1);
+        if (went == NULL) { /* OOM：停池退回串行 */
+            pool_shutdown(&pool);
+            free(pool.result);
+            parallel = 0;
+        }
+    }
+
     /* 逐块解压切条目；坏块跳过隔离（AR-ERR-001，T2 模板） */
     size_t extracted = 0, failed = 0, blocks_ok = 0;
-    uint8_t *blk_mem = NULL; /* store 块复用缓冲 */
-    uint64_t blk_cap = 0;
     for (size_t bi = 0; bi < ix.nblk; bi++) {
         const arc_block *b = &ix.blk[bi];
         if (want_blk != NULL && !want_blk[bi]) continue; /* --file：无目标条目的块不解 */
-        uint8_t *raw = NULL; /* 本块原始字节视图（store=blk_mem，压缩=解压产物） */
-        if (b->fmt == 0) {
-            if (blk_cap < b->raw_size) {
-                uint8_t *m = (uint8_t *)realloc(blk_mem, (size_t)b->raw_size);
-                if (m == NULL) goto sys_fail_ix;
-                blk_mem = m;
-                blk_cap = b->raw_size;
-            }
-            if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
-                fread(blk_mem, 1, (size_t)b->raw_size, f) != (size_t)b->raw_size ||
-                arc_crc32(0, blk_mem, (size_t)b->raw_size) != b->crc) {
-                report_bad_block(&ix, bi, b->fmt, quiet);
-                failed += blk_ents[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
-                continue;
-            }
-            raw = blk_mem;
-        } else {
-            /* 压缩块：读流 → 验流 CRC → 内存解压 → raw_size 一致性 */
-            const omnic_codec_ops *ops = omnic_codec_for_fmt((omnic_fmt_id)b->fmt);
-            uint8_t *cbuf = (uint8_t *)malloc((size_t)b->comp_size);
-            if (cbuf == NULL || ops == NULL || !ops->can_decompress) {
-                free(cbuf);
-                if (ops == NULL || !ops->can_decompress)
-                    omnic_set_error("block %zu: no decoder for format %u", bi, b->fmt);
-                else
-                    omnic_set_error("out of memory");
-                failed += blk_ents[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
-                continue;
-            }
-            if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
-                fread(cbuf, 1, (size_t)b->comp_size, f) != (size_t)b->comp_size ||
-                arc_crc32(0, cbuf, (size_t)b->comp_size) != b->crc) {
-                free(cbuf);
-                report_bad_block(&ix, bi, b->fmt, quiet);
-                failed += blk_ents[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
-                continue;
-            }
-            omnic_reader rr;
-            omnic_writer ww;
-            omnic_reader_init_mem(&rr, cbuf, (size_t)b->comp_size);
-            omnic_writer_init_mem(&ww);
-            omnic_status dst2 = ops->decompress(&rr, &ww);
-            size_t out_len = 0;
-            uint8_t *out_buf = omnic_writer_mem_drain(&ww, &out_len);
-            omnic_reader_fini(&rr);
-            free(cbuf);
-            if (dst2 != OMNIC_OK || out_buf == NULL || out_len != (size_t)b->raw_size) {
-                free(out_buf);
-                report_bad_block(&ix, bi, b->fmt, quiet);
-                failed += blk_ents[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
-                continue;
-            }
-            raw = out_buf;
+        int slot = parallel ? pool_acquire_slot(&pool) : -1;
+        uint8_t *raw = NULL; /* 本块原始字节（store 直读 / 压缩解压产物） */
+        int drc = decode_block(f, b, &raw);
+        if (drc != 0) {
+            if (drc == 1) report_bad_block(&ix, bi, b->fmt, quiet);
+            else if (drc == 2) omnic_set_error("block %zu: no decoder for format %u", bi, b->fmt);
+            else omnic_set_error("out of memory");
+            failed += blk_cnt[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
+            if (parallel) pool_release_if_empty(&pool, slot);
+            continue;
         }
+        if (parallel) pool.slot[slot].buf = raw; /* 槽占用期无 worker 触碰，直接赋值 */
         blocks_ok++;
-        for (size_t i = 0; i < ix.nent; i++) {
+        for (size_t k = blk_off[bi]; k < blk_off[bi + 1]; k++) {
+            size_t i = ent_ord[k];
             arc_entry *e = &ix.ent[i];
-            if (e->type != 0 || e->block_id != (uint32_t)bi) continue;
-            if (want_ent != NULL && !want_ent[i]) continue;
             /* 块内偏移越界防御（无溢出写法）；条目 CRC 为双层校验内层（§4.2） */
             if (e->size > b->raw_size || e->in_off > b->raw_size - e->size ||
                 arc_crc32(0, raw + e->in_off, (size_t)e->size) != e->crc) {
@@ -1084,57 +1297,79 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                 extracted++;
                 continue;
             }
-            size_t dl = strlen(dstroot) + strlen(e->name) + 2;
-            char *dst = (char *)malloc(dl);
-            if (dst == NULL) {
-                if (raw != blk_mem) free(raw);
-                goto sys_fail_ix;
-            }
-            sprintf(dst, "%s/%s", dstroot, e->name);
-            /* --file 目标已存在且未 -f → 拒绝（T5） */
-            if (want_ent != NULL && arc_file_exists(dst) &&
-                !(o != NULL && (o->flags & OMNIC_F_FORCE))) {
-                omnic_set_error("'%s' already exists — use -f to overwrite", dst);
+            /* --file 目标已存在且未 -f → 拒绝（T5）；并行路径派发前主线程拦截 */
+            if (want_ent != NULL) {
+                size_t dl = strlen(dstroot) + strlen(e->name) + 2;
+                char *dst = (char *)malloc(dl);
+                if (dst == NULL) { /* OOM 边角：按条目失败计，避免并行收尾复杂化 */
+                    failed++;
+                    continue;
+                }
+                sprintf(dst, "%s/%s", dstroot, e->name);
+                int deny = arc_file_exists(dst) && !(o != NULL && (o->flags & OMNIC_F_FORCE));
+                if (deny) omnic_set_error("'%s' already exists — use -f to overwrite", dst);
                 free(dst);
-                failed++;
-                continue;
-            }
-            FILE *out = omnic_fs_fopen(dst, "wb");
-            if (out == NULL) {
-                /* 兜底：目录条目序外缺失（畸形归档）才补建父目录——正常路径
-                 * 目录先行已建全，逐文件 mkdir_p 的 syscall 开销占解压墙钟大头 */
-                char *slash = strrchr(dst, '/');
-                if (slash != NULL) {
-                    *slash = '\0';
-                    omnic_status ms = omnic_fs_mkdir_p(dst);
-                    *slash = '/';
-                    if (ms == OMNIC_OK) out = omnic_fs_fopen(dst, "wb");
+                if (deny) {
+                    failed++;
+                    continue;
                 }
             }
-            if (out == NULL) {
-                omnic_set_error("cannot create: %s", dst);
+            if (parallel) {
+                went[i] = 1;
+                pool_enqueue(&pool, i, slot);
+            } else {
+                size_t dl = strlen(dstroot) + strlen(e->name) + 2;
+                char *dst = (char *)malloc(dl);
+                if (dst == NULL) {
+                    free(raw);
+                    goto sys_fail_ix;
+                }
+                sprintf(dst, "%s/%s", dstroot, e->name);
+                int rc = write_entry(dst, raw + e->in_off, e);
+                if (rc == 1) omnic_set_error("cannot create: %s", dst);
                 free(dst);
-                failed++;
-                continue;
+                if (rc != 0) {
+                    failed++;
+                    continue;
+                }
+                rep->out_bytes += e->size;
+                extracted++;
             }
-            size_t wsz = fwrite(raw + e->in_off, 1, (size_t)e->size, out);
-            if (wsz == (size_t)e->size) omnic_fs_set_mtime_stream(out, e->mtime);
-            fclose(out);
-            if (wsz != (size_t)e->size) {
-                free(dst);
-                failed++;
-                continue;
-            }
-            free(dst);
-            rep->out_bytes += e->size;
-            extracted++;
         }
-        if (raw != blk_mem) free(raw); /* 压缩块的解压产物 */
+        if (parallel) pool_release_if_empty(&pool, slot);
+        else free(raw);
     }
-    free(blk_mem);
+    if (parallel) {
+        pool_shutdown(&pool);
+        /* drain 后按条目序结算：worker 纯 I/O 结果码（1=无法创建 3=OOM） */
+        for (size_t i = 0; i < ix.nent; i++) {
+            if (went[i] != 1) continue;
+            if (pool.result[i] == 0) {
+                rep->out_bytes += ix.ent[i].size;
+                extracted++;
+                continue;
+            }
+            failed++;
+            if (pool.result[i] == 1) {
+                size_t dl = strlen(dstroot) + strlen(ix.ent[i].name) + 2;
+                char *dst = (char *)malloc(dl);
+                if (dst != NULL) {
+                    sprintf(dst, "%s/%s", dstroot, ix.ent[i].name);
+                    omnic_set_error("cannot create: %s", dst);
+                    free(dst);
+                }
+            } else if (pool.result[i] == 3) {
+                omnic_set_error("out of memory");
+            }
+        }
+        free(pool.result);
+        free(went);
+    }
+    free(blk_cnt);
+    free(blk_off);
+    free(ent_ord);
     free(want_ent);
     free(want_blk);
-    free(blk_ents);
     arc_index_mem_free(&ix);
     fclose(f);
     rep->in_bytes = rep->out_bytes;
@@ -1149,9 +1384,11 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
     return failed ? OMNIC_E_DATA : OMNIC_OK;
 
 sys_fail_ix:
+    free(blk_cnt);
+    free(blk_off);
+    free(ent_ord);
     free(want_ent);
     free(want_blk);
-    free(blk_ents);
     arc_index_mem_free(&ix);
     fclose(f);
     return OMNIC_E_SYSTEM;

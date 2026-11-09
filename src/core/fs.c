@@ -191,6 +191,37 @@ FILE *omnic_fs_fopen(const char *utf8_path, const char *mode) {
     return _wfopen(wpath, wmode);
 }
 
+omnic_status omnic_fs_write_file(const char *utf8_path, const void *data, size_t n,
+                                 long long mtime, int *opened) {
+    wchar_t wpath[OMNIC_FS_PATH_MAX * 2];
+    if (utf8_to_w16(utf8_path, wpath, OMNIC_FS_PATH_MAX * 2) == 0) return OMNIC_E_USAGE;
+    HANDLE h = CreateFileW(wpath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return OMNIC_E_SYSTEM;
+    if (opened != NULL) *opened = 1;
+    const uint8_t *p = (const uint8_t *)data;
+    size_t left = n;
+    while (left > 0) {
+        DWORD chunk = (left > 0x40000000u) ? 0x40000000u : (DWORD)left;
+        DWORD wrote = 0;
+        if (!WriteFile(h, p, chunk, &wrote, NULL) || wrote != chunk) {
+            CloseHandle(h);
+            return OMNIC_E_SYSTEM;
+        }
+        p += wrote;
+        left -= wrote;
+    }
+    /* mtime 换算与 set_mtime_stream 同式；失败不视作写失败（与旧语义一致） */
+    ULARGE_INTEGER u;
+    u.QuadPart = (unsigned long long)mtime * 10000000ULL + 116444736000000000ULL;
+    FILETIME ft;
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    SetFileTime(h, NULL, &ft, &ft);
+    CloseHandle(h);
+    return OMNIC_OK;
+}
+
 char *omnic_fs_abspath(const char *path) {
     wchar_t wpath[OMNIC_FS_PATH_MAX], wfull[OMNIC_FS_PATH_MAX];
     if (utf8_to_w16(path, wpath, OMNIC_FS_PATH_MAX) == 0) return NULL;
@@ -222,6 +253,7 @@ int omnic_fs_path_inside(const char *root_abs, const char *path_abs) {
 #include <dirent.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <utime.h>
@@ -324,6 +356,31 @@ omnic_status omnic_fs_set_mtime_stream(FILE *f, long long mtime) {
 
 FILE *omnic_fs_fopen(const char *utf8_path, const char *mode) {
     return fopen(utf8_path, mode);
+}
+
+omnic_status omnic_fs_write_file(const char *utf8_path, const void *data, size_t n,
+                                 long long mtime, int *opened) {
+    int fd = open(utf8_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return OMNIC_E_SYSTEM;
+    if (opened != NULL) *opened = 1;
+    const uint8_t *p = (const uint8_t *)data;
+    size_t left = n;
+    while (left > 0) {
+        ssize_t w = write(fd, p, left);
+        if (w <= 0) {
+            close(fd);
+            return OMNIC_E_SYSTEM;
+        }
+        p += w;
+        left -= (size_t)w;
+    }
+    struct timespec ts[2];
+    ts[0].tv_sec = (time_t)mtime;
+    ts[0].tv_nsec = 0;
+    ts[1] = ts[0];
+    futimens(fd, ts); /* mtime 失败不视作写失败（与旧语义一致） */
+    close(fd);
+    return OMNIC_OK;
 }
 
 char *omnic_fs_abspath(const char *path) {

@@ -32,6 +32,12 @@ omnic_status omnic_fs_set_mtime(const char *path, long long mtime);
 /* 在已打开的流上设置 mtime（省一次独立打开）；须在 fclose 前调用 */
 omnic_status omnic_fs_set_mtime_stream(FILE *f, long long mtime);
 
+/* 整文件直写：创建/覆写 + 数据 + mtime 一体，不经 CRT stdio（其锁路径在多
+ * writer 并发下逐文件成本线性膨胀）。OMNIC_OK=成功；E_USAGE=路径转换失败；
+ * E_SYSTEM=打开或写入失败。opened 非空时回写 1=文件已打开（写失败≠无法创建）。 */
+omnic_status omnic_fs_write_file(const char *utf8_path, const void *data, size_t n,
+                                 long long mtime, int *opened);
+
 /* 以 UTF-8 路径打开文件（Windows 内部转宽字符，规避 CRT ANSI fopen 的 GBK 坑） */
 FILE *omnic_fs_fopen(const char *utf8_path, const char *mode);
 

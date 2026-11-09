@@ -228,6 +228,11 @@ if(OMNIC_LIBS)
 endif()
 # log2 等数学函数在 Linux 上位于独立的 libm；Windows (CRT) 与 macOS (libSystem) 自动链接
 target_link_libraries(omnic_core PUBLIC $<$<PLATFORM_ID:Linux>:m>)
+# 解包并行写盘：POSIX 侧 pthread（Win32 走 SRWLOCK/CONDITION_VARIABLE 无额外依赖）
+if(NOT WIN32)
+  find_package(Threads REQUIRED)
+  target_link_libraries(omnic_core PUBLIC Threads::Threads)
+endif()
 # MinGW：snappy 等第三方为 C++ 源，静态链后按符号集可能拉入 libstdc++ DLL 依赖；
 # 统一静态化 GCC 运行时（仅消运行时 DLL 依赖，系统 DLL 不动），工具 exe 可直接分发
 if(WIN32 AND CMAKE_C_COMPILER_ID MATCHES "GNU")
