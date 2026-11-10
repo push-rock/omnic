@@ -827,6 +827,8 @@ static void test_parallel(void) {
         CHECK(omnic_unpack_files(ARC2, "omnic_arc_pf", names, 40, &of, &g_rep) == OMNIC_OK);
         CHECK(omnic_fs_fopen("omnic_arc_pf/d0/f000.txt", "rb") != NULL);
         CHECK(omnic_fs_fopen("omnic_arc_pf/d0/f039.txt", "rb") != NULL);
+        CHECK(omnic_fs_fopen("omnic_arc_pf/d0/f001.txt", "rb") == NULL); /* 非目标不落盘 */
+        CHECK(omnic_fs_fopen("omnic_arc_pf/rand.bin", "rb") == NULL);
         rm_tree("omnic_arc_pf");
     }
 

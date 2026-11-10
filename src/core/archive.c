@@ -1020,9 +1020,10 @@ typedef struct arc_job {
 } arc_job;
 
 typedef struct {
-    uint8_t *buf; /* busy 期间有效；pending 归零即回收 */
+    uint8_t *buf; /* busy 期间有效；open 关闭且 pending 归零后回收 */
     size_t pending;
     int busy;
+    int open; /* 主线程派发中：worker 不得因 pending 归零回收本槽 */
 } arc_wslot;
 
 typedef struct {
@@ -1039,9 +1040,9 @@ typedef struct {
     int nworkers;
 } arc_pool;
 
-/* worker：纯 I/O 落盘。槽数据在 pending 归零前保证有效（无锁读安全：
- * enqueue 的锁序建立 happens-before）；结果码经 result 数组回传，
- * 主线程 drain 后按条目序渲染。 */
+/* worker：纯 I/O 落盘。槽数据在块关闭（open=0）且 pending 归零前保证有效
+ * （无锁读安全：enqueue 的锁序建立 happens-before）；结果码经 result 数组
+ * 回传，主线程 drain 后按条目序渲染。 */
 ARC_THREAD_FN writer_main(void *arg) {
     arc_pool *p = (arc_pool *)arg;
     for (;;) {
@@ -1066,7 +1067,7 @@ ARC_THREAD_FN writer_main(void *arg) {
         arc_mutex_lock(&p->mu);
         p->result[j->ent_idx] = (int8_t)rc;
         arc_wslot *s = &p->slot[j->slot];
-        if (--s->pending == 0) {
+        if (--s->pending == 0 && !s->open) {
             free(s->buf);
             s->buf = NULL;
             s->busy = 0;
@@ -1107,6 +1108,7 @@ static int pool_acquire_slot(arc_pool *p) {
         for (int s = 0; s < ARC_SLOT_RING; s++) {
             if (!p->slot[s].busy) {
                 p->slot[s].busy = 1;
+                p->slot[s].open = 1;
                 p->slot[s].buf = NULL;
                 p->slot[s].pending = 0;
                 arc_mutex_unlock(&p->mu);
@@ -1136,10 +1138,12 @@ static void pool_enqueue(arc_pool *p, size_t ent_idx, int slot) {
     if (j != NULL) arc_cond_signal(&p->cv_work);
 }
 
-/* 块的条目全在派发前被拦截（CRC/存在性）→ 槽零作业，主线程自回收。
- * decode 失败路径复用（buf 可能为 NULL）。 */
-static void pool_release_if_empty(arc_pool *p, int slot) {
+/* 块派发结束：关槽。worker 可能赶在主线程前面清空 pending，open 期间不得
+ * 回收（主线程仍要读 buf 做条目 CRC）；关闭时已清零则就地回收，否则留给
+ * 最后一个完成的 worker。decode 失败路径复用（buf 可能为 NULL）。 */
+static void pool_close_slot(arc_pool *p, int slot) {
     arc_mutex_lock(&p->mu);
+    p->slot[slot].open = 0;
     if (p->slot[slot].busy && p->slot[slot].pending == 0) {
         free(p->slot[slot].buf);
         p->slot[slot].buf = NULL;
@@ -1276,14 +1280,15 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
             else if (drc == 2) omnic_set_error("block %zu: no decoder for format %u", bi, b->fmt);
             else omnic_set_error("out of memory");
             failed += blk_cnt[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
-            if (parallel) pool_release_if_empty(&pool, slot);
+            if (parallel) pool_close_slot(&pool, slot);
             continue;
         }
-        if (parallel) pool.slot[slot].buf = raw; /* 槽占用期无 worker 触碰，直接赋值 */
+        if (parallel) pool.slot[slot].buf = raw; /* open 且 pending==0：无 worker 触碰，直接赋值 */
         blocks_ok++;
         for (size_t k = blk_off[bi]; k < blk_off[bi + 1]; k++) {
             size_t i = ent_ord[k];
             arc_entry *e = &ix.ent[i];
+            if (want_ent != NULL && !want_ent[i]) continue; /* --file：仅目标条目 */
             /* 块内偏移越界防御（无溢出写法）；条目 CRC 为双层校验内层（§4.2） */
             if (e->size > b->raw_size || e->in_off > b->raw_size - e->size ||
                 arc_crc32(0, raw + e->in_off, (size_t)e->size) != e->crc) {
@@ -1336,7 +1341,7 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                 extracted++;
             }
         }
-        if (parallel) pool_release_if_empty(&pool, slot);
+        if (parallel) pool_close_slot(&pool, slot);
         else free(raw);
     }
     if (parallel) {
