@@ -4,6 +4,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/push-rock/omnic/actions/workflows/ci.yml/badge.svg)](https://github.com/push-rock/omnic/actions/workflows/ci.yml)
+
 ```
 $ omnic c report.json
 report.json: zstd | balanced | text/code | level 9
@@ -16,6 +18,17 @@ report.json: xz | best_ratio | text/code | level 9
 $ omnic pack gamedir/
 gamedir/: 152644069 -> 100395194 bytes (65.77%), 4.99s
 ```
+
+## Get it
+
+Prebuilt binaries — **Linux, macOS, Windows**, no installer, no runtime dependencies — are attached to every [GitHub Release](https://github.com/push-rock/omnic/releases). The executable is `bin/omnic` inside the archive (`bin\omnic.exe` on Windows); drop it anywhere on your `PATH`.
+
+The binaries are not code-signed (open-source budget):
+
+- **Windows** — running from cmd/PowerShell is unaffected by SmartScreen; if you launch by double-clicking and get the blue warning, pick *More info → Run anyway*.
+- **macOS** — extracting from a terminal (`tar -xzf`) leaves no quarantine flag, the binary runs as-is; if you extract by double-clicking (Archive Utility), clear the flag once: `xattr -d com.apple.quarantine bin/omnic`.
+
+Binaries are built and fully tested by CI on the tagged commit. To build from source instead, see [Build](#build).
 
 ## Why omnic
 
@@ -184,7 +197,7 @@ A 152.6 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files 
 `balanced` stream decompression runs at **1060 MiB/s — 1.8× the Kraken-5 estimate** — paying 1.7 pp of ratio for it; `best_ratio` beats the Kraken-5 ratio estimate by 0.8 pp. No single configuration beats Kraken on both axes at once — the profile system is how you pick a side.
 
 \* Kraken has no public binary; its figures are third-party same-machine measurements converted with a machine coefficient (±8% sensitivity). zstd-19 independently reproduces the Kraken-5 anchor on Silesia, which is why it serves as the proxy row above.
-† 1060 = omnic's streaming product path (frame-to-frame dictionary reuse); 652 = a one-shot direct library call on the same data.
+† Two decompression protocols on the same bytes — the compressed output is byte-identical, and both go through the same library call: 652 MiB/s holds the whole stream in RAM and decodes in one shot (the lzbench-style protocol every other row in this table uses, the Kraken-5 estimate included); 1060 MiB/s is omnic's actual streaming pipeline, which reuses fixed 4 MiB buffers end-to-end so the working set stays cache-resident. The buffering strategy is the entire difference.
 
 ## Build
 

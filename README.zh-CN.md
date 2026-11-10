@@ -4,6 +4,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
+[![CI](https://github.com/push-rock/omnic/actions/workflows/ci.yml/badge.svg)](https://github.com/push-rock/omnic/actions/workflows/ci.yml)
+
 ```
 $ omnic c report.json
 report.json: zstd | balanced | text/code | level 9
@@ -16,6 +18,17 @@ report.json: xz | best_ratio | text/code | level 9
 $ omnic pack gamedir/
 gamedir/: 152644069 -> 100395194 bytes (65.77%), 4.99s
 ```
+
+## 获取
+
+**Linux / macOS / Windows** 预编译二进制挂在每个 [GitHub Release](https://github.com/push-rock/omnic/releases)，免安装、零运行时依赖。可执行文件在归档内的 `bin/omnic`（Windows 为 `bin\omnic.exe`），放进 `PATH` 即可。
+
+二进制未做代码签名（开源预算）：
+
+- **Windows** —— 从 cmd/PowerShell 调用不受 SmartScreen 影响；双击运行若弹出蓝色警告，选 *更多信息 → 仍要运行*。
+- **macOS** —— 终端 `tar -xzf` 解压不会带隔离标记，直接可用；若用双击（归档实用工具）解压，清一次标记：`xattr -d com.apple.quarantine bin/omnic`。
+
+二进制由 CI 在 tag 提交上构建并全量测试后才挂出。从源码构建见 [构建](#构建)。
 
 ## 为什么用 omnic
 
@@ -184,7 +197,7 @@ unpack: --file <路径>  只提取该条目（可重复）
 `balanced` 整流解压 **1060 MiB/s——Kraken-5 估计值的 1.8 倍**，代价 1.7 pp；`best_ratio` 压缩率反超 Kraken-5 估计值 0.8 pp。没有单一配置能在两个维度同时胜过 Kraken——档位体系就是让你选边。
 
 \* Kraken 无公开二进制，数字为第三方同机实测经机器系数换算的估计（±8%）；zstd-19 在 Silesia 上独立复现了该锚点。
-† 1060 = omnic 流式产品路径（帧间字典复用）；652 = 同一数据的库直调单发口径。
+† 同一份压缩数据（产物逐字节相同、走同一次库调用）的两种解压口径：652 MiB/s 把整流驻内存一次性解完——本表其余各行（含 Kraken-5 估计值）所用的 lzbench 式口径；1060 MiB/s 是 omnic 产品实际的流式管线，全程复用 4 MiB 定长缓冲、工作集常驻缓存。两者的全部差异来自缓冲策略。
 
 ## 构建
 
