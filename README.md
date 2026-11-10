@@ -34,7 +34,8 @@ gamedir/: 152644069 -> 100395194 bytes (65.77%), 4.99s
 - Packing is **1.6× faster than zip -9** (28.8 vs 18.4 MB/s), same tier as default zip (28.8 vs 38.1);
 - Single-file extraction: **8.7 ms — 3.3× faster than zip** (zip CLI 28.3 ms, .NET library 25 ms); full unpack wall clock 4.4 s vs 2.5 s — lost to the file-creation path, which the v0.3.1 parallel write path will reclaim;
 - Capabilities zip lacks: corruption isolation (one flipped bit kills one block — `extracted 7435/8586`, the rest still come out), `--verify` no-write full verification (260 MB/s), `--list` without touching the data region (96 ms);
-- `--per-file` (per-entry random access) and solid (whole-stream max ratio, xz-class 63.2%) are one flag apart.
+- `--per-file` (per-entry random access) and solid (whole-stream max ratio, xz-class 63.2%) are one flag apart;
+- Cross-corpus confirmation on the standard Silesia benchmark (202 MiB, 12 mixed domains, no file extensions): **balanced beats zip-deflate on both axes — 10% smaller archive, 2.1× faster packing**; `best_ratio` lands 9.2 pp below zip.
 
 ## Supported codecs
 
@@ -98,6 +99,7 @@ All numbers measured on one machine (i7-12700, single thread, best of rounds); r
 5. **A 24 MB flat bitmap compresses to 744 bytes (1/33,000)** — brotli's specialty; zstd -19 / xz -9 only reach 3.0 / 4.3 KB. omnic picks brotli.
 6. **Every fixed algorithm has a disaster row**: gzip -9 is at least 1/3 larger on all five compressible groups (photo row +58%); zstd -19 is 4.1× larger on flat bitmaps, xz -9 5.7×; brotli -11 has no disaster row but runs at 1.0 MB/s throughout. omnic's worst group is +4.6%.
 7. **Stream mode decompresses at 1060 MiB/s** — 1.8× Oodle Kraken-5's published estimate — with ratio up to xz-class 57.0%.
+8. **Cross-corpus check — standard Silesia (202 MiB, 12 domains): balanced beats zip-deflate on both axes**: 29.0% vs 32.2% ratio, 2.4 vs 5.0 s pack; `best_ratio` reaches 23.0% (9.2 pp below zip).
 
 ![omnic vs zip: archive size and single-file extraction](assets/adv_pack.png)
 
@@ -154,6 +156,19 @@ A 152.6 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files 
 - Single-file extraction: pulling one 6 KB Lua file from 8,586 entries — omnic `--per-file` 8.7 ms (process start included), zip CLI 28.3 ms, .NET library (ZipFile + stream copy) 25 ms — **3.3× faster**; solid mode 67 ms (the cost of reading and decoding one whole 64 MiB block).
 - Unpack wall clock: 4.4 s vs 2.5 s. Breakdown: no-write decode+verify 0.56 s vs 0.36 s (deflate decode is inherently fast, and omnic adds a per-block CRC — the price of corruption isolation); file-creation path 3.8 s vs 2.2 s (8,586 files; a plain robocopy of the same tree costs 3.7 s) — the v0.3.1 parallel write path reclaims this.
 - Corruption isolation: every block carries a CRC-32; one flipped bit kills one block, extraction reports each affected file then continues (`extracted 7435/8586 files`, exit code 2). A zip with a damaged central directory usually gives you nothing. `--list` reads only the tail index: 8,586 entries in 96 ms.
+
+**Cross-corpus check: the standard Silesia benchmark** (12 domain-mixed files — novels, dictionary, chemistry database, C source, medical/X-ray images, binaries, XML; 202 MiB; no file extensions, so the decider routes everything through content sampling):
+
+| option | ratio | archive size | vs zip | pack |
+|---|---|---|---|---|
+| zip (deflate default) | 32.18% | 65.0 MB | — | 4.96 s |
+| omnic `-p fast_compress` | 41.02% | 82.9 MB | +27.5% | **1.08 s** |
+| omnic `-p fast_decompress` | 31.37% | 63.4 MB | -2.5% | 1.36 s |
+| **omnic pack (default)** | **28.97%** | **58.6 MB** | **-10.0%** | **2.41 s** |
+| omnic `-p best_ratio` | **23.02%** | **46.5 MB** | **-28.5%** | 87.4 s |
+
+- balanced wins both axes: **3.2 pp smaller ratio and 2.1× the pack speed**; `fast_decompress` matches zip's ratio at 3.6× the speed; `best_ratio` sits 9.2 pp below zip — the archival tier.
+- Losses recorded: full unpack of this big-file corpus is 0.83 s vs zip's 0.37 s (solid zstd decode plus the per-block CRC isolation tax; the parallel-write path targets many-file trees like the one above). `--file` extraction of the 10 MB member takes 48 ms — decode-bound; the 8.7 ms headline is a 6 KB file.
 
 **Whole-stream max compression** (tar the tree, then one stream — the lzbench / Oodle published protocol):
 
