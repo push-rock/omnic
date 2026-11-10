@@ -4,8 +4,35 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-11-10
+
+### Added — parallel unpack writes
+
+- `omnic unpack` extracts through a worker pool (8 writers by default, `-T`
+  to tune, `-T 1` forces the serial path): the main thread decodes blocks and
+  runs the per-entry CRC checks, workers do the disk writes. Bad-block
+  isolation, `--file` filtering, reporting and exit codes are unchanged.
+- Unpack of the 152.5 MB game tree (8,586 files): 4.3 s serial → 3.9 s on
+  Windows with Defender real-time scanning active (3.6 s at `-T 2`); most of
+  the residual gap is the antivirus scanning each new file from an unsigned
+  process. Without real-time AV (or with the output directory excluded) the
+  writers deliver their full speedup.
+- Unpacks with fewer than 32 write jobs keep the serial path — single-file
+  `--file` extraction stays at its 8.7 ms headline speed.
+- Index-driven block bucketing replaces the per-block table scan; the serial
+  path is ~0.15 s faster on per-file archives.
+- `-T` now sets worker threads for both zstd packing and unpack writes.
+
 ### Fixed
 
+- Parallel unpack: a slot buffer could be freed while the main thread was
+  still dispatching entries from it — workers that drained the queue faster
+  than the producer left it dangling, corrupting entry CRC checks. Surfaced
+  on Linux/macOS CI (2–4 cores, 9 threads), never on the many-core Windows
+  dev box. Slot lifetime is now gated on an explicit close from the producer.
+- `--file` extraction regressed to writing every entry of a target block
+  instead of only the requested names; the filter is restored and pinned by
+  a test asserting non-target files stay absent.
 - `omnic analyze` could print an empty codec / level 0 on GCC 16.2 `-O2`/`-O3`
   builds: the optimizer wrongly eliminates the stack initialization of the
   all-zero default-options literal, so the decision ran on a garbage profile.

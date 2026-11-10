@@ -32,7 +32,7 @@ gamedir/: 152644069 -> 100395194 bytes (65.77%), 4.99s
 
 - The archive is **5.0% smaller than zip** (95.7 vs 100.8 MB); the `--no-skip` tier is **10.2% smaller** (90.5 MB) — deflate caps at 69.2% at every tier, and omnic's default tier reaches **65.8%**;
 - Packing is **1.6× faster than zip -9** (28.8 vs 18.4 MB/s), same tier as default zip (28.8 vs 38.1);
-- Single-file extraction: **8.7 ms — 3.3× faster than zip** (zip CLI 28.3 ms, .NET library 25 ms); full unpack wall clock 4.4 s vs 2.5 s — lost to the file-creation path, which the v0.3.1 parallel write path will reclaim;
+- Single-file extraction: **8.7 ms — 3.3× faster than zip** (zip CLI 28.3 ms, .NET library 25 ms); full unpack now writes through a parallel worker pool (8 by default, `-T` to tune): 4.3 s → 3.9 s here under Windows Defender — the residual gap to zip (2.6 s) is the antivirus scanning each new file from an unsigned process; exclude the output directory or run AV-free for the full speedup;
 - Capabilities zip lacks: corruption isolation (one flipped bit kills one block — `extracted 7435/8586`, the rest still come out), `--verify` no-write full verification (260 MB/s), `--list` without touching the data region (96 ms);
 - `--per-file` (per-entry random access) and solid (whole-stream max ratio, xz-class 63.2%) are one flag apart;
 - Cross-corpus confirmation on the standard Silesia benchmark (202 MiB, 12 mixed domains, no file extensions): **balanced beats zip-deflate on both axes — 10% smaller archive, 2.1× faster packing**; `best_ratio` lands 9.2 pp below zip.
@@ -72,7 +72,7 @@ omnic list                       list codecs and recognized formats
 
 -p --profile <v>   fast_compress | fast_decompress | best_ratio | balanced
 -c --codec <name>  force a codec            -l --level <n>  codec-native level
--T --threads <n>   worker threads (zstd)    -o --output-dir <dir>
+-T --threads <n>   workers (zstd pack; unpack writes)    -o --output-dir <dir>
 -f --force    overwrite output / compress anyway / --file target exists
 -k --keep     keep the source file (default: removed after success)
 -x --explain  print the decision rationale  -q --quiet
@@ -154,7 +154,7 @@ A 152.6 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files 
 
 - deflate caps at 69.2% no matter the tier (-9 spends 2.1× the time for 0.07 pp); omnic's default tier reaches 65.8% — **5.0% smaller** — and packs 1.6× faster than zip -9 (throughput 28.8 vs 18.4 MB/s).
 - Single-file extraction: pulling one 6 KB Lua file from 8,586 entries — omnic `--per-file` 8.7 ms (process start included), zip CLI 28.3 ms, .NET library (ZipFile + stream copy) 25 ms — **3.3× faster**; solid mode 67 ms (the cost of reading and decoding one whole 64 MiB block).
-- Unpack wall clock: 4.4 s vs 2.5 s. Breakdown: no-write decode+verify 0.56 s vs 0.36 s (deflate decode is inherently fast, and omnic adds a per-block CRC — the price of corruption isolation); file-creation path 3.8 s vs 2.2 s (8,586 files; a plain robocopy of the same tree costs 3.7 s) — the v0.3.1 parallel write path reclaims this.
+- Unpack wall clock: 4.3 s serial → **3.9 s** with the default 8 write workers (3.6 s at `-T 2`) vs 2.6 s for signed tar.exe on the same zip. Breakdown: no-write decode+verify 0.56 s vs 0.36 s (deflate decode is inherently fast, and omnic adds a per-block CRC — the price of corruption isolation); the rest is file creation, and on this machine most of that is Windows Defender real-time scanning every file an unsigned process creates (a plain robocopy of the same tree costs 3.7 s; signed tar.exe pays none of the AV tax). Exclude the output directory from Defender — or run on Linux/macOS — and the parallel writers deliver their full speedup.
 - Corruption isolation: every block carries a CRC-32; one flipped bit kills one block, extraction reports each affected file then continues (`extracted 7435/8586 files`, exit code 2). A zip with a damaged central directory usually gives you nothing. `--list` reads only the tail index: 8,586 entries in 96 ms.
 
 **Cross-corpus check: the standard Silesia benchmark** (12 domain-mixed files — novels, dictionary, chemistry database, C source, medical/X-ray images, binaries, XML; 202 MiB; no file extensions, so the decider routes everything through content sampling):

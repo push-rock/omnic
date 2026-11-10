@@ -32,7 +32,7 @@ gamedir/: 152644069 -> 100395194 bytes (65.77%), 4.99s
 
 - 归档比 zip **小 5.0%**（95.7 vs 100.8 MB），`--no-skip` 极限档**小 10.2%**（90.5 MB）——deflate 全档位的压缩率天花板是 69.2%，omnic 默认档直接压到 **65.8%**；
 - 打包比 zip 极限档（-9）**快 1.6 倍**（28.8 vs 18.4 MB/s），与 zip 默认档同档（28.8 vs 38.1）；
-- 单文件提取 **8.7 ms，比 zip 快 3.3 倍**（zip CLI 28.3 ms、.NET 库级 25 ms）；解压墙钟 4.4 s vs 2.5 s，输在建盘路径，v0.3.1 并行写盘收复；
+- 单文件提取 **8.7 ms，比 zip 快 3.3 倍**（zip CLI 28.3 ms、.NET 库级 25 ms）；全量解包并行写盘（默认 8 worker，`-T` 可调）：本机 Windows Defender 下 4.3 s → 3.9 s——与 zip（2.6 s）的残余差距是杀软对未签名进程新建文件的实时扫描；输出目录加入 Defender 排除或无 AV 环境可获全部提速；
 - zip 没有的能力：坏块隔离（一个比特翻转只废一个块，`extracted 7435/8586` 其余照常解出）、`--verify` 无写入全量校验（260 MB/s）、`--list` 不碰数据区列全表（96 ms）；
 - `--per-file`（逐文件随机访问）与 solid（整流极限压缩，xz 级 63.2%）一个参数切换；
 - 跨语料复核：Silesia 标准基准（202 MiB、12 个混合内容域、文件均无扩展名）上 balanced 依旧双轴全胜——**归档比 zip-deflate 小 10%、打包快 2.1 倍**；`best_ratio` 压到 23.0%（比 zip 低 9.2 pp）。
@@ -72,7 +72,7 @@ omnic list                     列出算法与支持的格式
 
 -p --profile <v>   fast_compress | fast_decompress | best_ratio | balanced
 -c --codec <名>    指定算法                  -l --level <n>  算法原生级别
--T --threads <n>   压缩线程数（zstd）        -o --output-dir <目录>
+-T --threads <n>   线程数（zstd 打包；解包写盘）  -o --output-dir <目录>
 -f --force    覆盖已存在输出 / 强制压缩不可压缩数据 / --file 目标已存在
 -k --keep     保留源文件（默认：成功后删除）
 -x --explain  打印决策依据                   -q --quiet
@@ -154,7 +154,7 @@ unpack: --file <路径>  只提取该条目（可重复）
 
 - zip 的 deflate 无论怎么调档都封顶 69.2%（-9 多花 2.1 倍时间只换 0.07 pp）；omnic 默认档 65.8%——**小 5.0%**，打包还比 zip -9 快 1.6 倍（吞吐 28.8 vs 18.4 MB/s）。
 - 单文件提取：从 8,586 条目里取一个 6 KB Lua 文件，omnic `--per-file` 8.7 ms（含进程启动），zip CLI 28.3 ms、.NET 库级（ZipFile + 流拷贝）25 ms——**快 3.3 倍**；solid 模式 67 ms（读并解开整个 64 MiB 块的代价）。
-- 解包墙钟 4.4 s vs 2.5 s。分解：无写盘解码+校验 0.56 s vs 0.36 s（deflate 解码本来就快，omnic 多一层块级 CRC——这是坏块隔离能力的代价），建盘路径 3.8 s vs 2.2 s（8,586 文件；同树 robocopy 裸拷贝也要 3.7 s）——v0.3.1 并行写盘收复这段。
+- 解包墙钟：串行 4.3 s → 默认 8 写盘 worker **3.9 s**（本机 `-T 2` 为 3.6 s）vs 签名 tar.exe 解同内容 zip 2.6 s。分解：无写盘解码+校验 0.56 s vs 0.36 s（deflate 解码本来就快，omnic 多一层块级 CRC——这是坏块隔离能力的代价），其余是建盘——本机大头是 Defender 对未签名进程每个新建文件的实时扫描（同树 robocopy 裸拷贝也要 3.7 s；签名的 tar.exe 分文不付）。把输出目录加入 Defender 排除，或在 Linux/macOS 上跑，并行写盘即兑现全部提速。
 - 坏块隔离：每块自带 CRC-32，一个比特翻转只废一个块，提取把块内文件逐个报出后继续（`extracted 7435/8586 files`，退出码 2）。zip 中央目录一坏通常全废。`--list` 只读尾部压缩索引，8,586 条 96 ms。
 
 **跨语料复核：Silesia 标准基准**（12 个域混合文件——小说、词典、化学库、C 源码、医学/X 光影像、二进制、XML；202 MiB；文件均无扩展名，决策全部走内容采样路径）：
