@@ -21,7 +21,7 @@ It also packs directory trees into
 archives: files are classified, grouped into per-codec buckets, and
 compressed as 64 MiB solid blocks. Already-compressed assets are
 stored as-is. A corrupted block can never take the rest of the archive
-down \- extraction skips it and reports every affected file.
+down \- extraction skips it and names the first ten affected files.
 .SH COMMANDS
 .TP
 .BR c ", " compress
