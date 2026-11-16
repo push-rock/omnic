@@ -392,6 +392,79 @@ static omnic_status arc_compress_mem(const uint8_t *buf, size_t n,
     return OMNIC_OK;
 }
 
+/* ---- 并行分类池（DESIGN-parallel-pack-classify）：条目级独立作业，
+ * 批量领号 + plan[i] 按下标私有写，无队列无共享写路径。错误只记录首个
+ * （路径引用 fs[].rel，生命周期覆盖 join），join 后主线程统一写报错——
+ * g_err 非线程安全，worker 不直接碰。 ---- */
+#define CLS_BATCH 16
+#define ARC_NWRITER_DEFAULT 8
+#define ARC_NWRITER_MAX 64
+#define ARC_PAR_MIN_JOBS 32 /* 低于此数走串行：--file 单提取不付池启动成本 */
+
+typedef struct {
+    const omnic_fs_entry *fs;
+    const arc_index *ix;
+    const char *root;
+    const omnic_options *o;
+    file_plan *plan;
+    size_t n, next;
+    int stop;
+    omnic_status first_err;
+    const char *err_rel;
+    arc_mutex_t lock;
+} cls_ctx;
+
+static int cls_one(cls_ctx *c, size_t i) {
+    char src[OMNIC_FS_PATH_MAX * 2];
+    if (snprintf(src, sizeof(src), "%s/%s", c->root, c->fs[i].rel) >= (int)sizeof(src)) return -1;
+    omnic_report arep;
+    memset(&arep, 0, sizeof(arep));
+    if (omnic_run_analyze(src, c->o, &arep) != OMNIC_OK) return -1;
+    if (strcmp(arep.codec, OMNIC_SKIP_CODEC) == 0) arep.skipped = true; /* 哨兵兜底 */
+    if (arep.skipped && c->o != NULL && (c->o->flags & OMNIC_F_NO_SKIP)) {
+        /* --no-skip：已压资产视同 unknown 入压缩桶（实验口径 zstd/19） */
+        snprintf(c->plan[i].codec, sizeof(c->plan[i].codec), "zstd");
+        c->plan[i].level = 19;
+    } else if (arep.skipped || c->fs[i].size == 0) {
+        /* SYS-CMP-003 skip 直通；0 字节文件按规格 §4.5 归 store */
+        c->plan[i].store = 1;
+    } else {
+        snprintf(c->plan[i].codec, sizeof(c->plan[i].codec), "%s", arep.codec);
+        c->plan[i].level = arep.level;
+    }
+    return 0;
+}
+
+ARC_THREAD_FN cls_worker(void *arg) {
+    cls_ctx *c = (cls_ctx *)arg;
+    for (;;) {
+        size_t i0 = 0, cnt = 0;
+        arc_mutex_lock(&c->lock);
+        if (!c->stop) {
+            i0 = c->next;
+            cnt = (c->n - i0 > CLS_BATCH) ? CLS_BATCH : c->n - i0;
+            c->next += cnt;
+        }
+        arc_mutex_unlock(&c->lock);
+        if (cnt == 0) break;
+        for (size_t k = 0; k < cnt; k++) {
+            size_t i = i0 + k;
+            if (c->ix->ent[i].type == 1) continue; /* 目录条目不分类 */
+            if (cls_one(c, i) != 0) {
+                arc_mutex_lock(&c->lock);
+                if (c->first_err == OMNIC_OK) {
+                    c->first_err = OMNIC_E_SYSTEM;
+                    c->err_rel = c->fs[i].rel;
+                    c->stop = 1;
+                }
+                arc_mutex_unlock(&c->lock);
+                break;
+            }
+        }
+    }
+    ARC_THREAD_RET_OK;
+}
+
 /* ---- pack（A3：store-only；A4 接决策分桶与压缩块）---- */
 omnic_status omnic_pack(const char *root, const char *archive_path,
                         const omnic_options *o, omnic_report *rep) {
@@ -492,10 +565,49 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     int per_file = (o != NULL && (o->flags & OMNIC_F_PER_FILE));
     int threads = (o != NULL) ? o->threads : 0;
 
-    /* ---- 决策 pass：逐文件分类建议（~1ms/文件，决策器只采样不落盘） ---- */
+    /* ---- 决策 pass：逐文件分类建议。explain/小树/-T 1 走串行；默认 8 worker
+     * 并行（分类是 pack 大头：游戏树实测 3.82s/5.26s）。串行与并行语义一致，
+     * 区别仅 in_bytes 累加点（并行在 join 后按同一口径补算）。 ---- */
     plan = (file_plan *)calloc(n ? n : 1, sizeof(file_plan));
     if (plan == NULL) goto oom;
-    for (size_t i = 0; i < n; i++) {
+    size_t n_files = 0;
+    for (size_t i = 0; i < n; i++)
+        if (ix.ent[i].type == 0) n_files++;
+    int cls_workers = ARC_NWRITER_DEFAULT;
+    if (o != NULL && o->threads == 1) cls_workers = 1;
+    else if (o != NULL && o->threads > 1) cls_workers = o->threads;
+    if (cls_workers > ARC_NWRITER_MAX) cls_workers = ARC_NWRITER_MAX;
+    if (n_files > 0 && (size_t)cls_workers > n_files) cls_workers = (int)n_files;
+    int cls_parallel = (!explain && cls_workers > 1 && n_files >= ARC_PAR_MIN_JOBS);
+    if (cls_parallel) {
+        cls_ctx c;
+        memset(&c, 0, sizeof(c));
+        c.fs = fs;
+        c.ix = &ix;
+        c.root = root;
+        c.o = o;
+        c.plan = plan;
+        c.n = n;
+        c.first_err = OMNIC_OK;
+        arc_mutex_init(&c.lock);
+        arc_thread_t tid[ARC_NWRITER_MAX];
+        int spawned = 0;
+        for (; spawned < cls_workers; spawned++)
+            if (arc_thread_create(&tid[spawned], cls_worker, &c) != 0) break;
+        if (spawned == 0) {
+            cls_parallel = 0; /* 线程创建全败：串行兜底 */
+        } else {
+            for (int w = 0; w < spawned; w++) arc_thread_join(tid[w]);
+            if (c.first_err != OMNIC_OK) {
+                omnic_set_error("cannot analyze '%s/%s'", root, c.err_rel);
+                goto fail;
+            }
+            for (size_t i = 0; i < n; i++)
+                if (ix.ent[i].type == 0) rep->in_bytes += fs[i].size;
+        }
+    }
+    if (!cls_parallel) {
+        for (size_t i = 0; i < n; i++) {
         if (ix.ent[i].type == 1) continue;
         char src[OMNIC_FS_PATH_MAX * 2];
         if (snprintf(src, sizeof(src), "%s/%s", root, fs[i].rel) >= (int)sizeof(src)) {
@@ -521,6 +633,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
             printf("  %s: %s -> %s\n", fs[i].rel, omnic_class_str(arep.klass),
                    plan[i].store ? "pass-through" : plan[i].codec);
         rep->in_bytes += fs[i].size;
+        }
     }
     if (!quiet)
         printf("  classified %llu entries in %.2fs\n", (unsigned long long)n,
@@ -945,9 +1058,6 @@ static void report_bad_block(const arc_index *ix, size_t bi, unsigned fmt, unsig
  * 0.56s。主线程逐块解码 + worker 池并行落盘，解码被写盘掩盖。
  * 语义：坏块/条目校验/存在性全在主线程派发前拦截（顺序确定），worker 只做
  * 纯 I/O；提取/失败计数与串行路径同一口径。 */
-#define ARC_NWRITER_DEFAULT 8
-#define ARC_NWRITER_MAX 64
-#define ARC_PAR_MIN_JOBS 32 /* 低于此数走串行：--file 单提取不付池启动成本 */
 #define ARC_SLOT_RING 4     /* 在飞块上限 = 背压；内存上界 ≈ 4 × block_max */
 
 /* 落盘一个条目（串行/并行共用）。dst 为完整目标路径。

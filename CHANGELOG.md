@@ -4,6 +4,21 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
 
 ## [Unreleased]
 
+### Added — parallel pack classification
+
+- `pack` classifies the tree through a worker pool: 8 workers by default,
+  `-T <n>` to tune, `-T 1` for the serial path. Classification (per-file
+  open plus 3-segment sampling — filesystem/antivirus latency, not CPU) was
+  the wall-clock majority of packing: 3.63 s of 5.03 s on the 152.6 MB,
+  8,586-file game tree. The pool cuts it to 0.73 s: pack 2.4x faster overall
+  (5.03 -> 2.12 s), 2.5x faster than .NET zip (5.23 s) on the same tree in
+  the same window.
+- Determinism preserved: parallel and serial runs produce byte-identical
+  archives — plans are per-file, bucketing and block writes stay on the main
+  thread. `-x/--explain` and trees under 32 files keep the serial path.
+- `-T` now sets workers for classification, xz/zstd compression and unpack
+  writes.
+
 ### Fixed — multithreaded zstd truncation (v0.3.1, data integrity)
 
 - `c`/`pack` with `-T` > 1 on zstd no longer silently truncate output. The

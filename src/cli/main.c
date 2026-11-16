@@ -25,7 +25,7 @@ static void usage(FILE *out) {
           "  -p, --profile <v>   fast_compress | fast_decompress | best_ratio | balanced (default)\n"
           "  -c, --codec <name>  force a codec (see: omnic list; overrides skip, not for pack)\n"
           "  -l, --level <n>     codec-native level\n"
-          "  -T, --threads <n>   worker threads (zstd/xz compress, unpack writers)\n"
+          "  -T, --threads <n>   worker threads (classify, zstd/xz compress, unpack writers)\n"
           "  -o, --output-dir <dir>  pack: output archive path; unpack: output dir (same as -C)\n"
           "  -C, --dir <dir>     unpack: output root directory\n"
           "  -f, --force         overwrite output; compress incompressible data anyway\n"
