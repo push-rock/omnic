@@ -3,6 +3,7 @@
  * 无容器校验，流循环与 xz 完全共用。 */
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "codec/codec.h"
 #include <lzma.h>
@@ -102,10 +103,29 @@ done:
     return ret;
 }
 
+/* MT 内存预算（liblzma 文档：每线程约 3×block_size）。-9 满线程可到 10+ GiB，
+ * 超预算自动降线程，地板 2——宁可慢也要能跑。 */
+#define XZ_MT_MEM_CAP ((uint64_t)2 << 30)
+
 static omnic_status omnic_xz_compress(omnic_reader *in, omnic_writer *out, int level, int threads) {
-    (void)threads; /* 一期单线程（SYS-PERF-002） */
     lzma_stream strm = LZMA_STREAM_INIT;
-    if (lzma_easy_encoder(&strm, (uint32_t)level, LZMA_CHECK_CRC64) != LZMA_OK) return OMNIC_E_SYSTEM;
+    if (threads > 1) {
+        lzma_mt mt;
+        memset(&mt, 0, sizeof(mt));
+        mt.threads = (uint32_t)threads;
+        mt.block_size = 0; /* liblzma 自取 3×dict（xz CLI 同款约定） */
+        mt.preset = (uint32_t)level;
+        mt.check = LZMA_CHECK_CRC64;
+        while (mt.threads > 2 && lzma_stream_encoder_mt_memusage(&mt) > XZ_MT_MEM_CAP) mt.threads--;
+        if (lzma_stream_encoder_mt(&strm, &mt) != LZMA_OK) {
+            /* MT 初始化失败（内存压力等）退回单线程路径 */
+            if (lzma_easy_encoder(&strm, (uint32_t)level, LZMA_CHECK_CRC64) != LZMA_OK) {
+                return OMNIC_E_SYSTEM;
+            }
+        }
+    } else if (lzma_easy_encoder(&strm, (uint32_t)level, LZMA_CHECK_CRC64) != LZMA_OK) {
+        return OMNIC_E_SYSTEM;
+    }
     return lz_run_encode(in, out, &strm);
 }
 
