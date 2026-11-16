@@ -6,6 +6,7 @@
 #include "cli/argp.h"
 #include "cli/report.h"
 #include "core/archive.h"
+#include "core/dispatcher.h"
 #include "core/fs.h"
 #include "core/registry.h"
 #include "core/util.h"
@@ -22,7 +23,7 @@ static void usage(FILE *out) {
           "  omnic version | help\n\n"
           "options:\n"
           "  -p, --profile <v>   fast_compress | fast_decompress | best_ratio | balanced (default)\n"
-          "  -c, --codec <name>  force a codec (see: omnic list)\n"
+          "  -c, --codec <name>  force a codec (see: omnic list; overrides skip, not for pack)\n"
           "  -l, --level <n>     codec-native level\n"
           "  -T, --threads <n>   worker threads (zstd compress, unpack writers)\n"
           "  -o, --output-dir <dir>  pack: output archive path; unpack: output dir (same as -C)\n"
@@ -168,8 +169,8 @@ int main(int argc, char **argv) {
                 continue;
             }
             st = omnic_decompress(a.files[i], &a.opts, &rep);
-        } else { /* analyze */
-            st = omnic_analyze(a.files[i], &rep);
+        } else { /* analyze：直连 run_analyze 带全选项（api.c 公开接口按库契约为 NULL 选项） */
+            st = omnic_run_analyze(a.files[i], &a.opts, &rep);
             if (st == OMNIC_OK) {
                 if (!(a.opts.flags & OMNIC_F_QUIET)) {
                     printf("%s: %s | entropy %.2f | -> %s level %d\n", a.files[i],

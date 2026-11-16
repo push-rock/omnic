@@ -12,9 +12,8 @@ void omnic_print_report(const char *path, const omnic_report *rep, const omnic_o
     if (rep->skipped) {
         printf("%s -> skipped [%s | entropy %.2f bits/byte]\n", path, omnic_class_str(rep->klass),
                rep->entropy);
-        if (o->flags & OMNIC_F_EXPLAIN) {
-            printf("    %s\n", rep->reason);
-        }
+        /* skip 是可操作结果，提示直接给出，不藏在 -x 里 */
+        if (rep->reason[0] != '\0') printf("    %s\n", rep->reason);
         return;
     }
 

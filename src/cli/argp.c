@@ -215,5 +215,10 @@ int omnic_parse_args(int argc, char **argv, omnic_args *a) {
         fprintf(stderr, "omnic: --list and --file are mutually exclusive\n");
         return 1;
     }
+    if (strcmp(a->cmd, "pack") == 0 && (a->opts.codec != NULL || a->opts.level != 0)) {
+        fprintf(stderr, "omnic: -c/--codec and -l/--level do not apply to pack "
+                        "(routing is per-file; use 'omnic c' for a single stream)\n");
+        return 1;
+    }
     return 0;
 }

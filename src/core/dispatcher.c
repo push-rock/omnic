@@ -272,10 +272,11 @@ omnic_status omnic_run_compress(const char *path, const omnic_options *o, omnic_
     rep->klass = d.klass;
     rep->entropy = d.entropy;
 
-    /* 跳过路径（SYS-CMP-003 / 假设 A1） */
+    /* 跳过路径（SYS-CMP-003 / 假设 A1）。-c 手动指定即表达压缩意图，
+     * 视同 -f（pick_codec 的 manual 分支接管），不再需要双开关。 */
     if ((omnic_policy_is_skip(d.pe) || d.klass == OMNIC_CLS_ALREADY_COMPRESSED ||
          d.klass == OMNIC_CLS_RANDOM) &&
-        !(o->flags & OMNIC_F_FORCE)) {
+        !(o->flags & OMNIC_F_FORCE) && o->codec == NULL) {
         rep->skipped = true;
         snprintf(rep->codec, sizeof(rep->codec), "%s", OMNIC_SKIP_CODEC);
         snprintf(rep->reason, sizeof(rep->reason), "%s: %s (entropy %.2f)",
@@ -483,6 +484,18 @@ omnic_status omnic_run_analyze(const char *path, const omnic_options *o, omnic_r
             if (omnic_policy_is_skip(d.pe) || d.klass == OMNIC_CLS_ALREADY_COMPRESSED ||
                 d.klass == OMNIC_CLS_RANDOM) {
                 rep->skipped = true;
+            }
+        }
+        /* -c 手动覆盖：与 run_compress 同语义（-c 即压缩意图），报告手动
+         * codec 而非策略行——否则 analyze 说 skip、c 却真压，自家打脸。
+         * 未知 codec 保持策略输出，压缩路径会给出报错。 */
+        if (o->codec != NULL) {
+            const omnic_codec_ops *mops = omnic_codec_find(o->codec);
+            if (mops != NULL && mops->can_compress) {
+                rep->skipped = false;
+                snprintf(rep->codec, sizeof(rep->codec), "%s", o->codec);
+                rep->level = (o->level > 0) ? o->level : mops->default_level;
+                snprintf(rep->reason, sizeof(rep->reason), "manual: %s", o->codec);
             }
         }
     }

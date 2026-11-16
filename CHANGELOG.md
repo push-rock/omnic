@@ -21,6 +21,23 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
   61,402,164 B); 457 + 105 suite checks green; 5/5 fixture roundtrip
   SHA-identical.
 
+### Fixed — CLI ergonomics
+
+- `pack` now rejects `-c/--codec` and `-l/--level` with a usage error instead
+  of silently ignoring them — pack routing is per-file by design; use
+  `omnic c` for a single forced stream.
+- `-c` now carries compression intent on its own: compressing an
+  already-compressed or random file with an explicit codec no longer also
+  requires `-f` (previously the skip policy fired first and the manual codec
+  was silently unreachable).
+- `analyze` now honors its options. The CLI path previously called the
+  options-less library entry point, so `-c` and `-p` were silently dropped:
+  `analyze -p best_ratio` reported the balanced verdict, and `analyze -c` could
+  say "skip" while `c -c` would actually compress. Both now report what
+  `c`/`pack` would really do.
+- Skip messages on `c` print the `use --force` hint unconditionally instead of
+  hiding it behind `-x`.
+
 ## [0.3.1] — 2026-11-10
 
 ### Added — parallel unpack writes
