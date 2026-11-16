@@ -4,6 +4,28 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
 
 ## [Unreleased]
 
+### Fixed — multithreaded zstd truncation (v0.3.1, data integrity)
+
+- `c`/`pack` with `-T` > 1 on zstd no longer silently truncate output. The
+  streaming loop exited after a single finish call; single-threaded zstd
+  drains its small internal buffer across that call, but the multithreaded
+  job pool holds all output until the end — the first finish filled exactly
+  one output chunk and the loop stopped, producing a cut-off stream
+  (verify/extract then flag the block as corrupted; nothing passes silently,
+  but the packed data is unusable). The finish call now loops until the
+  encoder reports completion. v0.3.1 archives made with zstd and `-T` > 1
+  should be re-packed. Audited the other streaming codecs: xz/lzma loop until
+  STREAM_END, brotli until `IsFinished` — zstd was the only one-shot finalizer.
+
+### Added — multithreaded xz
+
+- `-T` > 1 now multithreads xz encoding through liblzma's stream MT encoder
+  (block size follows the xz CLI convention at 3x dictionary; memory capped at
+  2 GiB with automatic thread reduction). Default stays single-threaded and
+  byte-identical. Silesia 202 MB tarball at best_ratio, single stream:
+  63.0 s -> 11.6 s at `-T 8`, ratio 23.22% -> 23.36% (+0.14 pp from
+  independent block splitting).
+
 ### Fixed — classification trusts content over extensions
 
 - Content magic bytes now outrank file extensions in the routing decision.

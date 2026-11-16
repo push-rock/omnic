@@ -33,16 +33,17 @@ static omnic_status omnic_zstd_compress(omnic_reader *in, omnic_writer *out, int
 
     {
         ZSTD_inBuffer ib = {inbuf, 0, 0};
-        int last = 0;
-        while (!last) {
+        /* 输入阶段：e_continue 直到 reader 枯竭。MT 模式下 e_continue 可能不满额
+         * 消费 ib（作业池饱和），未耗尽时不再 refill，交给下一次调用继续消化。 */
+        for (;;) {
             if (ib.pos == ib.size) {
                 size_t n = omnic_reader_read(in, inbuf, ZC_CHUNK);
                 ib.size = n;
                 ib.pos = 0;
-                last = (n == 0);
+                if (n == 0) break;
             }
             ZSTD_outBuffer ob = {outbuf, outcap, 0};
-            size_t r = ZSTD_compressStream2(cctx, &ob, &ib, last ? ZSTD_e_end : ZSTD_e_continue);
+            size_t r = ZSTD_compressStream2(cctx, &ob, &ib, ZSTD_e_continue);
             if (ZSTD_isError(r)) {
                 ret = OMNIC_E_DATA;
                 goto done;
@@ -51,7 +52,21 @@ static omnic_status omnic_zstd_compress(omnic_reader *in, omnic_writer *out, int
                 ret = OMNIC_E_SYSTEM;
                 goto done;
             }
-            if (last && r == 0) break;
+        }
+        /* 收尾阶段：e_end 循环到 r==0。MT 作业池会把全部输出攒到此刻，
+         * 一个 ob 装不下——只调一次 e_end 会静默截断（v0.3.1 的 pack -T 数据损坏根因）。 */
+        for (;;) {
+            ZSTD_outBuffer ob = {outbuf, outcap, 0};
+            size_t r = ZSTD_compressStream2(cctx, &ob, &ib, ZSTD_e_end);
+            if (ZSTD_isError(r)) {
+                ret = OMNIC_E_DATA;
+                goto done;
+            }
+            if (omnic_writer_write(out, outbuf, ob.pos) != OMNIC_OK) {
+                ret = OMNIC_E_SYSTEM;
+                goto done;
+            }
+            if (r == 0) break;
         }
     }
 done:
