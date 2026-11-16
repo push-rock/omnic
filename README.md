@@ -44,7 +44,7 @@ Binaries are built and fully tested by CI on the tagged commit. To build from so
 **3. Archiving beats zip.** The same real game tree, 152.6 MB (8,586 files):
 
 - The archive is **5.0% smaller than zip** (95.7 vs 100.8 MB); the `--no-skip` tier is **10.2% smaller** (90.5 MB) — deflate caps at 69.2% at every tier, and omnic's default tier reaches **65.8%**;
-- Packing is **1.6× faster than zip -9** (28.8 vs 18.4 MB/s), same tier as default zip (28.8 vs 38.1);
+- Packing is **2.1 s — faster than zip's default 3.8 s and zip -9's 7.9 s**, while 5.0% smaller: classification runs an 8-worker pool by default (3.6 s → 0.7 s of the pack; archives byte-identical to the serial path);
 - Single-file extraction: **8.7 ms — 3.3× faster than zip** (zip CLI 28.3 ms, .NET library 25 ms); full unpack now writes through a parallel worker pool (8 by default, `-T` to tune): 4.3 s → 3.9 s here under Windows Defender — the residual gap to zip (2.6 s) is the antivirus scanning each new file from an unsigned process; exclude the output directory or run AV-free for the full speedup;
 - Capabilities zip lacks: corruption isolation (one flipped bit kills one block — `extracted 7435/8586`, the rest still come out), `--verify` no-write full verification (260 MB/s), `--list` without touching the data region (96 ms);
 - `--per-file` (per-entry random access) and solid (whole-stream max ratio, xz-class 63.2%) are one flag apart;
@@ -56,7 +56,7 @@ Binaries are built and fully tested by CI on the tagged commit. To build from so
 |---|---|---|---|
 | zstd 1.5.7 | .zst | -5..22 | multithreaded |
 | lz4 1.10.0 | .lz4 | 0..12 | level 0 = fast mode, 1..12 = LZ4HC |
-| xz 5.8.4 | .xz | 0..9 | CRC64 |
+| xz 5.8.4 | .xz | 0..9 | CRC64; multithreaded with -T |
 | zlib 1.3.2 | .gz | 0..9 | streaming, multi-member gzip on decompress |
 | zlib-ng 2.3.3 | .gz | 0..9 | same format, faster implementation |
 | libdeflate 1.26 | .gz | 0..12 | whole-buffer API, highest gzip speed |
@@ -85,7 +85,7 @@ omnic list                       list codecs and recognized formats
 
 -p --profile <v>   fast_compress | fast_decompress | best_ratio | balanced
 -c --codec <name>  force a codec            -l --level <n>  codec-native level
--T --threads <n>   workers (zstd pack; unpack writes)    -o --output-dir <dir>
+-T --threads <n>   workers (classify; zstd/xz compress; unpack writes)  -o --output-dir <dir>
 -f --force    overwrite output / compress anyway / --file target exists
 -k --keep     keep the source file (default: removed after success)
 -x --explain  print the decision rationale  -q --quiet
@@ -93,7 +93,7 @@ omnic list                       list codecs and recognized formats
 pack:   --per-file  one block per file (ms single-file extract, worse ratio)
         --no-skip   compress already-compressed assets too (store by default)
         --block-size <MiB>  solid block limit, 1..1024 (default 64)
-unpack: --file <path>  extract only this entry (repeatable)
+unpack: --file <pattern>  extract matching entries (exact path, dir/ prefix, or * glob; repeatable)
         --list         name/size/codec/ratio without touching the data area
         --verify       check both CRC layers, write nothing
         -C --dir <dir> output root
@@ -101,11 +101,11 @@ unpack: --file <path>  extract only this entry (repeatable)
 
 ## Measured results
 
-All numbers measured on one machine (i7-12700, single thread, best of rounds); reproduction tools ship with the build: `omnic_bench` (codec level), `omnic_gamepack` (archive level).
+All numbers measured on one machine (i7-12700, best of rounds); reproduction tools ship with the build: `omnic_bench` (codec level), `omnic_gamepack` (archive level). Pack classification runs an 8-worker pool by default; codec compression is single-threaded unless `-T` is set — parallel and serial output are byte-identical.
 
 **The headline numbers** — one figure per line, sources in the tables below:
 
-1. **Packing the same 152.6 MB game tree: the archive is 5.0% smaller than zip** (95.7 vs 100.8 MB); the `--no-skip` tier reaches **90.5 MB, 10.2% smaller**. deflate caps at 69.2% at every tier; omnic's default tier is 65.8%.
+1. **Packing the same 152.6 MB game tree: the archive is 5.0% smaller than zip** (95.7 vs 100.8 MB) **and packs faster** (2.1 vs 3.8 s); the `--no-skip` tier reaches **90.5 MB, 10.2% smaller**. deflate caps at 69.2% at every tier; omnic's default tier is 65.8%.
 2. **Extracting one file out of 8,586 entries: 3.3× faster** — omnic 8.7 ms, zip CLI 28.3 ms, .NET library 25 ms.
 3. **Per-file algorithm selection lands within +1.4% of the theoretical optimum** (72-file hindsight control); fixed `zstd -19` is +7.7%, fixed `brotli -11` +3.2%.
 4. **At equal compress speed, 6.2% smaller than `zstd -19`**; versus `gzip -9` a clean sweep: **8.6% smaller, 2.2× faster compression, 2.1× faster decompression**.
@@ -145,7 +145,7 @@ All numbers measured on one machine (i7-12700, single thread, best of rounds); r
 
 ![Speed-ratio frontier: omnic owns the frontier; gzip -9 and zstd -19 are strictly dominated](assets/adv_speed.png)
 
-- How it decides: extension routing + 8 features refined into 7 content classes, table lookup yields `(codec, level)`; for large files the `fast_compress` profile trial-compresses its top-2 candidates within a 50 ms budget; `--explain` prints the whole chain. The decision table is fitted from a 22-distribution × 44-config benchmark matrix and ships only after passing a leave-one-out regret bound (ρ ≤ 1.0 pp).
+- How it decides: content magic bytes outrank the extension (a renamed PNG still passes through; text renamed to .jpg still compresses), then extension routing + 8 features refined into 7 content classes, table lookup yields `(codec, level)`; for large files the `fast_compress` profile trial-compresses its top-2 candidates within a 50 ms budget; `--explain` prints the whole chain. The decision table is fitted from a 22-distribution × 44-config benchmark matrix and ships only after passing a leave-one-out regret bound (ρ ≤ 1.0 pp).
 - Codec-level landscape (Silesia, 212 MiB standard corpus, measured with `omnic_bench`):
 
 ![codec landscape](assets/bench.svg)
@@ -158,14 +158,14 @@ A 152.6 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files 
 
 | option | ratio | archive size | vs zip | pack | single-file extract |
 |---|---|---|---|---|---|
-| zip (deflate default) | 69.22% | 100.8 MB | — | **3.8 s** | 28.3 ms |
+| zip (deflate default) | 69.22% | 100.8 MB | — | 3.8 s | 28.3 ms |
 | zip -9 (deflate max) | 69.15% | 100.7 MB | -0.1% | 7.9 s | 28.3 ms |
-| **omnic pack** (solid, default) | **65.77%** | **95.7 MB** | **-5.0%** | 5.0 s | 67 ms |
-| omnic pack --per-file | 68.4% | 99.6 MB | -1.2% | 8.4 s | **8.7 ms** |
-| omnic pack --no-skip | **62.2%** | **90.5 MB** | **-10.2%** | 18.9 s | 67 ms |
-| omnic pack -p best_ratio | 63.2% | 92.0 MB | -8.7% | 23.9 s | 67 ms |
+| **omnic pack** (solid, default) | **65.77%** | **95.7 MB** | **-5.0%** | **2.1 s** | 67 ms |
+| omnic pack --per-file | 68.4% | 99.6 MB | -1.2% | 5.8 s | **8.7 ms** |
+| omnic pack --no-skip | **62.2%** | **90.5 MB** | **-10.2%** | 16.2 s | 67 ms |
+| omnic pack -p best_ratio | 63.2% | 92.0 MB | -8.7% | 24.2 s | 67 ms |
 
-- deflate caps at 69.2% no matter the tier (-9 spends 2.1× the time for 0.07 pp); omnic's default tier reaches 65.8% — **5.0% smaller** — and packs 1.6× faster than zip -9 (throughput 28.8 vs 18.4 MB/s).
+- deflate caps at 69.2% no matter the tier (-9 spends 2.1× the time for 0.07 pp); omnic's default tier reaches 65.8% — **5.0% smaller** — and now packs the tree in **2.1 s vs 3.8 s** for zip's default (1.8×; 3.8× vs zip -9's 7.9 s). Classification — 8,586 file opens and 3-segment samples, filesystem/antivirus latency rather than CPU — used to dominate the 5.0 s pack; an 8-worker pool (default, `-T` to tune) cuts it from 3.6 s to 0.7 s. Serial and parallel runs produce byte-identical archives.
 - Single-file extraction: pulling one 6 KB Lua file from 8,586 entries — omnic `--per-file` 8.7 ms (process start included), zip CLI 28.3 ms, .NET library (ZipFile + stream copy) 25 ms — **3.3× faster**; solid mode 67 ms (the cost of reading and decoding one whole 64 MiB block).
 - Unpack wall clock: 4.3 s serial → **3.9 s** with the default 8 write workers (3.6 s at `-T 2`) vs 2.6 s for signed tar.exe on the same zip. Breakdown: no-write decode+verify 0.56 s vs 0.36 s (deflate decode is inherently fast, and omnic adds a per-block CRC — the price of corruption isolation); the rest is file creation, and on this machine most of that is Windows Defender real-time scanning every file an unsigned process creates (a plain robocopy of the same tree costs 3.7 s; signed tar.exe pays none of the AV tax). Exclude the output directory from Defender — or run on Linux/macOS — and the parallel writers deliver their full speedup.
 - Corruption isolation: every block carries a CRC-32; one flipped bit kills one block, extraction names the first ten affected files, then continues (`extracted 7435/8586 files`, exit code 2). A zip with a damaged central directory usually gives you nothing. `--list` reads only the tail index: 8,586 entries in 96 ms.
@@ -182,6 +182,19 @@ A 152.6 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files 
 
 - balanced wins both axes: **3.2 pp smaller ratio and 2.1× the pack speed**; `fast_decompress` matches zip's ratio at 3.6× the speed; `best_ratio` sits 9.2 pp below zip — the archival tier.
 - Losses recorded: full unpack of this big-file corpus is 0.83 s vs zip's 0.37 s (solid zstd decode plus the per-block CRC isolation tax; the parallel-write path targets many-file trees like the one above). `--file` extraction of the 10 MB member takes 48 ms — decode-bound; the 8.7 ms headline is a 6 KB file.
+
+**The 7-Zip cross-check** (same machine and window, Silesia 12-file tree — 7zr 26.06, LZMA2):
+
+| option | ratio | pack |
+|---|---|---|
+| **omnic default (balanced)** | 28.97% | **2.40 s** |
+| 7z -mx=5 (its default) | 23.40% | 24.45 s |
+| omnic `-p best_ratio` | 23.02% | 90.5 s |
+| 7z -mx=9 (its max) | **22.99%** | 50.8 s |
+
+- The default tiers are different animals: omnic's is a speed tier (**10× faster**, 5.6 pp larger); 7-Zip's default is already a ratio tier.
+- Max tiers tie on ratio (0.03 pp) while 7-Zip packs this many-file shape 1.8× faster — its LZMA2 threads by default, omnic's buckets stay serial (`-T 8` closes the gap to 81 s; on a single stream, threaded xz flips the axis outright — the 202 MiB Silesia tar at `best_ratio -T 8` runs 63.0 s → **11.6 s** at +0.14 pp). Bucket-level parallel compression is the next work item.
+- 7-Zip also wins GUI, encryption, format breadth and 25 years of maturity — it stays installed here. omnic bets on per-file routing, pass-through and corruption isolation, not on replacing it.
 
 **Whole-stream max compression** (tar the tree, then one stream — the lzbench / Oodle published protocol):
 
