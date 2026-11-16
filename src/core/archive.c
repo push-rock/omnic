@@ -1161,6 +1161,44 @@ static void pool_shutdown(arc_pool *p) {
     for (int i = 0; i < p->nworkers; i++) arc_thread_join(p->tid[i]);
 }
 
+/* --file 模式匹配三种：尾 '/' 目录前缀、含 * / ? 走 glob、其余精确路径。
+ * glob 极简实现（无转义，* 跨 /，大小写敏感——条目名在归档内原样保留）。 */
+static int glob_match(const char *pat, const char *s) {
+    const char *star = NULL, *ss = NULL;
+    while (*s != '\0') {
+        if (*pat == *s || *pat == '?') {
+            pat++;
+            s++;
+        } else if (*pat == '*') {
+            star = pat++;
+            ss = s;
+        } else if (star != NULL) {
+            pat = star + 1;
+            s = ++ss;
+        } else {
+            return 0;
+        }
+    }
+    while (*pat == '*') pat++;
+    return *pat == '\0';
+}
+
+static int name_matches(const char *pat, size_t pat_len, const char *name) {
+    if (pat_len > 0 && pat[pat_len - 1] == '/') {
+        size_t pl = pat_len - 1;
+        return strncmp(name, pat, pl) == 0 && (name[pl] == '/' || name[pl] == '\0');
+    }
+    int has_glob = 0;
+    for (size_t i = 0; i < pat_len; i++) {
+        if (pat[i] == '*' || pat[i] == '?') {
+            has_glob = 1;
+            break;
+        }
+    }
+    if (has_glob) return glob_match(pat, name);
+    return strcmp(pat, name) == 0;
+}
+
 /* unpack_core：整树提取 / --file 过滤提取 / --verify 校验三种形态共用。
  * only!=NULL 时仅解命中条目所在块；verify_only 时不落盘只验双层 CRC。 */
 static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
@@ -1178,7 +1216,7 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
     omnic_status ost = arc_open_index(archive_path, &f, &ix);
     if (ost != OMNIC_OK) return ost;
 
-    /* --file 名匹配：未命中即用法错误（可操作）；命中标记条目与所需块 */
+    /* --file 名匹配（精确/目录前缀/glob 三种）：零命中即用法错误（可操作） */
     unsigned char *want_ent = NULL, *want_blk = NULL;
     size_t *blk_cnt = NULL, *blk_off = NULL, *ent_ord = NULL;
     if (n_only > 0) {
@@ -1187,16 +1225,17 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
         if (want_ent == NULL || want_blk == NULL) goto sys_fail_ix;
         size_t missing = 0;
         for (size_t k = 0; k < n_only; k++) {
-            size_t i;
-            for (i = 0; i < ix.nent; i++) {
-                if (ix.ent[i].type == 0 && strcmp(ix.ent[i].name, only[k]) == 0) break;
-            }
-            if (i == ix.nent) {
-                fprintf(stderr, "omnic: --file not in archive: %s\n", only[k]);
-                missing++;
-            } else {
+            size_t hit = 0;
+            for (size_t i = 0; i < ix.nent; i++) {
+                if (ix.ent[i].type != 0) continue;
+                if (!name_matches(only[k], strlen(only[k]), ix.ent[i].name)) continue;
                 want_ent[i] = 1;
                 want_blk[ix.ent[i].block_id] = 1;
+                hit++;
+            }
+            if (hit == 0) {
+                fprintf(stderr, "omnic: --file not in archive: %s\n", only[k]);
+                missing++;
             }
         }
         if (missing > 0) {

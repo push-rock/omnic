@@ -21,6 +21,15 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
   61,402,164 B); 457 + 105 suite checks green; 5/5 fixture roundtrip
   SHA-identical.
 
+### Added — `--file` patterns
+
+- `unpack --file` now takes patterns in three forms: an exact entry path
+  (unchanged), a directory prefix (`--file src/` extracts the whole subtree),
+  or a glob (`--file "*.lua"`). Globs match the full stored path, `*` crosses
+  `/`, matching is case-sensitive. A pattern that matches nothing is still a
+  usage error — all-or-nothing semantics are unchanged, and single-pattern
+  single-file extraction keeps its 8.7 ms headline path.
+
 ### Fixed — CLI ergonomics
 
 - `pack` now rejects `-c/--codec` and `-l/--level` with a usage error instead
