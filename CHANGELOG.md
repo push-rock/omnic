@@ -4,6 +4,23 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
 
 ## [Unreleased]
 
+### Fixed — classification trusts content over extensions
+
+- Content magic bytes now outrank file extensions in the routing decision.
+  A renamed PNG/ZIP/JPEG is passed through untouched instead of being
+  pointlessly recompressed; text renamed to `.jpg` is compressed instead of
+  being stored raw (previously the extension's claim was final).
+- Entropy guardrail both ways: an extension claiming "already compressed" is
+  revoked when sampled entropy is clearly compressible (< 7.5 bits/byte);
+  text/structured claims are revoked at ≥ 7.5, so random data named `.txt`
+  is skipped instead of white-compressed.
+- PDF content is deliberately not asserted by magic: PDFs mix raw and Flate
+  streams (Silesia's `reymont` is one — entropy 4.79, compresses 3×), so the
+  `already compressed` verdict for PDFs stays extension-only.
+- Regression: Silesia 12-file pack unchanged to the byte (28.97%,
+  61,402,164 B); 457 + 105 suite checks green; 5/5 fixture roundtrip
+  SHA-identical.
+
 ## [0.3.1] — 2026-11-10
 
 ### Added — parallel unpack writes

@@ -112,6 +112,19 @@ static omnic_status decide(FILE *f, const char *path, const omnic_options *o, om
     d->file_size = sz;
 
     d->klass = omnic_classify_ext(path);
+    /* 内容优先于扩展名（SW-DET-004）：magic 命中直接定类，防伪后缀误路由
+     * （改名 jpg/png 按内容正确跳过）。扩展名与熵矛盾时撤销重判：
+     * 声称已压缩但熵可压、或声称文本/结构化但熵≥SKIP，都降回 UNKNOWN
+     * 交由 RANDOM 逃生门或 γ 细分按实际内容裁决。 */
+    omnic_class mcls = omnic_classify_magic(seg, hn);
+    if (mcls != OMNIC_CLS_UNKNOWN) {
+        d->klass = mcls;
+    } else if (d->klass == OMNIC_CLS_ALREADY_COMPRESSED && d->entropy < OMNIC_ENTROPY_SKIP) {
+        d->klass = OMNIC_CLS_UNKNOWN;
+    } else if ((d->klass == OMNIC_CLS_TEXT || d->klass == OMNIC_CLS_STRUCTURED) &&
+               d->entropy >= OMNIC_ENTROPY_SKIP) {
+        d->klass = OMNIC_CLS_UNKNOWN;
+    }
     if (d->klass == OMNIC_CLS_UNKNOWN && d->entropy >= OMNIC_ENTROPY_SKIP) {
         d->klass = OMNIC_CLS_RANDOM; /* SW-DET-003 */
     } else {

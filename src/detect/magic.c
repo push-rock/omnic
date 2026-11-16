@@ -82,3 +82,43 @@ omnic_fmt_id omnic_detect(const char *path, const uint8_t *head, size_t n) {
     if (f != OMNIC_FMT_UNKNOWN) return f;
     return omnic_detect_ext(path);
 }
+
+/* 压缩侧内容分类：head 无 magic 命中返回 UNKNOWN，由调用方接熵/扩展名裁决。
+ * 压缩流格式直接复用 omnic_detect_magic——解压端认识的格式必然已压缩。
+ * 只收录"重压必然徒劳"的内部压缩格式；PDF 内层是 raw/Flate 混合体（常见熵<7.5），
+ * 内容侧不做已压缩断言，仅由 .pdf 扩展名走既定策略。 */
+typedef struct {
+    uint8_t bytes[8];
+    uint8_t len;
+    omnic_class cls;
+} omnic_media_magic;
+
+static const omnic_media_magic g_media_magic[] = {
+    {{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, 8, OMNIC_CLS_ALREADY_COMPRESSED}, /* PNG */
+    {{0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C}, 6, OMNIC_CLS_ALREADY_COMPRESSED},             /* 7z */
+    {{0x52, 0x61, 0x72, 0x21, 0x1A, 0x07}, 6, OMNIC_CLS_ALREADY_COMPRESSED},              /* Rar! */
+    {{0x1A, 0x45, 0xDF, 0xA3}, 4, OMNIC_CLS_ALREADY_COMPRESSED},                          /* mkv/webm */
+    {{0x47, 0x49, 0x46, 0x38}, 4, OMNIC_CLS_ALREADY_COMPRESSED},                          /* GIF8 */
+    {{0x50, 0x4B, 0x03, 0x04}, 4, OMNIC_CLS_ALREADY_COMPRESSED},                          /* PK zip */
+    {{0x4F, 0x67, 0x67, 0x53}, 4, OMNIC_CLS_ALREADY_COMPRESSED},                          /* OggS */
+    {{0x66, 0x4C, 0x61, 0x43}, 4, OMNIC_CLS_ALREADY_COMPRESSED},                          /* fLaC */
+    {{0xFF, 0xD8, 0xFF}, 3, OMNIC_CLS_ALREADY_COMPRESSED},                                /* JPEG */
+    {{0x49, 0x44, 0x33}, 3, OMNIC_CLS_ALREADY_COMPRESSED},                                /* ID3 (mp3) */
+    {{0x42, 0x4D}, 2, OMNIC_CLS_MEDIA_RAW},                                               /* BM (bitmap) */
+};
+
+omnic_class omnic_classify_magic(const uint8_t *head, size_t n) {
+    if (omnic_detect_magic(head, n) != OMNIC_FMT_UNKNOWN) return OMNIC_CLS_ALREADY_COMPRESSED;
+    for (size_t i = 0; i < sizeof(g_media_magic) / sizeof(g_media_magic[0]); i++) {
+        if (n >= g_media_magic[i].len && memcmp(head, g_media_magic[i].bytes, g_media_magic[i].len) == 0) {
+            return g_media_magic[i].cls;
+        }
+    }
+    /* 偏移 magic：mp4/mov（"ftyp"@4）、RIFF 容器子类型@8（未知子类型返回 UNKNOWN 交熵裁决） */
+    if (n >= 8 && memcmp(head + 4, "ftyp", 4) == 0) return OMNIC_CLS_ALREADY_COMPRESSED;
+    if (n >= 12 && memcmp(head, "RIFF", 4) == 0) {
+        if (memcmp(head + 8, "WAVE", 4) == 0) return OMNIC_CLS_MEDIA_RAW;
+        return OMNIC_CLS_ALREADY_COMPRESSED; /* WEBP/AVI 等 */
+    }
+    return OMNIC_CLS_UNKNOWN;
+}
