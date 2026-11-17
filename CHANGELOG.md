@@ -2,7 +2,20 @@
 
 All notable changes to omnic. Format follows [Keep a Changelog](https://keepachangelog.com); versioning is semantic.
 
-## [Unreleased]
+## [0.3.2] — 2026-11-17
+
+### Fixed — multithreaded zstd truncation (v0.3.1, data integrity)
+
+- `c`/`pack` with `-T` > 1 on zstd no longer silently truncate output. The
+  streaming loop exited after a single finish call; single-threaded zstd
+  drains its small internal buffer across that call, but the multithreaded
+  job pool holds all output until the end — the first finish filled exactly
+  one output chunk and the loop stopped, producing a cut-off stream
+  (verify/extract then flag the block as corrupted; nothing passes silently,
+  but the packed data is unusable). The finish call now loops until the
+  encoder reports completion. v0.3.1 archives made with zstd and `-T` > 1
+  should be re-packed. Audited the other streaming codecs: xz/lzma loop until
+  STREAM_END, brotli until `IsFinished` — zstd was the only one-shot finalizer.
 
 ### Added — parallel pack classification
 
@@ -18,19 +31,6 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
   thread. `-x/--explain` and trees under 32 files keep the serial path.
 - `-T` now sets workers for classification, xz/zstd compression and unpack
   writes.
-
-### Fixed — multithreaded zstd truncation (v0.3.1, data integrity)
-
-- `c`/`pack` with `-T` > 1 on zstd no longer silently truncate output. The
-  streaming loop exited after a single finish call; single-threaded zstd
-  drains its small internal buffer across that call, but the multithreaded
-  job pool holds all output until the end — the first finish filled exactly
-  one output chunk and the loop stopped, producing a cut-off stream
-  (verify/extract then flag the block as corrupted; nothing passes silently,
-  but the packed data is unusable). The finish call now loops until the
-  encoder reports completion. v0.3.1 archives made with zstd and `-T` > 1
-  should be re-packed. Audited the other streaming codecs: xz/lzma loop until
-  STREAM_END, brotli until `IsFinished` — zstd was the only one-shot finalizer.
 
 ### Added — multithreaded xz
 
