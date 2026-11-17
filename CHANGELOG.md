@@ -2,6 +2,20 @@
 
 All notable changes to omnic. Format follows [Keep a Changelog](https://keepachangelog.com); versioning is semantic.
 
+## [Unreleased]
+
+### Added — multithreaded regression coverage
+
+- `test_core` compresses a 12 MB corpus with zstd and xz at `-T 2/8` and
+  byte-compares the decompressed result: the corpus compresses to ~9.6 MB,
+  beyond the single output buffer where v0.3.1's zstd truncation hid.
+  Mutation-validated — restoring the old single-finish loop fails the checks.
+- `test_archive` packs the 121-file tree at `-T 1` and `-T 8` and asserts
+  byte-identical archives, locking the classification-determinism promise.
+- CI gained a Linux/clang ThreadSanitizer job instrumenting the whole tree
+  (worker pools and multithreaded codecs included), running the core and
+  archive suites.
+
 ## [0.3.2] — 2026-11-17
 
 ### Fixed — multithreaded zstd truncation (v0.3.1, data integrity)

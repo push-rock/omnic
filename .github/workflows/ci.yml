@@ -15,6 +15,9 @@ jobs:
             cc: gcc
           - os: ubuntu-22.04
             cc: clang
+          - os: ubuntu-22.04
+            cc: clang
+            san: tsan
           - os: macos-15
             cc: clang
           - os: windows-latest
@@ -26,8 +29,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: configure
-        # CC 环境变量对 VS 生成器无效；windows+gcc 需显式 MinGW 生成器
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.gen && format('-G "{0}"', matrix.gen) || '' }}
+        # CC 环境变量对 VS 生成器无效；windows+gcc 需显式 MinGW 生成器；
+        # tsan 档 Debug + -O1（T13）：三方静态库继承 CFLAGS，全树 instrument
+        shell: bash
+        run: |
+          if [ "${{ matrix.san }}" = "tsan" ]; then
+            cmake -B build -DCMAKE_BUILD_TYPE=Debug \
+              "-DCMAKE_C_FLAGS=-fsanitize=thread -fno-omit-frame-pointer -O1" \
+              -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+          else
+            cmake -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.gen && format('-G "{0}"', matrix.gen) || '' }}
+          fi
         env:
           CC: ${{ matrix.cc }}
       - name: build
@@ -57,7 +69,12 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          ctest --test-dir build --output-on-failure -C Release 2>&1 | tee test.log
+          if [ "${{ matrix.san }}" = "tsan" ]; then
+            # TSan 5-15x 慢：只跑两个池所在的套件，bench/fuzz 冒烟跳过
+            ctest --test-dir build --output-on-failure -R "core|archive" 2>&1 | tee test.log
+          else
+            ctest --test-dir build --output-on-failure -C Release 2>&1 | tee test.log
+          fi
           exit ${PIPESTATUS[0]}
       - name: dump test failures as annotations
         if: failure()

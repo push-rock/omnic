@@ -59,6 +59,11 @@ static void cleanup_all(void) {
                            "omnic_test_rand.zst",
                            "omnic_test_bigz",
                            "omnic_test_bigr",
+                           "omnic_test_mtb",
+                           "omnic_test_mtb.zst",
+                           "omnic_test_mtb.xz",
+                           "omnic_test_dst.zst",
+                           "omnic_test_dst.xz",
                            "omnic_test_trunc.zst",
                            "omnic_test_trunc.gz",
                            "omnic_test_trunc.br",
@@ -133,6 +138,20 @@ static void make_zeros(const char *path, size_t n) {
     unsigned char b[65536] = {0};
     while (n > 0) {
         size_t c = n < sizeof(b) ? n : sizeof(b);
+        fwrite(b, 1, c, f);
+        n -= c;
+    }
+    fclose(f);
+}
+
+/* 随机可打印 ASCII（熵 ~6.5 bits/char）：产物 ~80% 输入，必超单个输出缓冲区
+ * （4,210,688B）——v0.3.1 的 zstd -T 截断只在产物跨缓冲区时现形 */
+static void make_ascii(const char *path, size_t n) {
+    FILE *f = fopen(path, "wb");
+    unsigned char b[65536];
+    while (n > 0) {
+        size_t c = n < sizeof(b) ? n : sizeof(b);
+        for (size_t i = 0; i < c; i++) b[i] = (unsigned char)(32 + (rng() >> 16) % 94);
         fwrite(b, 1, c, f);
         n -= c;
     }
@@ -387,6 +406,33 @@ static void test_big_roundtrip(const char *name) {
         CHECK(rename(out, dst2) == 0);
         CHECK(omnic_decompress(dst2, &o, &rep) == OMNIC_OK);
         CHECK(files_equal(srcs[i], "omnic_test_dst"));
+        rm("omnic_test_dst");
+        rm(dst2);
+        free(out);
+    }
+}
+
+/* MT 回归（T13）：-T>1 的压缩流解压必须逐字节还原。仅 zstd/xz 吃线程；
+ * -T2 与 -T8 产物互不比较——MT 分块合法改变字节，解码等价才是不变量。 */
+static void test_mt_roundtrip(const char *name) {
+    const omnic_codec_ops *ops = omnic_codec_find(name);
+    CHECK(ops != NULL);
+    if (ops == NULL) return;
+
+    for (int t = 2; t <= 8; t *= 4) {
+        omnic_options o = def_opts();
+        o.codec = name;
+        o.threads = t;
+        o.flags |= OMNIC_F_FORCE; /* 随机内容默认跳过 */
+
+        omnic_report rep;
+        CHECK(omnic_compress("omnic_test_mtb", &o, &rep) == OMNIC_OK);
+        char *out = with_ext("omnic_test_mtb", ops->native_ext);
+        char dst2[64];
+        snprintf(dst2, sizeof dst2, "omnic_test_dst.%s", ops->native_ext);
+        CHECK(rename(out, dst2) == 0);
+        CHECK(omnic_decompress(dst2, &o, &rep) == OMNIC_OK);
+        CHECK(files_equal("omnic_test_mtb", "omnic_test_dst"));
         rm("omnic_test_dst");
         rm(dst2);
         free(out);
@@ -1155,6 +1201,7 @@ int main(void) {
     test_decision_latency();
     make_zeros("omnic_test_bigz", (4u << 20) + 700000); /* 解压跨 4MB 输出 flush */
     make_random("omnic_test_bigr", 5u << 20);           /* 产物超 4MB 输入块 */
+    make_ascii("omnic_test_mtb", 12u << 20);            /* 产物 ~9.6MB：超单输出缓冲区 */
     test_big_roundtrip("zstd");
     test_big_roundtrip("lz4");
     test_big_roundtrip("xz");
@@ -1167,11 +1214,14 @@ int main(void) {
     test_big_roundtrip("zlib-stream");
     test_big_roundtrip("raw-deflate");
     test_big_roundtrip("lzma");
+    test_mt_roundtrip("zstd"); /* MT 截断回归：产物超 4,210,688B 时现形 */
+    test_mt_roundtrip("xz");
     rm(SRC);
     rm("omnic_test_rand.png");
     rm("omnic_test_rand.png.zst");
     rm("omnic_test_bigz");
     rm("omnic_test_bigr");
+    rm("omnic_test_mtb");
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

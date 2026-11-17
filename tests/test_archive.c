@@ -187,6 +187,29 @@ static int tree_equal(const char *a, const char *b) {
     return ok;
 }
 
+static int files_equal(const char *a, const char *b) {
+    FILE *fa = omnic_fs_fopen(a, "rb"), *fb = omnic_fs_fopen(b, "rb");
+    if (fa == NULL || fb == NULL) {
+        if (fa) fclose(fa);
+        if (fb) fclose(fb);
+        return 0;
+    }
+    char ba[64 * 1024], bb[64 * 1024];
+    size_t na, nb;
+    do {
+        na = fread(ba, 1, sizeof(ba), fa);
+        nb = fread(bb, 1, sizeof(bb), fb);
+        if (na != nb || memcmp(ba, bb, na) != 0) {
+            fclose(fa);
+            fclose(fb);
+            return 0;
+        }
+    } while (na == sizeof(ba));
+    fclose(fa);
+    fclose(fb);
+    return 1;
+}
+
 static omnic_options mkopts(unsigned flags, int block_mib) {
     omnic_options o;
     memset(&o, 0, sizeof(o));
@@ -836,6 +859,27 @@ static void test_parallel(void) {
     rm_tree(TREE2);
 }
 
+/* ---- T13 pack 确定性：分类池串行/并行产物逐字节相同（README 承诺的不变量）。
+ * 桶压缩不吃 threads，两档唯一差异是分类路径；121 文件超 ARC_PAR_MIN_JOBS(32)
+ * 强制并行。 ---- */
+static void test_pack_determinism(void) {
+    make_tree_big();
+
+    omnic_options o1 = mkopts(OMNIC_F_QUIET, 0);
+    o1.threads = 1;
+    CHECK(pack_tree(TREE2, "omnic_arc_det1.omnic", o1) == OMNIC_OK);
+
+    omnic_options o8 = mkopts(OMNIC_F_QUIET, 0);
+    o8.threads = 8;
+    CHECK(pack_tree(TREE2, "omnic_arc_det8.omnic", o8) == OMNIC_OK);
+
+    CHECK(files_equal("omnic_arc_det1.omnic", "omnic_arc_det8.omnic"));
+
+    rm_tree(TREE2);
+    remove("omnic_arc_det1.omnic");
+    remove("omnic_arc_det8.omnic");
+}
+
 int main(void) {
     test_roundtrip();
     test_roundtrip_edges();
@@ -845,6 +889,7 @@ int main(void) {
     test_malformed();
     test_bounds();
     test_parallel();
+    test_pack_determinism();
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }
