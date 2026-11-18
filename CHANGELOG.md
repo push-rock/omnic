@@ -14,7 +14,10 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
   byte-identical archives, locking the classification-determinism promise.
 - CI gained a Linux/clang ThreadSanitizer job instrumenting the whole tree
   (worker pools and multithreaded codecs included), running the core and
-  archive suites.
+  archive suites. Two real-time budget tests (trial compress, decision
+  latency) skip under TSan — their 50 ms budgets assume native speed and
+  the instrumented entropy scan runs ~40x slower; all correctness checks
+  still run.
 
 ## [0.3.2] — 2026-11-17
 

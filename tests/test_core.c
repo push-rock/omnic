@@ -1154,6 +1154,11 @@ static void test_compressz_decode(void) {
 /* DoD #6（SYS-CMP-002）：决策延迟——4MB 特征提取 + 分类查表 ≤ 50ms（不含磁盘 I/O）。
  * Windows CRT 的 clock() 粒度 ~15ms，单次几毫秒测不出，跑多轮取平均。 */
 static void test_decision_latency(void) {
+    if (OMNIC_TSAN_BUILD) {
+        /* TSan 对熵扫描的减速远超套件均值（实测 1.09ms → 50ms+），预算断言无意义 */
+        printf("note: decision latency budget skipped under ThreadSanitizer\n");
+        return;
+    }
     enum { N = 4u * 1024u * 1024u, ROUNDS = 64 };
     uint8_t *buf = (uint8_t *)malloc(N);
     CHECK(buf != NULL);
