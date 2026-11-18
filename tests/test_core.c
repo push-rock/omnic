@@ -28,6 +28,15 @@ static int g_run = 0;
         }                                                                    \
     } while (0)
 
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define OMNIC_TSAN_BUILD 1
+#endif
+#endif
+#ifndef OMNIC_TSAN_BUILD
+#define OMNIC_TSAN_BUILD 0
+#endif
+
 static const char *SRC = "omnic_test_src.txt";
 static const char *DST_FMT = "omnic_test_dst.tmp";
 
@@ -293,6 +302,11 @@ static void test_feature(void) {
  * （2nd: lz4/0）触发试压，自然文本上 zstd 的 ρ 胜 lz4（一期实测）。
  * 无扩展名会落 UNKNOWN 兜底（熵细分，不走文本特征），不触发试压。 */
 static void test_trial(void) {
+    if (OMNIC_TSAN_BUILD) {
+        /* TSan 减速 5-15 倍撑爆试压 50ms 实时预算，胜者不定——纯时序断言豁免 */
+        printf("note: test_trial skipped under ThreadSanitizer\n");
+        return;
+    }
     omnic_options o = def_opts();
     omnic_report rep;
     const char *path = "omnic_test_trial.txt";
