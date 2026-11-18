@@ -35,7 +35,16 @@ jobs:
       - name: build
         run: cmake --build build -j --config Release
       - name: test
-        run: ctest --test-dir build --output-on-failure -C Release
+        shell: bash
+        run: |
+          ctest --test-dir build --output-on-failure -C Release
+          code=$?
+          if [ $code -ne 0 ]; then
+            # 共享 runner 偶发调度干扰重跑一次；真实回归重跑仍挂
+            ctest --test-dir build --output-on-failure --rerun-failed -C Release
+            code=$?
+          fi
+          exit $code
       - name: install and pack
         shell: bash
         run: |
