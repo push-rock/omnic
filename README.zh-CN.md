@@ -21,7 +21,16 @@ gamedir/: 152644069 -> 100395194 bytes (65.77%), 4.99s
 
 ## 获取
 
-**Linux / macOS / Windows** 预编译二进制挂在每个 [GitHub Release](https://github.com/push-rock/omnic/releases)，免安装、零运行时依赖。可执行文件在归档内的 `bin/omnic`（Windows 为 `bin\omnic.exe`），放进 `PATH` 即可。
+**Windows（scoop）**：
+
+```
+scoop bucket add omnic https://github.com/push-rock/omnic-bucket
+scoop install omnic
+```
+
+**winget**：`winget install push-rock.omnic`（包提交审核中——落地前用 scoop 或下面的二进制）。
+
+**Linux / macOS / Windows** 预编译二进制挂在每个 [GitHub Release](https://github.com/push-rock/omnic/releases)，免安装、零运行时依赖。可执行文件在归档内的 `bin/omnic`（Windows 为 `bin\omnic.exe`），放进 `PATH` 即可。一页看完所有实测数字：[BENCHMARK.md](BENCHMARK.md)。
 
 二进制未做代码签名（开源预算）：
 

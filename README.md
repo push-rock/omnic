@@ -21,7 +21,16 @@ gamedir/: 152644069 -> 100395194 bytes (65.77%), 4.99s
 
 ## Get it
 
-Prebuilt binaries — **Linux, macOS, Windows**, no installer, no runtime dependencies — are attached to every [GitHub Release](https://github.com/push-rock/omnic/releases). The executable is `bin/omnic` inside the archive (`bin\omnic.exe` on Windows); drop it anywhere on your `PATH`.
+**Windows (scoop)**:
+
+```
+scoop bucket add omnic https://github.com/push-rock/omnic-bucket
+scoop install omnic
+```
+
+**winget**: `winget install push-rock.omnic` (package submission in review — until it lands, use scoop or the binaries below).
+
+Prebuilt binaries — **Linux, macOS, Windows**, no installer, no runtime dependencies — are attached to every [GitHub Release](https://github.com/push-rock/omnic/releases). The executable is `bin/omnic` inside the archive (`bin\omnic.exe` on Windows); drop it anywhere on your `PATH`. For the numbers behind the pitch on one page, see [BENCHMARK.md](BENCHMARK.md).
 
 The binaries are not code-signed (open-source budget):
 
