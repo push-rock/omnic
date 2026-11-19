@@ -2,7 +2,7 @@
 
 All notable changes to omnic. Format follows [Keep a Changelog](https://keepachangelog.com); versioning is semantic.
 
-## [Unreleased]
+## [0.3.3] — 2026-11-19
 
 ### Changed — parallel block compression in pack (T12)
 
