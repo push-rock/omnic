@@ -31,6 +31,9 @@ void omnic_reader_fini(omnic_reader *r);
 size_t omnic_reader_read(omnic_reader *r, void *buf, size_t want);
 omnic_status omnic_reader_unread(omnic_reader *r, const void *buf, size_t n);
 uint64_t omnic_reader_total(const omnic_reader *r);
+/* 剩余未读总长（mem 后端精确；文件后端 = 文件长 - 已读，探测读计入已读）。
+ * 返回 UINT64_MAX 表示未知（文件后端 stat 失败）。codec 尺寸感知用（A2）。 */
+uint64_t omnic_reader_avail(const omnic_reader *r);
 
 void omnic_writer_init(omnic_writer *w, FILE *f);
 /* 内存后端：写入 realloc 缓冲；drain 转移所有权（*len 可为 NULL） */

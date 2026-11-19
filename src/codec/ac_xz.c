@@ -107,6 +107,16 @@ done:
  * 超预算自动降线程，地板 2——宁可慢也要能跑。 */
 #define XZ_MT_MEM_CAP ((uint64_t)2 << 30)
 
+/* 小输入字典右调（A2）：匹配距离不可能超过输入长度，avail 已知且 < 8MiB 时
+ * 字典取 2 的幂紧上界（LZMA 字典约束），上限 preset 默认。大输入/未知尺寸
+ * 一律全尺寸——行为与旧版逐字节一致。 */
+static uint32_t lz_small_dict(uint64_t avail, uint32_t preset_dict) {
+    if (avail == UINT64_MAX || avail == 0 || avail >= (8u << 20)) return preset_dict;
+    uint32_t d = 4096; /* LZMA 字典下限 */
+    while ((uint64_t)d < avail) d <<= 1;
+    return d < preset_dict ? d : preset_dict;
+}
+
 static omnic_status omnic_xz_compress(omnic_reader *in, omnic_writer *out, int level, int threads) {
     lzma_stream strm = LZMA_STREAM_INIT;
     if (threads > 1) {
@@ -123,8 +133,30 @@ static omnic_status omnic_xz_compress(omnic_reader *in, omnic_writer *out, int l
                 return OMNIC_E_SYSTEM;
             }
         }
-    } else if (lzma_easy_encoder(&strm, (uint32_t)level, LZMA_CHECK_CRC64) != LZMA_OK) {
-        return OMNIC_E_SYSTEM;
+    } else {
+        /* 单线程小输入：显式 options 编码（dict 右调，A2）。avail 未知或
+         * ≥8MiB 时 lz_small_dict 原样返回 preset 字典，走 easy_encoder，
+         * 产物与旧版逐字节一致。 */
+        uint64_t avail = omnic_reader_avail(in);
+        if (avail != UINT64_MAX) {
+            lzma_options_lzma opt;
+            if (lzma_lzma_preset(&opt, (uint32_t)level) != LZMA_OK) return OMNIC_E_SYSTEM;
+            uint32_t pd = opt.dict_size;
+            opt.dict_size = lz_small_dict(avail, pd);
+            if (opt.dict_size != pd) {
+                lzma_filter filters[2];
+                filters[0].id = LZMA_FILTER_LZMA2;
+                filters[0].options = &opt;
+                filters[1].id = LZMA_VLI_UNKNOWN;
+                filters[1].options = NULL;
+                if (lzma_stream_encoder(&strm, filters, LZMA_CHECK_CRC64) != LZMA_OK)
+                    return OMNIC_E_SYSTEM;
+                return lz_run_encode(in, out, &strm);
+            }
+        }
+        if (lzma_easy_encoder(&strm, (uint32_t)level, LZMA_CHECK_CRC64) != LZMA_OK) {
+            return OMNIC_E_SYSTEM;
+        }
     }
     return lz_run_encode(in, out, &strm);
 }

@@ -41,6 +41,66 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
   as success, and a metadata-ring overwrite when the probe submit
   skipped backpressure) — the gate fails on both when reintroduced.
 
+### Changed — per-file codec path: context reuse and right-sized xz dictionaries (A1/A2)
+
+- The zstd adapter keeps its encoder/decoder contexts and 2×4 MiB chunk
+  buffers in thread-local storage, reset at entry (`ZSTD_*Ctx_reset`,
+  the supported reuse path) — a stream aborted mid-frame would
+  otherwise poison the next one. Per-file packs call the codec once
+  per file, so rebuilding contexts and buffers per call was a fixed
+  tax paid thousands of times. brotli was audited for the same
+  treatment and skipped: the vendored version exposes no instance-reset
+  API, and brotli occupies four decision cells, none on the per-file
+  hot path.
+- The xz encoder sizes its LZMA dictionary to the input when the whole
+  input is known and under 8 MiB (power-of-two ceiling, capped at the
+  preset default): match distances cannot exceed the input length, so
+  nothing is lost — the game-tree best-ratio per-file archive actually
+  came out 133 bytes smaller. Inputs ≥ 8 MiB or of unknown size keep
+  the full preset dictionary: solid blocks, stream mode and the
+  Silesia/dickens regression invariants are byte-identical. This was
+  the real engine behind the slow per-file best-ratio story — each
+  small block paid a full preset-dictionary setup, not decoder-context
+  churn as the old roadmap note assumed.
+- Measured on the 152.6 MB game tree, same window, best of 3:
+  `--per-file` pack 2.50 s → **1.75 s** (-30%), `--per-file -p
+  best_ratio` 20.8 s → **6.0 s** (-71%); the balanced per-file product
+  is byte-identical to 0.3.2 (SHA-256-verified).
+- Gates: `test_ctx_reuse` (three clean zstd roundtrips in a row, then a
+  truncated stream followed by a good one — removing the reset fails
+  it, the exact 10-red shape caught during development) and
+  `test_xz_small_dict` (parses the xz block header's LZMA2 filter
+  props — a format-spec field, stable across liblzma versions — and
+  asserts a 100 KB input declares a 128 KiB dictionary; reverting to
+  full preset dictionaries fails it; boundary sizes 1 B … 1 MiB+1
+  roundtrip).
+
+### Changed — parallel block decode for unpack/verify (B)
+
+- `unpack` and `--verify` decode blocks through a worker pool using
+  the same dispatch-order receipt pattern as pack: workers read the
+  archive through independent handles and decompress, the main thread
+  reaps results in dispatch order — block order, bad-block isolation
+  and per-entry CRC semantics are identical to the serial path.
+  `--file` extraction stays serial (latency-sensitive).
+- The pool is gated on block granularity: `--verify` has no write
+  competition and always benefits, while during unpack with the write
+  pool active it only engages for small blocks — concurrent 64 MiB
+  solid decodes plus 8 writers contend for memory bandwidth (measured
+  +21% on solid unpack; serial decode + parallel writes is already the
+  better pipeline there).
+- Measured on the game tree, same window, best of 3: `--verify`
+  `--per-file` 0.73 s → **0.43 s** (-41%), `--per-file -p best_ratio`
+  1.04 s → **0.46 s** (-56%), solid 0.55 s → **0.42 s** (-24%). Unpack
+  wall clock is unchanged — write-bound on this machine (Defender's
+  per-file tax), with the decode saving sitting inside that noise.
+- Gate `test_decode_pool`: a 66-block per-file archive must unpack to
+  identical trees at `-T 8` and `-T 1`, verify counts must match
+  across thread counts, and a corrupted mid-archive block must kill
+  exactly its own member while both neighbors survive.
+  Mutation-checked: dropping the receipt sequence validation
+  segfaults on the stale-slot path instead of returning wrong data.
+
 ### Added — multithreaded regression coverage
 
 - `test_core` compresses a 12 MB corpus with zstd and xz at `-T 2/8` and

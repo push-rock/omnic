@@ -1,5 +1,8 @@
 /* zstd adapter（SW-CODEC-001）：frame 流式编解码。
- * 多线程走 zstd 原生 nbWorkers（SYS-PERF-002）；未编译 MT 的库自动降级单线程。 */
+ * 多线程走 zstd 原生 nbWorkers（SYS-PERF-002）；未编译 MT 的库自动降级单线程。
+ * ctx/缓冲线程本地复用（T1/A1）：归档路径每块一调，per-file 是数千次调用，
+ * 每次从零建 DCtx/CCtx + 2×4MiB malloc 是纯固定税。复用是官方支持路径
+ * （参数每次重设，无跨流残留）；进程退出不释放——省去 TLS 析构的顺序问题。 */
 #include <stdlib.h>
 #include <string.h>
 #include <zstd.h>
@@ -8,17 +11,75 @@
 
 #define ZC_CHUNK (4u * 1024u * 1024u)
 
+typedef struct {
+    ZSTD_CCtx *cctx;
+    ZSTD_DCtx *dctx;
+    uint8_t *inbuf;
+    uint8_t *outbuf;
+    size_t outcap;
+    int ok; /* 0=未分配（首调或 OOM 退回后） */
+} zc_tls;
+
+static _Thread_local zc_tls zc;
+
+/* 取 TLS 缓存；任何一步失败置 ok=0，调用方退回一次性分配（正确性优先） */
+static int zc_buf(void) {
+    if (zc.ok) return 0;
+    if (zc.inbuf == NULL) zc.inbuf = (uint8_t *)malloc(ZC_CHUNK);
+    if (zc.outbuf == NULL) {
+        zc.outcap = ZSTD_compressBound(ZC_CHUNK);
+        zc.outbuf = (uint8_t *)malloc(zc.outcap);
+    }
+    if (zc.inbuf == NULL || zc.outbuf == NULL) return -1;
+    zc.ok = 1;
+    return 0;
+}
+
 static omnic_status omnic_zstd_compress(omnic_reader *in, omnic_writer *out, int level, int threads) {
     omnic_status ret = OMNIC_OK;
-    ZSTD_CCtx *cctx = ZSTD_createCCtx();
+    int own = 0; /* 1=本次调用自建对象（TLS 不可用），用毕释放 */
+    ZSTD_CCtx *cctx = zc.cctx;
     uint8_t *inbuf = NULL;
     uint8_t *outbuf = NULL;
     size_t outcap = ZSTD_compressBound(ZC_CHUNK);
 
-    if (cctx == NULL) return OMNIC_E_SYSTEM;
-    inbuf = (uint8_t *)malloc(ZC_CHUNK);
-    outbuf = (uint8_t *)malloc(outcap);
-    if (inbuf == NULL || outbuf == NULL) {
+    if (cctx == NULL) {
+        cctx = ZSTD_createCCtx();
+        if (cctx == NULL) return OMNIC_E_SYSTEM;
+        if (zc_buf() == 0) {
+            zc.cctx = cctx; /* TLS 建成：缓冲并入复用池 */
+            inbuf = zc.inbuf;
+            outbuf = zc.outbuf;
+            outcap = zc.outcap;
+        } else {
+            own = 1; /* 缓冲 OOM：一次性分配，ctx 也随用随放 */
+            inbuf = (uint8_t *)malloc(ZC_CHUNK);
+            outbuf = (uint8_t *)malloc(outcap);
+            if (inbuf == NULL || outbuf == NULL) {
+                free(inbuf);
+                free(outbuf);
+                ZSTD_freeCCtx(cctx);
+                return OMNIC_E_SYSTEM;
+            }
+        }
+    } else if (zc_buf() != 0) {
+        own = 1; /* 缓冲中途失效（理论不可达）：保守退回 */
+        inbuf = (uint8_t *)malloc(ZC_CHUNK);
+        outbuf = (uint8_t *)malloc(outcap);
+        if (inbuf == NULL || outbuf == NULL) {
+            free(inbuf);
+            free(outbuf);
+            return OMNIC_E_SYSTEM;
+        }
+    } else {
+        inbuf = zc.inbuf;
+        outbuf = zc.outbuf;
+        outcap = zc.outcap;
+    }
+
+    /* 复用 CCtx 前复位会话（参数重设在下方 setParameter）：上一流失败退出时
+     * 的半开帧状态不能带进本流。 */
+    if (!own && ZSTD_isError(ZSTD_CCtx_reset(cctx, ZSTD_reset_session_only))) {
         ret = OMNIC_E_SYSTEM;
         goto done;
     }
@@ -70,24 +131,60 @@ static omnic_status omnic_zstd_compress(omnic_reader *in, omnic_writer *out, int
         }
     }
 done:
-    free(inbuf);
-    free(outbuf);
-    ZSTD_freeCCtx(cctx);
+    if (own) {
+        free(inbuf);
+        free(outbuf);
+        ZSTD_freeCCtx(cctx);
+    }
     return ret;
 }
 
 static omnic_status omnic_zstd_decompress(omnic_reader *in, omnic_writer *out) {
     omnic_status ret = OMNIC_OK;
-    ZSTD_DCtx *dctx = ZSTD_createDCtx();
-    uint8_t *inbuf = (uint8_t *)malloc(ZC_CHUNK);
-    uint8_t *outbuf = (uint8_t *)malloc(ZC_CHUNK);
+    int own = 0;
+    ZSTD_DCtx *dctx = zc.dctx;
+    uint8_t *inbuf = NULL;
+    uint8_t *outbuf = NULL;
+
+    if (dctx == NULL) {
+        dctx = ZSTD_createDCtx();
+        if (dctx == NULL) return OMNIC_E_SYSTEM;
+        if (zc_buf() == 0) {
+            zc.dctx = dctx;
+            inbuf = zc.inbuf;
+            outbuf = zc.outbuf;
+        } else {
+            own = 1;
+            inbuf = (uint8_t *)malloc(ZC_CHUNK);
+            outbuf = (uint8_t *)malloc(ZC_CHUNK);
+            if (inbuf == NULL || outbuf == NULL) {
+                free(inbuf);
+                free(outbuf);
+                ZSTD_freeDCtx(dctx);
+                return OMNIC_E_SYSTEM;
+            }
+        }
+    } else if (zc_buf() != 0) {
+        own = 1;
+        inbuf = (uint8_t *)malloc(ZC_CHUNK);
+        outbuf = (uint8_t *)malloc(ZC_CHUNK);
+        if (inbuf == NULL || outbuf == NULL) {
+            free(inbuf);
+            free(outbuf);
+            return OMNIC_E_SYSTEM;
+        }
+    } else {
+        inbuf = zc.inbuf;
+        outbuf = zc.outbuf;
+    }
+    /* 复用 DCtx 前复位：上一流若未消费完（坏流中途退出），残余状态会污染
+     * 下一流的解压（ZSTD_decompressStream 返回 data error）。官方复用路径。 */
+    if (!own && ZSTD_isError(ZSTD_DCtx_reset(dctx, ZSTD_reset_session_only))) {
+        return OMNIC_E_SYSTEM;
+    }
     bool got_any = false;
     size_t last_r = 1;
 
-    if (dctx == NULL || inbuf == NULL || outbuf == NULL) {
-        ret = OMNIC_E_SYSTEM;
-        goto done;
-    }
     {
         ZSTD_inBuffer ib = {inbuf, 0, 0};
         for (;;) {
@@ -114,9 +211,11 @@ static omnic_status omnic_zstd_decompress(omnic_reader *in, omnic_writer *out) {
     }
     if (!got_any || last_r != 0) ret = OMNIC_E_DATA; /* 空输入或截断 */
 done:
-    free(inbuf);
-    free(outbuf);
-    ZSTD_freeDCtx(dctx);
+    if (own) {
+        free(inbuf);
+        free(outbuf);
+        ZSTD_freeDCtx(dctx);
+    }
     return ret;
 }
 

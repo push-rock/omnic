@@ -82,6 +82,25 @@ omnic_status omnic_reader_unread(omnic_reader *r, const void *buf, size_t n) {
 
 uint64_t omnic_reader_total(const omnic_reader *r) { return r->total_in; }
 
+uint64_t omnic_reader_avail(const omnic_reader *r) {
+    if (r->mem != NULL) {
+        uint64_t pend = (uint64_t)r->pend_len;
+        uint64_t rest = (uint64_t)(r->mem_len - r->mem_pos);
+        return pend + rest; /* pend 是 pushback（已读又被退回），计入未读 */
+    }
+    /* 文件后端：当前偏移之后的剩余 + pushback。long 够 2GB 上限内的归档成员；
+     * 更大文件返回未知，codec 退回全尺寸字典（正确性不受影响）。 */
+    long cur = ftell(r->f);
+    if (cur < 0) return UINT64_MAX;
+    if (fseek(r->f, 0, SEEK_END) != 0) return UINT64_MAX;
+    long end = ftell(r->f);
+    if (fseek(r->f, cur, SEEK_SET) != 0) return UINT64_MAX;
+    if (end < cur) return UINT64_MAX;
+    uint64_t rest = (uint64_t)(end - cur);
+    uint64_t pend = (uint64_t)r->pend_len;
+    return pend + rest;
+}
+
 void omnic_writer_init(omnic_writer *w, FILE *f) {
     w->f = f;
     w->mem = NULL;

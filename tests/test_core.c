@@ -82,6 +82,11 @@ static void cleanup_all(void) {
                            "omnic_test_trunc.zz",
                            "omnic_test_trunc.lzma",
                            "omnic_test_trunc.lzvn",
+                           "omnic_test_reuse.zst",
+                           "omnic_test_reuse",
+                           "omnic_test_trunc2.zst",
+                           "omnic_test_sd",
+                           "omnic_test_sd.xz",
                            "omnic_test_lzvn.lzvn",
                            "omnic_test_lzvn",
                            "omnic_test_lzvn_ref",
@@ -529,6 +534,126 @@ static void test_truncated(const char *name) {
     rm("omnic_test_trunc");
     rm(z);
     free(z);
+}
+
+/* A1 门禁：zstd ctx 线程复用的流边界契约。复用 DCtx 若不在入口复位，上一流
+ * 的会话残留会污染下一流——连续好流 ×3 + 截断流（E_DATA 中途弃单）后再接
+ * 好流，两条序列都必须完整还原。删掉 reset 复现的正是 v0.3.3 前的 10 连红。 */
+static void test_ctx_reuse(void) {
+    const omnic_codec_ops *ops = omnic_codec_find("zstd");
+    CHECK(ops != NULL);
+    if (ops == NULL) return;
+    omnic_options o = def_opts();
+    o.codec = "zstd";
+    omnic_report rep;
+
+    for (int round = 0; round < 3; round++) {
+        CHECK(omnic_compress(SRC, &o, &rep) == OMNIC_OK);
+        char *out = with_ext(SRC, "zst");
+        CHECK(rename(out, "omnic_test_reuse.zst") == 0);
+        free(out);
+        CHECK(omnic_decompress("omnic_test_reuse.zst", &o, &rep) == OMNIC_OK);
+        CHECK(files_equal(SRC, "omnic_test_reuse"));
+        rm("omnic_test_reuse");
+        rm("omnic_test_reuse.zst");
+    }
+
+    /* 截断流（坏单）→ 好流：坏单弃单后的 ctx 状态不得影响下一流 */
+    CHECK(omnic_compress(SRC, &o, &rep) == OMNIC_OK);
+    char *out = with_ext(SRC, "zst");
+    CHECK(rename(out, "omnic_test_reuse.zst") == 0);
+    free(out);
+    FILE *f = fopen("omnic_test_reuse.zst", "rb");
+    CHECK(f != NULL);
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fclose(f);
+    CHECK(sz > 16);
+    size_t keep = (size_t)sz / 2;
+    f = fopen("omnic_test_reuse.zst", "rb");
+    unsigned char *part = (unsigned char *)malloc(keep);
+    CHECK(part != NULL);
+    if (part != NULL) {
+        CHECK(fread(part, 1, keep, f) == keep);
+        fclose(f);
+        f = fopen("omnic_test_trunc2.zst", "wb");
+        CHECK(f != NULL);
+        fwrite(part, 1, keep, f);
+        fclose(f);
+        free(part);
+    } else {
+        fclose(f);
+    }
+    CHECK(omnic_decompress("omnic_test_trunc2.zst", &o, &rep) == OMNIC_E_DATA);
+    CHECK(omnic_decompress("omnic_test_reuse.zst", &o, &rep) == OMNIC_OK);
+    CHECK(files_equal(SRC, "omnic_test_reuse"));
+    rm("omnic_test_reuse");
+    rm("omnic_test_reuse.zst");
+    rm("omnic_test_trunc2.zst");
+}
+
+/* A2 门禁：xz 小输入字典右调。解析块头 LZMA2 props（xz 格式规范字段，跨版本
+ * 稳定）：100KB 输入声明的字典必须是 128KiB（2 幂紧上界）——回退 preset 全
+ * 尺寸（level 默认 6 → 8MiB）即红。边界尺寸（含 4096/4097 的下限翻转点）走
+ * roundtrip，非法字典值会被编码器当场拒绝。 */
+static void test_xz_small_dict(void) {
+    const omnic_codec_ops *ops = omnic_codec_find("xz");
+    CHECK(ops != NULL);
+    if (ops == NULL) return;
+    omnic_options o = def_opts();
+    o.codec = "xz";
+    omnic_report rep;
+
+    make_ascii("omnic_test_sd", 100000);
+    CHECK(omnic_compress("omnic_test_sd", &o, &rep) == OMNIC_OK);
+    CHECK(rename("omnic_test_sd.xz", "omnic_test_dst.xz") == 0);
+    CHECK(omnic_decompress("omnic_test_dst.xz", &o, &rep) == OMNIC_OK);
+    CHECK(files_equal("omnic_test_sd", "omnic_test_dst"));
+    {
+        FILE *f = fopen("omnic_test_dst.xz", "rb");
+        CHECK(f != NULL);
+        unsigned char hdr[32];
+        if (f != NULL) {
+            CHECK(fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr));
+            fclose(f);
+        } else {
+            memset(hdr, 0, sizeof(hdr));
+        }
+        /* 流头 12B（magic 6 + flags 2 + CRC32 4），块头紧随：尺寸字节 + flags */
+        CHECK(hdr[0] == 0xFD && hdr[1] == 0x37);
+        unsigned bflags = hdr[13];
+        size_t pos = 14;
+        if (bflags & 0x40) { /* 压缩尺寸 VLI */
+            while (pos < sizeof(hdr) && (hdr[pos] & 0x80)) pos++;
+            pos++;
+        }
+        if (bflags & 0x80) { /* 原始尺寸 VLI */
+            while (pos < sizeof(hdr) && (hdr[pos] & 0x80)) pos++;
+            pos++;
+        }
+        CHECK(pos + 2 < sizeof(hdr));
+        CHECK(hdr[pos] == 0x21);   /* LZMA2 滤波器 id（<0x80 单字节 VLI） */
+        CHECK(hdr[pos + 1] == 1);  /* props 尺寸 = 1 */
+        unsigned pbyte = hdr[pos + 2];
+        uint64_t dict = (uint64_t)(2 | (pbyte & 1)) << (pbyte / 2 + 11);
+        CHECK(dict == 128u * 1024u); /* 100KB → 128KiB；回退 8MiB preset 即红 */
+    }
+    rm("omnic_test_sd");
+    rm("omnic_test_dst");
+    rm("omnic_test_dst.xz");
+
+    static const size_t sizes[] = {1,    100,   4095,  4096,     4097,
+                                   65536, 65537, (1u << 20) + 1};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        make_ascii("omnic_test_sd", sizes[i]);
+        CHECK(omnic_compress("omnic_test_sd", &o, &rep) == OMNIC_OK);
+        CHECK(rename("omnic_test_sd.xz", "omnic_test_dst.xz") == 0);
+        CHECK(omnic_decompress("omnic_test_dst.xz", &o, &rep) == OMNIC_OK);
+        CHECK(files_equal("omnic_test_sd", "omnic_test_dst"));
+        rm("omnic_test_sd");
+        rm("omnic_test_dst");
+        rm("omnic_test_dst.xz");
+    }
 }
 
 /* 空文件是经典边界：全部 codec 走一遍空输入 roundtrip */
@@ -1210,6 +1335,8 @@ int main(void) {
     test_truncated("zlib-stream");
     test_truncated("raw-deflate");
     test_truncated("lzma");
+    test_ctx_reuse();
+    test_xz_small_dict();
     test_empty_roundtrip();
     test_gzip_multimember();
     test_snappy_crc();

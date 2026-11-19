@@ -933,6 +933,137 @@ static void test_pack_parallel_blocks(void) {
     rm_tree(T3);
 }
 
+/* B 门禁：解码池保序回执（每文件一块 × 66 块跨 8 worker）。回执错位会把 A 块
+ * 的原始字节配给 B 块的条目——条目 CRC 即红、树即不等。中段坏块在池路径下
+ * 验证隔离语义（受击成员缺失、前后邻完好、退出码 2）；verify 的 -T8/-T1
+ * out_bytes 口径一致。 */
+static void test_decode_pool(void) {
+    static const char *T4 = "omnic_arc_tree4";
+    static const char *A4 = "omnic_arc_dp.omnic";
+    rm_tree(T4);
+    omnic_fs_mkdir_p(T4);
+    static char buf[64 * 1024];
+    char p[512];
+    for (int i = 0; i < 64; i++) {
+        fill_text(buf, sizeof(buf));
+        buf[0] = (char)('a' + i % 26); /* 内容随块序可区分：块交叉必炸 CRC */
+        buf[1] = (char)('A' + i / 26);
+        snprintf(p, sizeof(p), "%s/dp%03d.txt", T4, i);
+        wfile(p, buf, sizeof(buf));
+    }
+    { /* 高熵 + 空：store/零尺寸块混进解码流（decode_block 全返回码路径） */
+        static char rbuf[64 * 1024];
+        for (size_t i = 0; i < sizeof(rbuf); i++) rbuf[i] = (char)rng();
+        snprintf(p, sizeof(p), "%s/rand.bin", T4);
+        wfile(p, rbuf, sizeof(rbuf));
+        snprintf(p, sizeof(p), "%s/empty.bin", T4);
+        wfile(p, "", 0);
+    }
+
+    omnic_options o8 = mkopts(OMNIC_F_QUIET | OMNIC_F_PER_FILE, 0);
+    o8.threads = 8;
+    omnic_options o1 = o8;
+    o1.threads = 1;
+    CHECK(pack_tree(T4, A4, o8) == OMNIC_OK);
+
+    rm_tree("omnic_arc_dp8");
+    CHECK(unpack_arc(A4, "omnic_arc_dp8", o8) == OMNIC_OK);
+    CHECK(tree_equal("omnic_arc_dp8", T4));
+    rm_tree("omnic_arc_dp1");
+    CHECK(unpack_arc(A4, "omnic_arc_dp1", o1) == OMNIC_OK);
+    CHECK(tree_equal("omnic_arc_dp1", T4));
+    rm_tree("omnic_arc_dp8");
+    rm_tree("omnic_arc_dp1");
+
+    /* verify 池路径：-T8 与 -T1 校验字节口径一致 */
+    omnic_report r8, r1;
+    memset(&r8, 0, sizeof(r8));
+    memset(&r1, 0, sizeof(r1));
+    CHECK(omnic_arc_verify(A4, &o8, &r8) == OMNIC_OK);
+    CHECK(omnic_arc_verify(A4, &o1, &r1) == OMNIC_OK);
+    CHECK(r8.out_bytes == r1.out_bytes);
+    CHECK(r8.out_bytes > 0);
+
+    /* 中段坏块 × 池：从索引取中段块行（offset@4/comp@12/raw@20），翻转存储
+     * 域中点；受击块的成员缺失，前后邻块成员存活（隔离语义在保序收割下不变） */
+    {
+        size_t n;
+        uint64_t io;
+        uint32_t nent, nblk;
+        uint8_t *pl = load_index_plain(A4, &n, &io, &nent, &nblk);
+        CHECK(pl != NULL);
+        long flip_off = -1;
+        uint32_t hit = 0, pre = 0, post = 0;
+        char in_name[512] = {0}, pre_name[512] = {0}, post_name[512] = {0};
+        int got_in = 0, got_pre = 0, got_post = 0;
+        if (pl != NULL) {
+            CHECK(nblk >= 8); /* ≥66 块：解码池必开 */
+            /* 中段起找首个存储域 >4 的块（跳过零尺寸空块），前后邻取成员名 */
+            for (uint32_t cand = nblk / 2; cand + 1 < nblk; cand++) {
+                const uint8_t *row = pl + (size_t)cand * T_BLK_ROW;
+                uint64_t boff = 0, comp = 0, raw = 0;
+                for (int b = 0; b < 8; b++) boff |= (uint64_t)row[b + 4] << (8 * b);
+                for (int b = 0; b < 8; b++) comp |= (uint64_t)row[b + 12] << (8 * b);
+                for (int b = 0; b < 8; b++) raw |= (uint64_t)row[b + 20] << (8 * b);
+                uint64_t stored = (row[0] == 0) ? raw : comp;
+                if (stored <= 4) continue;
+                flip_off = (long)(28 + boff + stored / 2);
+                hit = cand;
+                pre = cand - 1;
+                post = cand + 1;
+                break;
+            }
+            if (flip_off > 0) {
+                size_t off = (size_t)nblk * T_BLK_ROW;
+                for (uint32_t i = 0; i < nent && !(got_in && got_pre && got_post); i++) {
+                    uint32_t nl = (uint32_t)pl[off] | ((uint32_t)pl[off + 1] << 8);
+                    if (pl[off + 2 + nl] == 0) { /* 文件条目 */
+                        uint32_t bid =
+                            (uint32_t)pl[off + 4 + nl] | ((uint32_t)pl[off + 5 + nl] << 8);
+                        char *dst = NULL;
+                        int want = 0;
+                        if (bid == hit && !got_in) {
+                            dst = in_name;
+                            want = got_in = 1;
+                        } else if (bid == pre && !got_pre) {
+                            dst = pre_name;
+                            want = got_pre = 1;
+                        } else if (bid == post && !got_post) {
+                            dst = post_name;
+                            want = got_post = 1;
+                        }
+                        if (want) {
+                            memcpy(dst, pl + off + 2, nl);
+                            dst[nl] = '\0';
+                        }
+                    }
+                    off += 2 + nl + T_ENT_FIX + 8;
+                }
+                CHECK(got_in);
+                CHECK(got_pre);
+                CHECK(got_post);
+            }
+            free(pl);
+        }
+        CHECK(flip_off > 0);
+        if (flip_off > 0) {
+            flip_byte(A4, flip_off);
+            rm_tree("omnic_arc_dpc");
+            CHECK(unpack_arc(A4, "omnic_arc_dpc", o8) == OMNIC_E_DATA);
+            char dst[600];
+            snprintf(dst, sizeof(dst), "omnic_arc_dpc/%s", in_name);
+            CHECK(omnic_fs_fopen(dst, "rb") == NULL); /* 受击成员缺失 */
+            snprintf(dst, sizeof(dst), "omnic_arc_dpc/%s", pre_name);
+            CHECK(omnic_fs_fopen(dst, "rb") != NULL); /* 前邻存活 */
+            snprintf(dst, sizeof(dst), "omnic_arc_dpc/%s", post_name);
+            CHECK(omnic_fs_fopen(dst, "rb") != NULL); /* 后邻存活 */
+            rm_tree("omnic_arc_dpc");
+        }
+    }
+    remove(A4);
+    rm_tree(T4);
+}
+
 int main(void) {
     test_roundtrip();
     test_roundtrip_edges();
@@ -944,6 +1075,7 @@ int main(void) {
     test_parallel();
     test_pack_determinism();
     test_pack_parallel_blocks();
+    test_decode_pool();
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }
