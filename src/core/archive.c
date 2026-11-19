@@ -465,6 +465,270 @@ ARC_THREAD_FN cls_worker(void *arg) {
     ARC_THREAD_RET_OK;
 }
 
+/* ---- 并行块压缩池（DESIGN-parallel-pack-compress）：主线程构块派发，
+ * worker 压缩，回执按派发序收——保序 = 块表/crc/offset 与串行一致，
+ * 产物逐字节不变。作业结构 POD，blk 所有权随作业转移，回执带回 out 所有权。
+ * 失败记首个错停派发，join 后统一报（g_err 非线程安全，worker 不碰）。 ---- */
+#define CMP_PROBE_SAMPLE (4u << 20) /* 桶级候选采样：4MiB 前缀定全桶 codec */
+
+typedef struct cmp_job {
+    uint8_t *blk;
+    uint64_t blk_len;
+    const omnic_codec_ops *ops;
+    int level;
+    const omnic_codec_ops *alt; /* 双候选 B（best_ratio 首块），NULL=无 */
+    size_t sample;              /* >0：采样探针（借用 blk 不转移，双压定夺不产块） */
+    size_t seq;                 /* 派发序号：回执按此入槽，主线程按序消费保序 */
+    struct cmp_job *next;
+} cmp_job;
+
+typedef struct cmp_result {
+    uint8_t *out;
+    size_t out_len;
+    uint64_t raw;             /* 回执带回块长（入表 raw_size 用） */
+    const omnic_codec_ops *win_ops;
+    int win_level;
+    omnic_status st;
+    size_t seq_mark;          /* 写槽时的派发序号+1；0=未写（calloc 初始） */
+    int decide;               /* 采样探针回执：只定 codec，无块产出 */
+} cmp_result;
+
+/* 每序号块的条目归属：构块时记录，flush 回填 block_id（入表序号此刻才定） */
+typedef struct cmp_meta {
+    const size_t *bidx; /* 桶内文件下标表（b->idx，buckets 存活期覆盖 flush） */
+    size_t fi0, fi1;     /* 本块覆盖的桶内条目范围 [fi0, fi1) */
+} cmp_meta;
+
+typedef struct {
+    cmp_job *head, *tail;     /* 待压作业 FIFO */
+    cmp_result *res;           /* 回执环形缓冲（容量 workers+1） */
+    cmp_meta *meta;            /* 每序号块的条目范围（flush 时回填 block_id） */
+    size_t res_cap;
+    int stop;
+    arc_mutex_t lock;
+    arc_cond_t job_cv;   /* worker 等作业 */
+    arc_cond_t res_cv;   /* 主线程等回执 */
+} cmp_ctx;
+
+static void cmp_result_free(cmp_result *r) {
+    free(r->out);
+    r->out = NULL;
+}
+
+/* worker：弹作业→压缩→回执入环。无队列深度限制：主线程构块速度天然低于
+ * 压缩速度，内存峰值 = 在途块数（受 workers 限制，见派发侧背压）。 */
+ARC_THREAD_FN cmp_worker(void *arg) {
+    cmp_ctx *c = (cmp_ctx *)arg;
+    for (;;) {
+        cmp_job *j = NULL;
+        arc_mutex_lock(&c->lock);
+        while (j == NULL && !c->stop) {
+            if (c->head != NULL) {
+                j = c->head;
+                c->head = j->next;
+                if (c->head == NULL) c->tail = NULL;
+            } else {
+                arc_cond_wait(&c->job_cv, &c->lock);
+            }
+        }
+        arc_mutex_unlock(&c->lock);
+        if (j == NULL) break; /* stop 且队列空 */
+
+        /* T12：块内 codec 恒单线程（threads=0）——块级并行是全部并行度，
+         * 由此 -T>1 与 -T1 产物逐字节相同（结构保证，非小块巧合）。 */
+        cmp_result r;
+        memset(&r, 0, sizeof(r));
+        r.raw = j->blk_len;
+        r.st = OMNIC_E_SYSTEM;
+        if (j->sample > 0) {
+            /* 采样探针（AR-PKG-003）：4MiB 前缀双压定全桶 codec，不产块。
+             * blk 为借用（主线程等回执，生命周期安全），用毕不释放。 */
+            uint8_t *oa = NULL, *ob = NULL;
+            size_t la = 0, lb = 0;
+            omnic_status sa = arc_compress_mem(j->blk, j->sample, j->ops, j->level,
+                                               0, &oa, &la);
+            omnic_status sb = sa == OMNIC_OK
+                                  ? arc_compress_mem(j->blk, j->sample, j->alt, 9, 0, &ob, &lb)
+                                  : sa;
+            free(oa);
+            free(ob);
+            if (sa == OMNIC_OK && sb == OMNIC_OK) {
+                if (lb < la) {
+                    r.win_ops = j->alt;
+                    r.win_level = 9;
+                } else {
+                    r.win_ops = j->ops;
+                    r.win_level = j->level;
+                }
+                r.decide = 1;
+                r.st = OMNIC_OK;
+            } else {
+                r.st = (sa != OMNIC_OK) ? sa : sb;
+            }
+        } else if (j->alt != NULL) {
+            /* 双候选：A 全量试压，B 候选 xz/9 定级试压，小者胜（AR-PKG-003 平移） */
+            uint8_t *oa = NULL, *ob = NULL;
+            size_t la = 0, lb = 0;
+            omnic_status sa = arc_compress_mem(j->blk, (size_t)j->blk_len, j->ops, j->level,
+                                               0, &oa, &la);
+            if (sa == OMNIC_OK) {
+                omnic_status sb = arc_compress_mem(j->blk, (size_t)j->blk_len, j->alt, 9,
+                                                   0, &ob, &lb);
+                if (sb == OMNIC_OK) {
+                    if (lb < la) {
+                        free(oa);
+                        r.out = ob; r.out_len = lb;
+                        r.win_ops = j->alt; r.win_level = 9;
+                    } else {
+                        free(ob);
+                        r.out = oa; r.out_len = la;
+                        r.win_ops = j->ops; r.win_level = j->level;
+                    }
+                    r.st = OMNIC_OK;
+                } else {
+                    free(oa);
+                    r.st = sb;
+                }
+            } else {
+                r.st = sa;
+            }
+        } else {
+            r.st = arc_compress_mem(j->blk, (size_t)j->blk_len, j->ops, j->level,
+                                    0, &r.out, &r.out_len);
+            if (r.st == OMNIC_OK) {
+                r.win_ops = j->ops;
+                r.win_level = j->level;
+            }
+        }
+
+        arc_mutex_lock(&c->lock);
+        size_t jseq = j->seq; /* free 前留取：入槽序号 */
+        if (j->sample == 0) free(j->blk); /* 探针借用 blk，不释放 */
+        free(j);
+        /* 回执按派发序入槽（非完成序）：槽 = seq % cap，主线程按序消费。
+         * mark=seq+1 是"本序号已写"的唯一凭证（完成乱序时 done 计数
+         * 会假阳性）；同槽复用受 res_cap=workers+1 与窗口背压保护。 */
+        r.seq_mark = jseq + 1;
+        c->res[jseq % c->res_cap] = r;
+        arc_cond_signal(&c->res_cv);
+        arc_mutex_unlock(&c->lock);
+    }
+    ARC_THREAD_RET_OK;
+}
+
+/* 派发：入队并唤醒。seq 由调用方递增（= 派发序号）。 */
+static int cmp_submit(cmp_ctx *c, cmp_job *j) {
+    j->next = NULL;
+    arc_mutex_lock(&c->lock);
+    if (c->stop) { /* 失败后停收：释放所有权，主循环走失败路径 */
+        arc_mutex_unlock(&c->lock);
+        if (j->sample == 0) free(j->blk); /* 探针借用 blk 不释放，调用方善后 */
+        free(j);
+        return -1;
+    }
+    if (c->tail != NULL) c->tail->next = j;
+    else c->head = j;
+    c->tail = j;
+    arc_cond_signal(&c->job_cv);
+    arc_mutex_unlock(&c->lock);
+    return 0;
+}
+
+/* 收据：等到 seq 序号回执（严格保序）。完成是乱序的——"完成计数>seq"
+ * 不蕴含"seq 已写"（后序号先完成时假阳性），故对号入座：mark==seq+1
+ * 才是本序号回执已落槽。失败回执也在其序号到位时报。 */
+static cmp_result *cmp_reap(cmp_ctx *c, size_t seq) {
+    for (;;) {
+        arc_mutex_lock(&c->lock);
+        if (c->res[seq % c->res_cap].seq_mark == seq + 1) {
+            arc_mutex_unlock(&c->lock);
+            return &c->res[seq % c->res_cap];
+        }
+        arc_cond_wait(&c->res_cv, &c->lock);
+        arc_mutex_unlock(&c->lock);
+    }
+}
+
+/* 收一笔回执并完成块收尾（入表/写出/打印）。ops/level 出参回写候选胜者
+ * （非 probe 恒等；传 NULL 表示调用方不关心——常规窗口回收）。
+ * 消费后置空槽 out 防双重释放。 */
+static omnic_status cmp_flush_one(cmp_ctx *c, arc_index *ix, size_t *tbl_cap,
+                                  FILE *f, uint64_t *arc_pos, uint64_t data_off,
+                                  unsigned quiet, size_t *reaped,
+                                  const omnic_codec_ops **ops, int *level) {
+    size_t seq = *reaped;
+    cmp_result *r = cmp_reap(c, seq);
+    *reaped = seq + 1;
+    if (r->st != OMNIC_OK) {
+        omnic_set_error("block compress failed (%s)", omnic_status_str(r->st));
+        cmp_result_free(r);
+        return r->st;
+    }
+    if (r->decide) {
+        /* 采样探针回执：胜者已由派发侧窥视取走（cmp_reap 不推进消费），
+         * 此处按序空过即可，无块入表/写出、不动 ops/level（可能已是他桶） */
+        return OMNIC_OK;
+    }
+    uint8_t *out = r->out;
+    size_t out_len = r->out_len;
+    uint64_t blk_len = r->raw;
+    const omnic_codec_ops *wops = r->win_ops;
+    int wlevel = r->win_level;
+    r->out = NULL; /* 所有权移交 */
+    if (ops != NULL) {
+        *ops = wops;
+        *level = wlevel;
+    }
+    /* 块号在此刻回填（入表时才确定）：构块时 ix.nblk 尚未推进到本块 */
+    cmp_meta *m = &c->meta[seq % c->res_cap];
+    for (size_t k = m->fi0; k < m->fi1; k++)
+        ix->ent[m->bidx[k]].block_id = (uint32_t)(ix->nblk);
+    if (arc_block_new(ix, tbl_cap, (uint8_t)wops->fmt, (uint8_t)wlevel,
+                      *arc_pos - data_off) != 0) {
+        free(out);
+        omnic_set_error("out of memory");
+        return OMNIC_E_SYSTEM;
+    }
+    arc_block *cb = &ix->blk[ix->nblk - 1];
+    cb->comp_size = out_len;
+    cb->raw_size = blk_len;
+    cb->crc = arc_crc32(0, out, out_len);
+    if (fwrite(out, 1, out_len, f) != out_len) {
+        free(out);
+        omnic_set_error("write failed");
+        return OMNIC_E_SYSTEM;
+    }
+    *arc_pos += out_len;
+    free(out);
+    if (!quiet)
+        printf("  block: %s/%d  %llu -> %zu bytes (%.2f%%)\n", wops->name, wlevel,
+               (unsigned long long)blk_len, out_len,
+               blk_len ? 100.0 * (double)out_len / (double)blk_len : 0.0);
+    return OMNIC_OK;
+}
+
+/* 停池：唤醒 worker 退出、join、清队列/回执残留。成功收尾与 fail 路径共用。
+ * join 后无并发，队列/回执直取直放。 */
+static void cmp_pool_shutdown(cmp_ctx *c, arc_thread_t *tid, int spawned) {
+    arc_mutex_lock(&c->lock);
+    c->stop = 1;
+    arc_cond_broadcast(&c->job_cv);
+    arc_mutex_unlock(&c->lock);
+    for (int w = 0; w < spawned; w++) arc_thread_join(tid[w]);
+    cmp_job *j = c->head;
+    while (j != NULL) {
+        cmp_job *nx = j->next;
+        free(j->blk);
+        free(j);
+        j = nx;
+    }
+    for (size_t k = 0; k < c->res_cap; k++) cmp_result_free(&c->res[k]);
+    free(c->res);
+    c->res = NULL;
+    free(c->meta);
+    c->meta = NULL;
+}
+
 /* ---- pack（A3：store-only；A4 接决策分桶与压缩块）---- */
 omnic_status omnic_pack(const char *root, const char *archive_path,
                         const omnic_options *o, omnic_report *rep) {
@@ -503,6 +767,15 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
         free(fs);
         return OMNIC_E_USAGE;
     }
+
+    /* T12 块压缩池局部量：先于一切 goto fail 声明并置零（fail 标签要读） */
+    cmp_ctx cmp;
+    memset(&cmp, 0, sizeof(cmp));
+    int cmp_on = 0;
+    int cmp_spawned = 0;
+    size_t cmp_seq = 0;    /* 已派发数 */
+    size_t cmp_reaped = 0; /* 已收笔数（含写出） */
+    arc_thread_t cmp_tid[ARC_NWRITER_MAX];
 
     arc_index ix;
     memset(&ix, 0, sizeof(ix));
@@ -684,10 +957,53 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     /* 桶序统一 qsort（大小降序；store 桶自然沉浮由总量决定）——确定性 */
     qsort(bkts, nb, sizeof(arc_bucket), bucket_cmp);
 
+    /* ---- 并行块压缩池（T12）：threads 语义与分类池一致（0=默认8、1=串行）。
+     * 构块留主线程，压缩重叠进行；回执按派发序收——保序 = 块表/产物与串行一致。
+     * 局部量已在函数头声明置零（fail 标签先于本块可达）。 ---- */
+    int cmp_workers = ARC_NWRITER_DEFAULT;
+    if (threads == 1) cmp_workers = 1;
+    else if (threads > 1) cmp_workers = threads;
+    if (cmp_workers > ARC_NWRITER_MAX) cmp_workers = ARC_NWRITER_MAX;
+    cmp_on = (cmp_workers > 1 && !explain);
+    if (cmp_on) {
+        cmp.res_cap = (size_t)cmp_workers + 1;
+        cmp.res = (cmp_result *)calloc(cmp.res_cap, sizeof(cmp_result));
+        cmp.meta = (cmp_meta *)calloc(cmp.res_cap, sizeof(cmp_meta));
+        if (cmp.res == NULL || cmp.meta == NULL) {
+            free(cmp.res);
+            free(cmp.meta);
+            cmp.res = NULL;
+            cmp.meta = NULL;
+            cmp_on = 0; /* OOM 退回串行，正确性不受影响 */
+        } else {
+            arc_mutex_init(&cmp.lock);
+            arc_cond_init(&cmp.job_cv);
+            arc_cond_init(&cmp.res_cv);
+            for (; cmp_spawned < cmp_workers; cmp_spawned++)
+                if (arc_thread_create(&cmp_tid[cmp_spawned], cmp_worker, &cmp) != 0) break;
+            if (cmp_spawned == 0) {
+                free(cmp.res);
+                free(cmp.meta);
+                cmp.res = NULL;
+                cmp.meta = NULL;
+                cmp_on = 0; /* 线程创建全败：串行兜底 */
+            }
+        }
+    }
+
     /* ---- 桶写出 ---- */
     for (size_t bi = 0; bi < nb; bi++) {
         arc_bucket *b = &bkts[bi];
         if (b->is_store) {
+            /* store 直写文件/直入表：先排空在途压缩块，锁住表序/写序与串行
+             * 一致（压缩桶之间靠 seq 保序无需排空，跨桶重叠保留到最后） */
+            if (cmp_on) {
+                while (cmp_reaped < cmp_seq) {
+                    if (cmp_flush_one(&cmp, &ix, &tbl_cap, f, &arc_pos, data_off, quiet,
+                                      &cmp_reaped, NULL, NULL) != OMNIC_OK)
+                        goto fail;
+                }
+            }
             /* store：流式块（A3 路径），双 CRC 边写边算 */
             uint32_t blk_crc = 0;
             int blk_open = 0;
@@ -766,6 +1082,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
             size_t bcap_bytes = (size_t)block_max;
             uint8_t *blk = NULL;
             uint64_t blk_len = 0;
+            size_t fi0 = fi; /* 池路径：本块条目范围起点（flush 回填 block_id 用） */
             while (fi < b->n) {
                 size_t i = b->idx[fi];
                 if (blk_len > 0 && blk_len + fs[i].size > block_max) break;
@@ -814,35 +1131,99 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
                 ix.ent[i].crc = file_crc;
                 fi++;
             }
-            /* 压缩（首块且桶 ≥4MiB 时双候选全量试压，AR-PKG-003） */
-            uint8_t *out = NULL;
-            size_t out_len = 0;
+            /* 压缩（首块且桶 ≥4MiB 时双候选全量试压，AR-PKG-003）。
+             * 池路径：构块即派发，窗口满（在途>workers）收最旧回执写出——
+             * 压缩与后续构块重叠；桶级候选首块同步收（胜者定全桶 ops/level，
+             * 与串行语义一致）。串行路径逐字保留（-T1/explain/兜底）。 */
+            if (cmp_on) {
+                /* 背压（任何提交之前）：在途压回 ≤ spawned。meta 环槽在提交时
+                 * 写入——只有先消费才能保证槽复用不踩未消费项（res 环由
+                 * worker 的 mark 写入天然晚于此约束，一并被覆盖保护）。 */
+                while (cmp_seq - cmp_reaped > (size_t)cmp_spawned) {
+                    if (cmp_flush_one(&cmp, &ix, &tbl_cap, f, &arc_pos, data_off, quiet,
+                                      &cmp_reaped, NULL, NULL) != OMNIC_OK)
+                        goto fail;
+                }
+                /* 采样探针（桶级候选首块）：4MiB 前缀双压定全桶 codec。回执用
+                 * 窥视（等标记不推进消费序号）——胜者尽早到手，后续块尽早
+                 * 派发，不被前序慢块的按序消费卡住；槽由后续 flush 按序空过。
+                 * blk 为借用，主线程窥视等待期生命周期安全。 */
+                if (first && alt != NULL) {
+                    size_t sn = (size_t)blk_len < CMP_PROBE_SAMPLE ? (size_t)blk_len
+                                                                   : CMP_PROBE_SAMPLE;
+                    cmp_job *pj = (cmp_job *)malloc(sizeof(cmp_job));
+                    if (pj == NULL) {
+                        free(blk);
+                        goto oom;
+                    }
+                    pj->blk = blk;
+                    pj->blk_len = blk_len;
+                    pj->sample = sn;
+                    pj->ops = ops;
+                    pj->level = level;
+                    pj->alt = alt;
+                    pj->seq = cmp_seq++;
+                    if (cmp_submit(&cmp, pj) != 0) {
+                        free(blk); /* 探针借用被拒：本方善后 */
+                        goto fail;
+                    }
+                    cmp_result *pr = cmp_reap(&cmp, pj->seq); /* 窥视：不消费 */
+                    if (pr->st != OMNIC_OK) {
+                        omnic_set_error("probe compress failed (%s)",
+                                        omnic_status_str(pr->st));
+                        goto fail;
+                    }
+                    ops = pr->win_ops; /* 胜者定全桶，首块随即按此派发 */
+                    level = pr->win_level;
+                    /* 探针占了一个在途名额：实块提交前再压一次窗口 */
+                    while (cmp_seq - cmp_reaped > (size_t)cmp_spawned) {
+                        if (cmp_flush_one(&cmp, &ix, &tbl_cap, f, &arc_pos, data_off, quiet,
+                                          &cmp_reaped, NULL, NULL) != OMNIC_OK)
+                            goto fail;
+                    }
+                }
+                cmp_job *j = (cmp_job *)malloc(sizeof(cmp_job));
+                if (j == NULL) {
+                    free(blk);
+                    goto oom;
+                }
+                j->blk = blk;
+                j->blk_len = blk_len;
+                j->sample = 0;
+                j->ops = ops;
+                j->level = level;
+                j->alt = NULL; /* 桶 codec 已由探针定夺 */
+                j->seq = cmp_seq++;
+                cmp.meta[j->seq % cmp.res_cap] = (cmp_meta){b->idx, fi0, fi};
+                blk = NULL; /* 所有权随作业转移 */
+                first = 0;
+                if (cmp_submit(&cmp, j) != 0) goto fail; /* 池停：前序失败 */
+                continue; /* 本块入表/写出已随回执完成 */
+            }
+            /* 串行路径：桶级候选同款采样探针（与池路径同一决策 = 同一产物） */
             if (first && alt != NULL) {
+                size_t sn = (size_t)blk_len < CMP_PROBE_SAMPLE ? (size_t)blk_len
+                                                               : CMP_PROBE_SAMPLE;
                 uint8_t *oa = NULL, *ob = NULL;
                 size_t la = 0, lb = 0;
-                omnic_status sa = arc_compress_mem(blk, (size_t)blk_len, ops, level, threads, &oa, &la);
-                if (sa != OMNIC_OK) {
-                    free(blk);
-                    goto fail;
-                }
-                omnic_status sb = arc_compress_mem(blk, (size_t)blk_len, alt, 9, threads, &ob, &lb);
-                if (sb != OMNIC_OK) {
-                    free(oa);
+                omnic_status sa = arc_compress_mem(blk, sn, ops, level, threads, &oa, &la);
+                omnic_status sb = sa == OMNIC_OK
+                                      ? arc_compress_mem(blk, sn, alt, 9, threads, &ob, &lb)
+                                      : sa;
+                free(oa);
+                free(ob);
+                if (sa != OMNIC_OK || sb != OMNIC_OK) {
                     free(blk);
                     goto fail;
                 }
                 if (lb < la) {
-                    free(oa);
-                    out = ob;
-                    out_len = lb;
                     ops = alt;
                     level = 9;
-                } else {
-                    free(ob);
-                    out = oa;
-                    out_len = la;
                 }
-            } else {
+            }
+            uint8_t *out = NULL;
+            size_t out_len = 0;
+            {
                 if (arc_compress_mem(blk, (size_t)blk_len, ops, level, threads, &out, &out_len) !=
                     OMNIC_OK) {
                     free(blk);
@@ -871,6 +1252,19 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
                        (unsigned long long)blk_len, out_len,
                        blk_len ? 100.0 * (double)out_len / (double)blk_len : 0.0);
         }
+    }
+    /* 收尾排空：跨桶在途块按序写出（桶间无 probe 依赖，重叠到最后） */
+    if (cmp_on) {
+        while (cmp_reaped < cmp_seq) {
+            if (cmp_flush_one(&cmp, &ix, &tbl_cap, f, &arc_pos, data_off, quiet,
+                              &cmp_reaped, NULL, NULL) != OMNIC_OK)
+                goto fail;
+        }
+    }
+    /* 池停机：回执已清，停 worker 后索引/Footer 才安全落笔 */
+    if (cmp_on) {
+        cmp_pool_shutdown(&cmp, cmp_tid, cmp_spawned);
+        cmp_on = 0;
     }
     buckets_free(bkts, nb);
     bkts = NULL;
@@ -931,6 +1325,7 @@ io_fail:
 oom:
     omnic_set_error("out of memory");
 fail:
+    if (cmp_on) cmp_pool_shutdown(&cmp, cmp_tid, cmp_spawned);
     free(plan);
     buckets_free(bkts, nb);
     arc_index_mem_free(&ix);

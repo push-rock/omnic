@@ -4,6 +4,43 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
 
 ## [Unreleased]
 
+### Changed — parallel block compression in pack (T12)
+
+- `pack` now compresses blocks through a worker pool: the main thread
+  builds blocks (file reads, CRC) and dispatches, workers compress, and
+  receipts are consumed in dispatch order — so the block table, CRCs
+  and file layout stay identical to the serial path. `-T` follows the
+  classification-pool semantics (0 = 8 workers by default, 1 = serial,
+  n = n workers); `-T 1` and parallel archives are byte-identical by
+  construction, and intra-block codec MT is disabled in pack (workers
+  compress single-threaded). Stream mode (`omnic c -T`) keeps
+  libzstd/liblzma MT unchanged.
+- The best-ratio bucket probe (which pits the planned codec against
+  xz/9 for buckets ≥ 4 MiB) now decides on a 4 MiB prefix sample
+  instead of compressing the whole first block twice — serial packs
+  save the duplicate full-block pass, and in the pool the probe result
+  is peeked (not queued behind older receipts) so the bucket's codec is
+  settled while earlier blocks are still in flight.
+- Measured on the 152.6 MB game tree (8,588 files, best of 3): pack
+  `best_ratio` 24.2 s → **11.5 s**, `--per-file` 5.8 s → **2.5 s**,
+  `--no-skip` 16.2 s → 12.7 s, default 2.1 s → 1.9 s (zstd blocks were
+  already fast; the old path let libzstd MT run inside a block, the
+  pool trades that for block-level parallelism — parity on this tree,
+  recorded as such). Silesia (202 MiB, 12 files): default 2.41 s →
+  **1.06 s**, `best_ratio` 87.4 s → **30.2 s** — at the max tier omnic
+  now packs this shape 1.7× faster than `7z -mx=9` (50.8 s). All
+  archive sizes are byte-for-byte unchanged from 0.3.2.
+- New gate `test_pack_parallel_blocks`: an 18 MiB tree shaped to force
+  every pool hazard — 16 pool sequences (14 blocks + probe + wrapped
+  font block) against a 9-slot receipt ring, the best-ratio probe
+  landing past the wrap point, a store bucket between compressed
+  buckets, and window backpressure. Packs at `-T 1` vs parallel under
+  both `balanced` and `best_ratio` must be byte-identical, plus a full
+  roundtrip of the parallel archive. Two real bugs were caught by
+  exactly this shape during development (an aliased receipt slot read
+  as success, and a metadata-ring overwrite when the probe submit
+  skipped backpressure) — the gate fails on both when reintroduced.
+
 ### Added — multithreaded regression coverage
 
 - `test_core` compresses a 12 MB corpus with zstd and xz at `-T 2/8` and

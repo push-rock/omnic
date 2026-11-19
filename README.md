@@ -95,7 +95,7 @@ unpack: --file <pattern>  extract matching entries (exact path, dir/ prefix, or 
 
 ## Measured results
 
-All numbers measured on one machine (i7-12700, best of rounds); reproduction tools ship with the build: `omnic_bench` (codec level), `omnic_gamepack` (archive level). Pack classification runs an 8-worker pool by default; codec compression is single-threaded unless `-T` is set — parallel and serial output are byte-identical.
+All numbers measured on one machine (i7-12700, best of rounds); reproduction tools ship with the build: `omnic_bench` (codec level), `omnic_gamepack` (archive level). Pack runs two worker pools by default (8 workers each, `-T` to tune, `-T 1` for serial): one classifies files, one compresses blocks — intra-block codecs stay single-threaded in pack, and parallel and serial output are byte-identical.
 
 **The headline numbers** — one figure per line, sources in the tables below:
 
@@ -154,12 +154,12 @@ A 152.6 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files 
 |---|---|---|---|---|---|
 | zip (deflate default) | 69.22% | 100.8 MB | — | 3.8 s | 28.3 ms |
 | zip -9 (deflate max) | 69.15% | 100.7 MB | -0.1% | 7.9 s | 28.3 ms |
-| **omnic pack** (solid, default) | **65.77%** | **95.7 MB** | **-5.0%** | **2.1 s** | 67 ms |
-| omnic pack --per-file | 68.4% | 99.6 MB | -1.2% | 5.8 s | **8.7 ms** |
-| omnic pack --no-skip | **62.2%** | **90.5 MB** | **-10.2%** | 16.2 s | 67 ms |
-| omnic pack -p best_ratio | 63.2% | 92.0 MB | -8.7% | 24.2 s | 67 ms |
+| **omnic pack** (solid, default) | **65.77%** | **95.7 MB** | **-5.0%** | **1.9 s** | 67 ms |
+| omnic pack --per-file | 68.4% | 99.6 MB | -1.2% | **2.5 s** | **8.7 ms** |
+| omnic pack --no-skip | **62.2%** | **90.5 MB** | **-10.2%** | 12.7 s | 67 ms |
+| omnic pack -p best_ratio | 63.2% | 92.0 MB | -8.7% | **11.5 s** | 67 ms |
 
-- deflate caps at 69.2% no matter the tier (-9 spends 2.1× the time for 0.07 pp). Classification — 8,586 file opens and 3-segment samples, filesystem/antivirus latency rather than CPU — used to dominate the 5.0 s pack; an 8-worker pool (default, `-T` to tune) cuts it from 3.6 s to 0.7 s. Serial and parallel runs produce byte-identical archives.
+- deflate caps at 69.2% no matter the tier (-9 spends 2.1× the time for 0.07 pp). Classification — 8,586 file opens and 3-segment samples, filesystem/antivirus latency rather than CPU — used to dominate the pack; an 8-worker pool (default, `-T` to tune) cuts it from 3.6 s to 0.7 s. Block compression runs through the same-style pool now too: blocks are built on the main thread, compressed by workers, and written in dispatch order — `best_ratio` drops from 24.2 s to 11.5 s and `--per-file` from 5.8 s to 2.5 s with byte-identical output to the serial path.
 - Single-file extraction: pulling one 6 KB Lua file from 8,586 entries — omnic `--per-file` 8.7 ms (process start included), zip CLI 28.3 ms, .NET library (ZipFile + stream copy) 25 ms — **3.3× faster**; solid mode 67 ms (the cost of reading and decoding one whole 64 MiB block).
 - Unpack wall clock: 4.3 s serial → **3.9 s** with the default 8 write workers (3.6 s at `-T 2`) vs 2.6 s for signed tar.exe on the same zip. Breakdown: no-write decode+verify 0.56 s vs 0.36 s (deflate decode is inherently fast, and omnic adds a per-block CRC — the price of corruption isolation); the rest is file creation, and on this machine most of that is Windows Defender real-time scanning every file an unsigned process creates (a plain robocopy of the same tree costs 3.7 s; signed tar.exe pays none of the AV tax). Exclude the output directory from Defender — or run on Linux/macOS — and the parallel writers deliver their full speedup.
 - Corruption isolation: every block carries a CRC-32; one flipped bit kills one block, extraction names the first ten affected files, then continues (`extracted 7435/8586 files`, exit code 2). A zip with a damaged central directory usually gives you nothing. `--verify` checks both CRC layers without writing (260 MB/s); `--list` reads only the tail index: 8,586 entries in 96 ms.
@@ -169,25 +169,25 @@ A 152.6 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files 
 | option | ratio | archive size | vs zip | pack |
 |---|---|---|---|---|
 | zip (deflate default) | 32.18% | 65.0 MB | — | 4.96 s |
-| omnic `-p fast_compress` | 41.02% | 82.9 MB | +27.5% | **1.08 s** |
-| omnic `-p fast_decompress` | 31.37% | 63.4 MB | -2.5% | 1.36 s |
-| **omnic pack (default)** | **28.97%** | **58.6 MB** | **-10.0%** | **2.41 s** |
-| omnic `-p best_ratio` | **23.02%** | **46.5 MB** | **-28.5%** | 87.4 s |
+| omnic `-p fast_compress` | 41.02% | 82.9 MB | +27.5% | **0.66 s** |
+| omnic `-p fast_decompress` | 31.37% | 63.4 MB | -2.5% | 0.74 s |
+| **omnic pack (default)** | **28.97%** | **58.6 MB** | **-10.0%** | **1.06 s** |
+| omnic `-p best_ratio` | **23.02%** | **46.5 MB** | **-28.5%** | 30.2 s |
 
-- balanced wins both axes: **3.2 pp smaller ratio and 2.1× the pack speed**; `fast_decompress` matches zip's ratio at 3.6× the speed; `best_ratio` sits 9.2 pp below zip — the archival tier.
+- balanced wins both axes: **3.2 pp smaller ratio and 4.7× the pack speed**; `fast_decompress` matches zip's ratio at 6.7× the speed; `best_ratio` sits 9.2 pp below zip — the archival tier.
 - Losses recorded: full unpack of this big-file corpus is 0.83 s vs zip's 0.37 s (solid zstd decode plus the per-block CRC isolation tax; the parallel-write path targets many-file trees like the one above). `--file` extraction of the 10 MB member takes 48 ms — decode-bound; the 8.7 ms headline is a 6 KB file.
 
 **The 7-Zip cross-check** (same machine and window, Silesia 12-file tree — 7zr 26.06, LZMA2):
 
 | option | ratio | pack |
 |---|---|---|
-| **omnic default (balanced)** | 28.97% | **2.40 s** |
+| **omnic default (balanced)** | 28.97% | **1.06 s** |
 | 7z -mx=5 (its default) | 23.40% | 24.45 s |
-| omnic `-p best_ratio` | 23.02% | 90.5 s |
+| **omnic `-p best_ratio`** | 23.02% | **30.2 s** |
 | 7z -mx=9 (its max) | **22.99%** | 50.8 s |
 
-- The default tiers are different animals: omnic's is a speed tier (**10× faster**, 5.6 pp larger); 7-Zip's default is already a ratio tier.
-- Max tiers tie on ratio (0.03 pp) while 7-Zip packs this many-file shape 1.8× faster — its LZMA2 threads by default, omnic's buckets stay serial (`-T 8` closes the gap to 81 s; on a single stream, threaded xz flips the axis outright — the 202 MiB Silesia tar at `best_ratio -T 8` runs 63.0 s → **11.6 s** at +0.14 pp). Bucket-level parallel compression is the next work item.
+- The default tiers are different animals: omnic's is a speed tier (**23× faster**, 5.6 pp larger); 7-Zip's default is already a ratio tier.
+- Max tiers tie on ratio (0.03 pp) and omnic is now the faster one — 30.2 s vs 50.8 s: block compression runs through a worker pool (blocks are independent units), while a single 7z stream serializes LZMA2 unless it splits the archive. On a single stream, threaded xz flips the axis outright — the 202 MiB Silesia tar at `best_ratio -T 8` runs 63.0 s → **11.6 s** at +0.14 pp.
 - 7-Zip also wins GUI, encryption, format breadth and 25 years of maturity — it stays installed here. omnic bets on per-file routing, pass-through and corruption isolation, not on replacing it.
 
 **Whole-stream max compression** (tar the tree, then one stream — the lzbench / Oodle published protocol):

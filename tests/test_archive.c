@@ -880,6 +880,59 @@ static void test_pack_determinism(void) {
     remove("omnic_arc_det8.omnic");
 }
 
+/* ---- T12 块压缩池：多块乱序/回执环复用/probe 双候选/store 排水的确定性门禁。
+ * 树形：96×128KiB 文本（best_ratio→xz 桶 14 块）+ font.ttf 6MiB 中熵
+ * （best_ratio 计划 zstd/19 → 桶首块 probe 对 xz/9；单文件超限独立成块）+ rand/empty（store）。
+ * block_mib=1 → 池序号 0..15（14 块 + probe + 1 字体块）：环 cap=9 下 probe 落在
+ * seq 14（槽 5 复用点），窗口回收、乱序完成、跨桶重叠、store 前排水、探针窥视
+ * 全部在途。两 profile 各自 -T1/-T8 逐字节相同 + -T8 归档 roundtrip 等价。 ---- */
+static void test_pack_parallel_blocks(void) {
+    static const char *T3 = "omnic_arc_tree3";
+    rm_tree(T3);
+    omnic_fs_mkdir_p(T3);
+    static char buf[128 * 1024];
+    char p[512];
+    for (int i = 0; i < 96; i++) {
+        fill_text(buf, sizeof(buf));
+        snprintf(p, sizeof(p), "%s/t%02d.txt", T3, i % 100);
+        wfile(p, buf, sizeof(buf));
+    }
+    { /* 6MiB 中熵：best_ratio 计划 zstd/19（≥4MiB 触发 probe），balanced 走 zstd/9 */
+        static char mbuf[6 * 1024 * 1024];
+        for (size_t i = 0; i < sizeof(mbuf); i++) mbuf[i] = (char)(rng() % 47);
+        snprintf(p, sizeof(p), "%s/font.ttf", T3);
+        wfile(p, mbuf, sizeof(mbuf));
+    }
+    { /* store 桶（与压缩桶混排，盖住 store 前排水路径） */
+        static char rbuf[64 * 1024];
+        for (size_t i = 0; i < sizeof(rbuf); i++) rbuf[i] = (char)rng();
+        snprintf(p, sizeof(p), "%s/rand.bin", T3);
+        wfile(p, rbuf, sizeof(rbuf));
+        snprintf(p, sizeof(p), "%s/empty.bin", T3);
+        wfile(p, "", 0);
+    }
+
+    for (int best = 0; best <= 1; best++) {
+        omnic_options o1 = mkopts(OMNIC_F_QUIET, 1);
+        o1.threads = 1;
+        o1.profile = best ? OMNIC_PROFILE_BEST_RATIO : OMNIC_PROFILE_BALANCED;
+        omnic_options o8 = o1;
+        o8.threads = 8;
+        const char *a1 = best ? "omnic_arc_pb_b1.omnic" : "omnic_arc_pb_l1.omnic";
+        const char *a8 = best ? "omnic_arc_pb_b8.omnic" : "omnic_arc_pb_l8.omnic";
+        CHECK(pack_tree(T3, a1, o1) == OMNIC_OK);
+        CHECK(pack_tree(T3, a8, o8) == OMNIC_OK);
+        CHECK(files_equal(a1, a8)); /* 池保序回执：-T1 ≡ -T8 逐字节 */
+        rm_tree("omnic_arc_pb_rt");
+        CHECK(unpack_arc(a8, "omnic_arc_pb_rt", o8) == OMNIC_OK);
+        CHECK(tree_equal("omnic_arc_pb_rt", T3));
+        rm_tree("omnic_arc_pb_rt");
+        remove(a1);
+        remove(a8);
+    }
+    rm_tree(T3);
+}
+
 int main(void) {
     test_roundtrip();
     test_roundtrip_edges();
@@ -890,6 +943,7 @@ int main(void) {
     test_bounds();
     test_parallel();
     test_pack_determinism();
+    test_pack_parallel_blocks();
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }
