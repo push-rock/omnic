@@ -44,25 +44,6 @@ omnic_status omnic_unpack(const char *archive_path, const char *dest_dir,
 }
 #else /* ---- 完整实现 ---- */
 
-/* ---- CRC-32/ISO-HDLC ---- */
-static uint32_t s_crc_tab[256];
-static int s_crc_ready = 0;
-
-static uint32_t arc_crc32(uint32_t crc, const void *buf, size_t n) {
-    if (!s_crc_ready) {
-        for (uint32_t i = 0; i < 256; i++) {
-            uint32_t c = i;
-            for (int k = 0; k < 8; k++) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
-            s_crc_tab[i] = c;
-        }
-        s_crc_ready = 1;
-    }
-    const uint8_t *p = (const uint8_t *)buf;
-    crc ^= 0xFFFFFFFFu;
-    for (size_t i = 0; i < n; i++) crc = s_crc_tab[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
-    return crc ^ 0xFFFFFFFFu;
-}
-
 /* ---- little-endian ---- */
 static void put16(uint8_t *p, uint16_t v) {
     p[0] = (uint8_t)v;
@@ -692,7 +673,7 @@ static omnic_status cmp_flush_one(cmp_ctx *c, arc_index *ix, size_t *tbl_cap,
     arc_block *cb = &ix->blk[ix->nblk - 1];
     cb->comp_size = out_len;
     cb->raw_size = blk_len;
-    cb->crc = arc_crc32(0, out, out_len);
+    cb->crc = omnic_crc32(0, out, out_len);
     if (fwrite(out, 1, out_len, f) != out_len) {
         free(out);
         omnic_set_error("write failed");
@@ -979,6 +960,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
             arc_mutex_init(&cmp.lock);
             arc_cond_init(&cmp.job_cv);
             arc_cond_init(&cmp.res_cv);
+            (void)omnic_crc32(0, "", 0); /* 预热分表：worker 可能先于主线程首调 */
             for (; cmp_spawned < cmp_workers; cmp_spawned++)
                 if (arc_thread_create(&cmp_tid[cmp_spawned], cmp_worker, &cmp) != 0) break;
             if (cmp_spawned == 0) {
@@ -1045,8 +1027,8 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
                     arc_pos += r;
                     cb->raw_size += r;
                     cb->comp_size = cb->raw_size;
-                    file_crc = arc_crc32(file_crc, buf, r);
-                    blk_crc = arc_crc32(blk_crc, buf, r);
+                    file_crc = omnic_crc32(file_crc, buf, r);
+                    blk_crc = omnic_crc32(blk_crc, buf, r);
                 }
                 int bad = ferror(in);
                 fclose(in);
@@ -1114,7 +1096,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
                 while (got < fs[i].size) {
                     size_t r = fread(blk + blk_len, 1, (size_t)(fs[i].size - got), in);
                     if (r == 0) break;
-                    file_crc = arc_crc32(file_crc, blk + blk_len, r);
+                    file_crc = omnic_crc32(file_crc, blk + blk_len, r);
                     blk_len += r;
                     got += r;
                 }
@@ -1240,7 +1222,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
             arc_block *cb = &ix.blk[ix.nblk - 1];
             cb->comp_size = out_len;
             cb->raw_size = blk_len;
-            cb->crc = arc_crc32(0, out, out_len);
+            cb->crc = omnic_crc32(0, out, out_len);
             if (fwrite(out, 1, out_len, f) != out_len) {
                 free(out);
                 goto io_fail;
@@ -1294,7 +1276,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
         free(zbuf);
         goto io_fail;
     }
-    uint32_t index_crc = arc_crc32(0, zbuf, (size_t)zn);
+    uint32_t index_crc = omnic_crc32(0, zbuf, (size_t)zn);
     free(zbuf);
 
     uint32_t nb32 = (uint32_t)ix.nblk;
@@ -1393,7 +1375,7 @@ static omnic_status arc_open_index(const char *archive_path, FILE **out_f, arc_i
         fclose(f);
         return OMNIC_E_DATA;
     }
-    if (arc_crc32(0, zbuf, (size_t)index_comp) != index_crc) {
+    if (omnic_crc32(0, zbuf, (size_t)index_comp) != index_crc) {
         free(zbuf);
         omnic_set_error("archive index corrupted — cannot list or extract");
         fclose(f);
@@ -1484,7 +1466,7 @@ static int decode_block(FILE *f, const arc_block *b, uint8_t **raw) {
         if (m == NULL) return 3;
         if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
             fread(m, 1, (size_t)b->raw_size, f) != (size_t)b->raw_size ||
-            arc_crc32(0, m, (size_t)b->raw_size) != b->crc) {
+            omnic_crc32(0, m, (size_t)b->raw_size) != b->crc) {
             free(m);
             return 1;
         }
@@ -1497,7 +1479,7 @@ static int decode_block(FILE *f, const arc_block *b, uint8_t **raw) {
     if (cbuf == NULL) return 3;
     if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
         fread(cbuf, 1, (size_t)b->comp_size, f) != (size_t)b->comp_size ||
-        arc_crc32(0, cbuf, (size_t)b->comp_size) != b->crc) {
+        omnic_crc32(0, cbuf, (size_t)b->comp_size) != b->crc) {
         free(cbuf);
         return 1;
     }
@@ -1955,6 +1937,7 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
         dec_ok = (avg < (4u << 20));
     }
     if (dec_ok) {
+        (void)omnic_crc32(0, "", 0); /* 预热分表：worker 可能先于主线程首调 */
         dec.path = archive_path;
         dec.res_cap = (size_t)writers + 1;
         dec.res = (dec_result *)calloc(dec.res_cap, sizeof(dec_result));
@@ -2019,7 +2002,7 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                 arc_entry *e = &ix.ent[i];
                 if (want_ent != NULL && !want_ent[i]) continue;
                 if (e->size > b->raw_size || e->in_off > b->raw_size - e->size ||
-                    arc_crc32(0, raw + e->in_off, (size_t)e->size) != e->crc) {
+                    omnic_crc32(0, raw + e->in_off, (size_t)e->size) != e->crc) {
                     if (!quiet)
                         fprintf(stderr, "omnic: entry corrupted — skipped: %s\n", e->name);
                     failed++;
@@ -2094,7 +2077,7 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
             if (want_ent != NULL && !want_ent[i]) continue; /* --file：仅目标条目 */
             /* 块内偏移越界防御（无溢出写法）；条目 CRC 为双层校验内层（§4.2） */
             if (e->size > b->raw_size || e->in_off > b->raw_size - e->size ||
-                arc_crc32(0, raw + e->in_off, (size_t)e->size) != e->crc) {
+                omnic_crc32(0, raw + e->in_off, (size_t)e->size) != e->crc) {
                 if (!quiet)
                     fprintf(stderr, "omnic: entry corrupted — skipped: %s\n", e->name);
                 failed++;

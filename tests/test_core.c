@@ -1278,6 +1278,45 @@ static void test_compressz_decode(void) {
 
 /* DoD #6（SYS-CMP-002）：决策延迟——4MB 特征提取 + 分类查表 ≤ 50ms（不含磁盘 I/O）。
  * Windows CRT 的 clock() 粒度 ~15ms，单次几毫秒测不出，跑多轮取平均。 */
+/* CRC-32：slice-by-8 与独立逐字节参考全尺寸一致 + 标准向量 + 链式续算 */
+static uint32_t ref_crc32(uint32_t crc, const void *buf, size_t n) {
+    static uint32_t tab[256];
+    static int ready = 0;
+    if (!ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            tab[i] = c;
+        }
+        ready = 1;
+    }
+    const uint8_t *p = (const uint8_t *)buf;
+    crc ^= 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) crc = tab[(crc ^ p[i]) & 0xFFu] ^ (crc >> 8);
+    return crc ^ 0xFFFFFFFFu;
+}
+
+static void test_crc32(void) {
+    CHECK(omnic_crc32(0, "123456789", 9) == 0xCBF43926u);
+    CHECK(omnic_crc32(0, "", 0) == 0u);
+    uint8_t buf[(1u << 16) + 64];
+    uint32_t s = 0x12345678u;
+    for (size_t i = 0; i < sizeof(buf); i++) {
+        s = s * 1664525u + 1013904223u;
+        buf[i] = (uint8_t)(s >> 24);
+    }
+    static const size_t sizes[] = {0,  1,  2,  7,  8,  9,  15,  16,  17,  31,  32,  33,
+                                   63, 64, 65, 127, 128, 129, 255, 256, 257,
+                                   4095, 4096, 4097, 65535, 65536, 65537};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        size_t n = sizes[i];
+        CHECK(omnic_crc32(0, buf, n) == ref_crc32(0, buf, n));
+    }
+    uint32_t half = omnic_crc32(0, buf, 40000);
+    CHECK(omnic_crc32(half, buf + 40000, sizeof(buf) - 40000) ==
+          omnic_crc32(0, buf, sizeof(buf)));
+}
+
 static void test_decision_latency(void) {
     if (OMNIC_TSAN_BUILD) {
         /* TSan 对熵扫描的减速远超套件均值（实测 1.09ms → 50ms+），预算断言无意义 */
@@ -1340,6 +1379,7 @@ int main(void) {
     test_empty_roundtrip();
     test_gzip_multimember();
     test_snappy_crc();
+    test_crc32();
     test_lzvn_decode();
     test_lzip_decode();
     test_bzip2_decode();

@@ -85,3 +85,39 @@ char *omnic_strip_ext(const char *in) {
     }
     return p;
 }
+
+/* ---- CRC-32/ISO-HDLC：slice-by-8，8 张分表消掉逐字节串行依赖链 ---- */
+static uint32_t s_crc_tab[8][256];
+static int s_crc_ready = 0;
+
+uint32_t omnic_crc32(uint32_t crc, const void *buf, size_t n) {
+    if (!s_crc_ready) {
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = i;
+            for (int k = 0; k < 8; k++) c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            s_crc_tab[0][i] = c;
+        }
+        for (uint32_t i = 0; i < 256; i++) {
+            uint32_t c = s_crc_tab[0][i];
+            for (int j = 1; j < 8; j++) {
+                c = (c >> 8) ^ s_crc_tab[0][c & 0xFFu];
+                s_crc_tab[j][i] = c;
+            }
+        }
+        s_crc_ready = 1;
+    }
+    const uint8_t *p = (const uint8_t *)buf;
+    crc ^= 0xFFFFFFFFu;
+    while (n >= 8) {
+        crc = s_crc_tab[7][(crc ^ p[0]) & 0xFFu]
+            ^ s_crc_tab[6][((crc >> 8) ^ p[1]) & 0xFFu]
+            ^ s_crc_tab[5][((crc >> 16) ^ p[2]) & 0xFFu]
+            ^ s_crc_tab[4][((crc >> 24) ^ p[3]) & 0xFFu]
+            ^ s_crc_tab[3][p[4]] ^ s_crc_tab[2][p[5]]
+            ^ s_crc_tab[1][p[6]] ^ s_crc_tab[0][p[7]];
+        p += 8;
+        n -= 8;
+    }
+    while (n--) crc = (crc >> 8) ^ s_crc_tab[0][(crc ^ *p++) & 0xFFu];
+    return crc ^ 0xFFFFFFFFu;
+}

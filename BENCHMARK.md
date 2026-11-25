@@ -11,21 +11,21 @@ audio, models, fonts, DLLs), every zip tier:**
 
 | option | ratio | archive size | vs zip | pack | single-file extract |
 |---|---|---|---|---|---|
-| zip (deflate default) | 69.22% | 100.8 MB | — | 3.8 s | 28.3 ms |
+| zip (deflate default) | 69.22% | 100.8 MB | — | 3.8 s | 27 ms |
 | zip -9 (deflate max) | 69.15% | 100.7 MB | -0.1% | 7.9 s | 28.3 ms |
-| **omnic pack** (solid, default) | **65.77%** | **95.7 MB** | **-5.0%** | **1.9 s** | 67 ms |
-| omnic pack --per-file | 68.4% | 99.6 MB | -1.2% | **1.7 s** | **8.7 ms** |
-| omnic pack --per-file -p best_ratio | 66.4% | 96.7 MB | -4.0% | 6.0 s | 8.7 ms |
-| omnic pack -p best_ratio | 63.2% | 92.0 MB | -8.7% | **11.5 s** | 67 ms |
-| omnic pack --no-skip | **62.2%** | **90.5 MB** | **-10.2%** | 12.7 s | 67 ms |
+| **omnic pack** (solid, default) | **65.77%** | **95.7 MB** | **-5.0%** | **1.56 s** | 67 ms |
+| omnic pack --per-file | 68.4% | 99.6 MB | -1.2% | **1.42 s** | **8 ms** |
+| omnic pack --per-file -p best_ratio | 66.4% | 96.7 MB | -4.0% | 5.7 s | 8 ms |
+| omnic pack -p best_ratio | 63.2% | 92.0 MB | -8.7% | **11.1 s** | 67 ms |
+| omnic pack --no-skip | **62.2%** | **90.5 MB** | **-10.2%** | 12.3 s | 67 ms |
 
-- **Smaller and faster at the default tier**: -5.0% size at half the pack time.
-- **Single-file extraction is the per-file tier's game**: 8.7 ms (process start
-  included) vs 28.3 ms for the zip CLI — 3.3×.
+- **Smaller and faster at the default tier**: -5.0% size at 40% of the pack time.
+- **Single-file extraction is the per-file tier's game**: 8 ms (process start
+  included) vs 27 ms for the zip CLI — 3.4×.
 - **The ratio ceiling**: --no-skip at -10.2% vs zip, where deflate simply
   cannot follow (it caps at 69.2% at every tier).
 
-## vs 7-Zip — the max tier
+## vs 7-Zip — the max tier (v0.3.3 window)
 
 ![omnic vs 7-Zip on Silesia](assets/bench_silesia.png)
 
@@ -45,17 +45,22 @@ Default tiers are different animals (omnic's is a speed tier, 23× faster and
 the faster one by 1.7×: block compression runs through a worker pool while a
 single 7z stream serializes LZMA2.
 
-Cross-corpus vs zip on Silesia: balanced is 3.2 pp smaller *and* 4.7× faster
-to pack (28.97% / 1.06 s vs 32.18% / 4.96 s).
+Cross-corpus vs zip on Silesia: balanced is 3.2 pp smaller, 6.6× faster
+to pack, and 26% faster to unpack (28.97% / 0.76 s vs 32.18% / 4.97 s;
+unpack 0.27 s vs 0.36 s).
 
 ## What's measured, and what it costs
 
-Recorded losses, same protocol: full unpack of the game tree is 3.9 s vs 2.6 s
-for signed tar.exe on the same zip content (Windows Defender taxes every file
-an unsigned process creates — a bare robocopy of the same tree costs 3.7 s;
-block decode+verify without writes is 0.42 s vs 0.36 s, the price of the
-per-block CRC that buys corruption isolation). On the big-file Silesia corpus
-full unpack is 0.83 s vs zip's 0.37 s. Details and the honest-losses notes
+Recorded losses, same protocol: full unpack of the game tree is 3.9 s vs 2.7 s
+for signed tar.exe on the same zip content — Windows Defender taxes every file
+an unsigned process creates (a bare robocopy of the same tree costs 3.7 s),
+and the pipeline is now fast enough to hit that per-file scan wall head-on;
+block decode+verify without writes is 0.12 s, so the per-block CRC that buys
+corruption isolation is not the bottleneck. Exclude the output directory from
+Defender and the same unpack runs **1.78 s vs tar's 2.55 s** — a 30% win. On
+the big-file Silesia corpus the former recorded loss (0.83 s vs zip's 0.37 s)
+flipped with the slice-by-8 CRC: full unpack is now **0.27 s vs 0.36 s**.
+Details and the honest-losses notes
 live in the [README's measured section](README.md#archiving-the-same-tree-versus-every-zip-tier).
 
 Corruption isolation, for the record: every block carries a CRC-32; one
@@ -68,8 +73,9 @@ damaged central directory usually gives you nothing.
 - **Corpora**: a real game tree (Luanti 5.16 + minetest_game + VoxeLibre,
   152.6 MB, 8,586 files) and the standard Silesia corpus (202 MiB, 12 files).
 - **Timing**: wall clock of the whole CLI invocation, best of 3 (pack) or
-  best of 5 (millisecond-scale extraction), on an idle machine; zip/7z rows
-  measured in the same window as their omnic counterparts.
+  5–7 (millisecond-scale extraction), on an idle machine; zip rows are
+  measured in the same window as their omnic counterparts, and the 7-Zip
+  cross-check is a v0.3.3-window snapshot.
 - **Protocols**: archive rows are directory-to-archive; the whole-stream
   table (README) follows the lzbench / Oodle published protocol. Nothing is
   extrapolated — if a cell is not measured, it is not printed.

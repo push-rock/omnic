@@ -19,4 +19,7 @@ char *omnic_strip_ext(const char *in);
 /* 去掉路径目录部分（指向 in 内部，不分配） */
 const char *omnic_basename(const char *path);
 
+/* CRC-32/ISO-HDLC（与 zip/gzip 同族）。链式续算：omnic_crc32(omnic_crc32(0, a, n), b, m) */
+uint32_t omnic_crc32(uint32_t crc, const void *buf, size_t n);
+
 #endif /* OMNIC_UTIL_H */

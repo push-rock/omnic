@@ -47,11 +47,11 @@ Binaries are built and fully tested by CI on the tagged commit. To build from so
 
 **3. Archiving beats zip.** The same real game tree, 152.6 MB (8,586 files):
 
-- The archive is **5.0% smaller than zip**; the `--no-skip` tier is **10.2% smaller** — and packing at 2.1 s is **faster than zip's default while being smaller**;
-- Single-file extraction: **8.7 ms — 3.3× faster than zip**; full unpack writes through a parallel worker pool (8 by default, `-T` to tune);
+- The archive is **5.0% smaller than zip**; the `--no-skip` tier is **10.2% smaller** — and packing at 1.56 s is **faster than zip's default while being smaller**;
+- Single-file extraction: **8 ms — 3.4× faster than zip**; full unpack writes through a parallel worker pool (8 by default, `-T` to tune);
 - Capabilities zip lacks: corruption isolation (one flipped bit kills one block — the rest still come out), `--verify` no-write full verification, `--list` without touching the data region — figures in the Measured section;
 - `--per-file` (per-entry random access) and solid (max-ratio tier, xz-class 63.2%) are one flag apart;
-- Cross-corpus confirmation on the standard Silesia benchmark: **balanced beats zip-deflate on both axes**.
+- Cross-corpus confirmation on the standard Silesia benchmark: **balanced beats zip-deflate on every axis — smaller, faster to pack, faster to unpack**.
 
 ## Supported codecs
 
@@ -109,7 +109,7 @@ All numbers measured on one machine (i7-12700, best of rounds); reproduction too
 **The headline numbers** — one figure per line, sources in the tables below:
 
 1. **Packing the same 152.6 MB game tree: the archive is 5.0% smaller than zip, and packs faster**; the `--no-skip` tier is smaller still (tables below).
-2. **Extracting one file out of 8,586 entries: 3.3× faster** — omnic 8.7 ms, zip CLI 28.3 ms, .NET library 25 ms.
+2. **Extracting one file out of 8,586 entries: 3.4× faster** — omnic 8 ms, zip CLI 27 ms, .NET library 25 ms.
 3. **Per-file algorithm selection lands within +1.4% of the theoretical optimum** (72-file hindsight control).
 4. **At equal compress speed, 6.2% smaller than `zstd -19`**; versus `gzip -9` a clean sweep — size and speed figures in the matchup table.
 5. **A 24 MB flat bitmap compresses to 744 bytes (1/33,000)** — brotli's specialty; zstd -19 / xz -9 only reach 3.0 / 4.3 KB. omnic picks brotli.
@@ -161,33 +161,33 @@ A 152.6 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files 
 
 | option | ratio | archive size | vs zip | pack | single-file extract |
 |---|---|---|---|---|---|
-| zip (deflate default) | 69.22% | 100.8 MB | — | 3.8 s | 28.3 ms |
+| zip (deflate default) | 69.22% | 100.8 MB | — | 3.8 s | 27 ms |
 | zip -9 (deflate max) | 69.15% | 100.7 MB | -0.1% | 7.9 s | 28.3 ms |
-| **omnic pack** (solid, default) | **65.77%** | **95.7 MB** | **-5.0%** | **1.9 s** | 67 ms |
-| omnic pack --per-file | 68.4% | 99.6 MB | -1.2% | **1.7 s** | **8.7 ms** |
-| omnic pack --per-file -p best_ratio | 66.4% | 96.7 MB | -4.0% | 6.0 s | 8.7 ms |
-| omnic pack --no-skip | **62.2%** | **90.5 MB** | **-10.2%** | 12.7 s | 67 ms |
-| omnic pack -p best_ratio | 63.2% | 92.0 MB | -8.7% | **11.5 s** | 67 ms |
+| **omnic pack** (solid, default) | **65.77%** | **95.7 MB** | **-5.0%** | **1.56 s** | 67 ms |
+| omnic pack --per-file | 68.4% | 99.6 MB | -1.2% | **1.42 s** | **8 ms** |
+| omnic pack --per-file -p best_ratio | 66.4% | 96.7 MB | -4.0% | 5.7 s | 8 ms |
+| omnic pack --no-skip | **62.2%** | **90.5 MB** | **-10.2%** | 12.3 s | 67 ms |
+| omnic pack -p best_ratio | 63.2% | 92.0 MB | -8.7% | **11.1 s** | 67 ms |
 
-- deflate caps at 69.2% no matter the tier (-9 spends 2.1× the time for 0.07 pp). Classification — 8,586 file opens and 3-segment samples, filesystem/antivirus latency rather than CPU — used to dominate the pack; an 8-worker pool (default, `-T` to tune) cuts it from 3.6 s to 0.7 s. Block compression runs through the same-style pool now too: blocks are built on the main thread, compressed by workers, and written in dispatch order — `best_ratio` drops from 24.2 s to 11.5 s and `--per-file` from 5.8 s to 2.5 s with byte-identical output to the serial path. The per-file codec path got its own pass: zstd contexts and buffers are reused per thread, and xz sizes its dictionary to the input for small blocks (match distances can't exceed the input length — the dictionary is right-sized for free) — `--per-file` drops to **1.7 s**, and per-file `best_ratio` from 20.8 s to **6.0 s**, with the balanced product byte-identical to 0.3.2 and the best-ratio per-file archive 133 bytes *smaller*.
-- Single-file extraction: pulling one 6 KB Lua file from 8,586 entries — omnic `--per-file` 8.7 ms (process start included), zip CLI 28.3 ms, .NET library (ZipFile + stream copy) 25 ms — **3.3× faster**; solid mode 67 ms (the cost of reading and decoding one whole 64 MiB block).
-- Unpack wall clock: 4.3 s serial → **3.9 s** with the default 8 write workers (3.6 s at `-T 2`) vs 2.6 s for signed tar.exe on the same zip. Breakdown: no-write decode+verify **0.42 s** vs 0.36 s (block decoding runs through a parallel pool now — per-file verify is 0.43 s, down from 0.73 s — but deflate decode is inherently fast, and omnic adds a per-block CRC, the price of corruption isolation); the rest is file creation, and on this machine most of that is Windows Defender real-time scanning every file an unsigned process creates (a plain robocopy of the same tree costs 3.7 s; signed tar.exe pays none of the AV tax). Exclude the output directory from Defender — or run on Linux/macOS — and the parallel writers deliver their full speedup.
-- Corruption isolation: every block carries a CRC-32; one flipped bit kills one block, extraction names the first ten affected files, then continues (`extracted 7435/8586 files`, exit code 2). A zip with a damaged central directory usually gives you nothing. `--verify` checks both CRC layers without writing (360 MB/s); `--list` reads only the tail index: 8,586 entries in 96 ms.
+- deflate caps at 69.2% no matter the tier (-9 spends 2.1× the time for 0.07 pp). Classification — 8,586 file opens and 3-segment samples, filesystem/antivirus latency rather than CPU — used to dominate the pack; an 8-worker pool (default, `-T` to tune) cuts it from 3.6 s to 0.7 s. Block compression runs through the same-style pool now too: blocks are built on the main thread, compressed by workers, and written in dispatch order — `best_ratio` drops from 24.2 s to 11.5 s and `--per-file` from 5.8 s to 2.5 s with byte-identical output to the serial path. The per-file codec path got its own pass: zstd contexts and buffers are reused per thread, and xz sizes its dictionary to the input for small blocks (match distances can't exceed the input length — the dictionary is right-sized for free) — `--per-file` drops to **1.42 s**, and per-file `best_ratio` from 20.8 s to **5.7 s**, with the balanced product byte-identical to 0.3.2 and the best-ratio per-file archive 133 bytes *smaller*. CRC-32 itself now runs slice-by-8 — ~1.3 GB/s instead of the byte-at-a-time table's ~0.36 GB/s — taking another 0.34 s off pack and 0.30 s off verify on this tree.
+- Single-file extraction: pulling one 6 KB Lua file from 8,586 entries — omnic `--per-file` 8 ms (process start included), zip CLI 27 ms, .NET library (ZipFile + stream copy) 25 ms — **3.4× faster**; solid mode 67 ms (the cost of reading and decoding one whole 64 MiB block).
+- Unpack wall clock: 4.0 s serial → **3.9 s** with the default 8 write workers vs 2.7 s for signed tar.exe on the same zip. Breakdown: no-write decode+verify is **0.12 s** (parallel block decode plus slice-by-8 CRC-32 at ~1.3 GB/s — the per-block CRC, the price of corruption isolation, no longer hands plain deflate decode a win); the rest is file creation, and on this machine nearly all of that is Windows Defender real-time scanning every file an unsigned process creates (a plain robocopy of the same tree costs 3.7 s; a faster pipeline simply hits the per-file scan wall harder — the old byte-at-a-time CRC was accidentally pacing writes below it). Exclude the output directory from Defender — or run on Linux/macOS — and the parallel writers deliver their full speedup: **1.78 s vs 2.55 s for tar.exe**, a 30% win.
+- Corruption isolation: every block carries a CRC-32; one flipped bit kills one block, extraction names the first ten affected files, then continues (`extracted 7435/8586 files`, exit code 2). A zip with a damaged central directory usually gives you nothing. `--verify` checks both CRC layers without writing (~1.3 GB/s); `--list` reads only the tail index: 8,586 entries in 96 ms.
 
 **Cross-corpus check: the standard Silesia benchmark** (12 domain-mixed files — novels, dictionary, chemistry database, C source, medical/X-ray images, binaries, XML; 202 MiB; no file extensions, so the decider routes everything through content sampling):
 
 | option | ratio | archive size | vs zip | pack |
 |---|---|---|---|---|
-| zip (deflate default) | 32.18% | 65.0 MB | — | 4.96 s |
+| zip (deflate default) | 32.18% | 65.0 MB | — | 4.97 s |
 | omnic `-p fast_compress` | 41.02% | 82.9 MB | +27.5% | **0.66 s** |
 | omnic `-p fast_decompress` | 31.37% | 63.4 MB | -2.5% | 0.74 s |
-| **omnic pack (default)** | **28.97%** | **58.6 MB** | **-10.0%** | **1.06 s** |
+| **omnic pack (default)** | **28.97%** | **58.6 MB** | **-10.0%** | **0.76 s** |
 | omnic `-p best_ratio` | **23.02%** | **46.5 MB** | **-28.5%** | 30.2 s |
 
-- balanced wins both axes: **3.2 pp smaller ratio and 4.7× the pack speed**; `fast_decompress` matches zip's ratio at 6.7× the speed; `best_ratio` sits 9.2 pp below zip — the archival tier.
-- Losses recorded: full unpack of this big-file corpus is 0.83 s vs zip's 0.37 s (solid zstd decode plus the per-block CRC isolation tax; the parallel-write path targets many-file trees like the one above). `--file` extraction of the 10 MB member takes 48 ms — decode-bound; the 8.7 ms headline is a 6 KB file.
+- balanced wins every axis: **3.2 pp smaller ratio, 6.6× the pack speed, and full unpack 0.27 s vs zip's 0.36 s**; `fast_decompress` matches zip's ratio at 6.7× the speed; `best_ratio` sits 9.2 pp below zip — the archival tier.
+- Full unpack was the recorded loss on this corpus (0.83 s vs zip's 0.37 s); slice-by-8 CRC-32 flipped it — **0.27 s vs 0.36 s**. `--file` extraction of the 10 MB member takes 48 ms — decode-bound; the 8 ms headline is a 6 KB file.
 
-**The 7-Zip cross-check** (same machine and window, Silesia 12-file tree — 7zr 26.06, LZMA2):
+**The 7-Zip cross-check** (v0.3.3 window, same machine — 7zr 26.06, LZMA2, both sides measured together; omnic has gained pack speed since):
 
 | option | ratio | pack |
 |---|---|---|

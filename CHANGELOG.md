@@ -2,6 +2,27 @@
 
 All notable changes to omnic. Format follows [Keep a Changelog](https://keepachangelog.com); versioning is semantic.
 
+## [Unreleased]
+
+### Changed — CRC-32 slice-by-8
+
+- `omnic_crc32` (the archive CRC-32, zip-compatible ISO-HDLC) now runs
+  slice-by-8: eight derived tables break the byte-at-a-time serial
+  dependency chain. Bit-identical results — old and new binaries pack
+  byte-identical archives, and existing archives verify unchanged.
+- The CRC tables are warmed on the main thread before worker pools
+  spawn, so first-call lazy init no longer depends on call order.
+- Measured, same window, best of 3 (152.6 MB game tree / 202 MiB
+  Silesia): verify 0.42 s → **0.12 s** (CRC throughput ~360 → ~1300
+  MB/s), pack 1.9 s → **1.56 s**, `--per-file` 1.7 s → **1.42 s**,
+  `best_ratio` 11.5 s → **11.1 s**, `--no-skip` 12.7 s → **12.3 s**;
+  Silesia pack 1.06 s → **0.76 s**, and its full unpack flipped from
+  the recorded loss (0.83 s vs zip's 0.37 s) to **0.27 s vs 0.36 s**.
+  Single-file extract 8.7 ms → **8 ms**. Game-tree unpack wall clock
+  stays 3.9 s — Windows Defender's per-file scan tax dominates it
+  (robocopy baseline 3.7 s); with the output dir excluded from Defender
+  it is 1.78 s vs tar.exe's 2.55 s.
+
 ## [0.3.3] — 2026-11-19
 
 ### Changed — parallel block compression in pack (T12)
