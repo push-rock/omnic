@@ -37,6 +37,32 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
   unchanged. New regression test: few-big-files shape unpacks
   identical through both the pool and serial paths.
 
+### Added — FORMAT.md: public v1 archive spec
+
+- The complete byte-level definition of the `.omnic` container: layout
+  diagram, header/data/index/footer fields, the 17-value codec id
+  table, CRC definitions, path rules, packing strategies, unpacker
+  behavior and corruption isolation semantics, v1 limits, and the
+  freeze-and-evolve compatibility promise — written so a third party
+  can reimplement a decoder from it alone. The README now links it as
+  the contract behind the container pitch.
+
+### Changed — README/BENCHMARK restructure (same-window Pareto data)
+
+- All published numbers re-measured in one window with the competitors
+  interleaved (7-Zip 26.06 restored on the machine — the frozen
+  v0.3.3-window snapshot note is retired), best-of-3 (best-of-7 for
+  millisecond extraction). New charts: single-stream compress and
+  decode Pareto (202 MiB Silesia tar, 16 configurations), and the
+  archive ladder vs zip/7-Zip on both corpora.
+- README restructured: the Why section carries the one-container
+  vision and points at FORMAT.md; an Architecture section (pipeline
+  diagram) is new; Measured results is regrouped into Pareto picture /
+  per-type picks (public Silesia corpus) / archiving / honest losses.
+  zh-CN mirrored. Old hero/matrix/panorama images removed with their
+  sections; honest-losses consolidated (solid `--file` extract, per-file
+  best_ratio vs 7z, Defender tax, `--list` re-measured at 7.5 ms).
+
 ## [0.3.3] — 2026-11-19
 
 ### Changed — parallel block compression in pack (T12)
