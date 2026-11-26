@@ -89,7 +89,32 @@ is covered there.
 
 The pack path is a pipeline: identify each file, pick its codec, compress, and pack into a CRC-verified container.
 
-![Architecture: the pack pipeline — input files → format adapters → decider → codec pool → .omnic container → archive.omnic](assets/architecture.png)
+```mermaid
+flowchart TD
+    cli[CLI / C API]
+    adapters[format adapters]
+    decider[decider]
+    codecs[codec pool]
+    container[".omnic container"]
+    archive[("archive.omnic")]
+
+    cli -->|input files| adapters
+    adapters -->|type + stats| decider
+    decider -->|chosen codec| codecs
+    codecs -->|compressed blocks| container
+    container --> archive
+
+    classDef entry fill:#4C72B0,stroke:#4C72B0,color:#FFFFFF
+    classDef stage fill:#F1F5FA,stroke:#9FB3D9,color:#2F2F2F
+    classDef hero fill:#FFFFFF,stroke:#C44E52,stroke-width:2px,color:#2F2F2F
+    classDef out fill:#FAFAFA,stroke:#C9C9C9,color:#2F2F2F
+    class cli entry
+    class adapters,decider,codecs stage
+    class container hero
+    class archive out
+```
+
+The stages: **format adapters** identify each file by magic (14 sniffers, magic first, extension fallback); the **decider** picks the right codec per file in ~1 ms (3-segment sample, 8 features, 7 content classes); the **codec pool** compresses with 16 vendored codecs, encode threaded through worker pools; the **.omnic container** writes blocks, index, and double CRC — a corrupt block is isolated, the rest still extracts. `d` / `unpack` runs the same pipeline in reverse.
 
 - **pack**: a classify pool (8 workers) walks the tree, buckets files by
   compression affinity, blocks are built on the main thread, compressed by

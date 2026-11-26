@@ -59,7 +59,32 @@ scoop install omnic
 
 pack 路径是一条流水线：识别每个文件、为它选 codec、压缩、装进带 CRC 校验的容器。
 
-![架构：pack 流水线——输入文件 → 格式适配层 → 决策器 → codec 池 → .omnic 容器 → archive.omnic](assets/architecture.png)
+```mermaid
+flowchart TD
+    cli[CLI / C API]
+    adapters[格式适配层]
+    decider[决策器]
+    codecs[codec 池]
+    container[".omnic 容器"]
+    archive[("archive.omnic")]
+
+    cli -->|输入文件| adapters
+    adapters -->|类型 + 特征| decider
+    decider -->|选定的 codec| codecs
+    codecs -->|压缩后的块| container
+    container --> archive
+
+    classDef entry fill:#4C72B0,stroke:#4C72B0,color:#FFFFFF
+    classDef stage fill:#F1F5FA,stroke:#9FB3D9,color:#2F2F2F
+    classDef hero fill:#FFFFFF,stroke:#C44E52,stroke-width:2px,color:#2F2F2F
+    classDef out fill:#FAFAFA,stroke:#C9C9C9,color:#2F2F2F
+    class cli entry
+    class adapters,decider,codecs stage
+    class container hero
+    class archive out
+```
+
+各阶段：**格式适配层**靠 magic 识别每个文件（14 个嗅探器，magic 优先、扩展名兜底）；**决策器**在 ~1 ms 内为每个文件选对 codec（3 段采样、8 项特征、7 个内容类别）；**codec 池**用 16 个内置 codec 压缩，编码经 worker 池多线程；**.omnic 容器**写块、索引与双重 CRC——坏块被隔离，其余照常解出。`d` / `unpack` 沿同一条流水线反向执行。
 
 - **pack**：分类池（8 worker）遍历目录树，按压缩亲和性分桶，主线程构块，第二个 worker 池压块、按派发序写出——并行与串行产物逐字节相同。
 - **unpack**：解码池超前解块，主循环按序收割条目、过 CRC，交给写盘池（≥32 条目或 ≥8 MiB 时启用）；CRC-32 走 slice-by-8。
