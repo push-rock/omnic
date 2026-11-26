@@ -87,32 +87,7 @@ is covered there.
 
 ## Architecture
 
-```
-                      +---------------------------------------+
-                      |            CLI  /  C API             |
-                      |   c  d  pack  unpack  analyze  list   |
-                      +-------------------+-------------------+
-                                          |
-            +-----------------------------+-----------------------------+
-            |                             |                             |
-  +---------v---------+     +-------------v-------------+   +-----------v-----------+
-  |     decider       |     |    .omnic container v1    |   |    format adapters    |
-  |  ~1 ms per file   |     |  blocks | index | 2 CRCs  |   |  14 magic sniffers,   |
-  | 3-segment sample, |     |  (frozen spec: FORMAT.md) |   |  magic first, ext     |
-  | 8 features,       +---->+  solid / per-file / skip  |   |  fallback             |
-  | 7 content classes |     |  corruption isolation     |   +-----------+-----------+
-  +---------+---------+     +-------------+-------------+               |
-            |                             |                             |
-            +-----------------------------+-----------------------------+
-                                          |
-              +---------------------------v---------------------------+
-              |             codec pool — 16 vendored codecs           |
-              | zstd* lz4 xz* lzma zlib x3 brotli snappy lzfse ...    |
-              |        (* multithreaded encode through worker pools)  |
-              +-----------------------------------------------------+
-                one adapter interface (src/codec/ac_*.c): a new codec
-                is one file plus one registry entry
-```
+![Architecture: CLI over three subsystems (decider, .omnic container, format adapters) over the codec pool](assets/architecture.png)
 
 - **pack**: a classify pool (8 workers) walks the tree, buckets files by
   compression affinity, blocks are built on the main thread, compressed by
