@@ -1,0 +1,93 @@
+# omnic architecture — render with:
+#   d2 --layout=tala architecture.d2 architecture.svg
+#   d2 --layout=tala architecture.d2 architecture.png --scale=2
+# Palette matches the README charts (seaborn accents).
+
+vars: {
+  blue: "#4C72B0"
+  red: "#C44E52"
+  ink: "#2F2F2F"
+  pale: "#F1F5FA"
+  line: "#8C8C8C"
+}
+
+direction: down
+
+classes: {
+  head: { style: { fill: "${blue}"; stroke: "${blue}"; font-color: "#FFFFFF"; border-radius: 10 } }
+  sub:  { style: { fill: "${pale}"; stroke: "#9FB3D9"; font-color: "${ink}"; border-radius: 8 } }
+  hero: { style: { fill: "#FFFFFF"; stroke: "${red}"; stroke-width: 2; font-color: "${ink}"; border-radius: 8 } }
+  pool: { style: { fill: "#FAFAFA"; stroke: "#C9C9C9"; font-color: "${ink}"; border-radius: 10 } }
+}
+
+cli: {
+  label: |md
+    ### **CLI / C API**
+
+    `c` · `d` · `pack` · `unpack` · `analyze` · `list`
+  |
+  class: head
+}
+
+decider: {
+  label: |md
+    ### **decider**
+
+    ~1 ms per file
+
+    3-segment sample · 8 features · 7 content classes
+  |
+  class: sub
+}
+
+container: {
+  label: |md
+    ### **.omnic container v1**
+
+    blocks · index · double CRC
+
+    solid / per-file / skip
+
+    corruption isolation — spec: FORMAT.md
+  |
+  class: hero
+}
+
+adapters: {
+  label: |md
+    ### **format adapters**
+
+    14 magic sniffers
+
+    magic first, extension fallback
+  |
+  class: sub
+}
+
+pool: {
+  label: |md
+    ### **codec pool — 16 vendored codecs**
+
+    `zstd`* `lz4` `xz`* `lzma` `zlib` ×3 `brotli`
+
+    `snappy` `lzfse` `lzvn` `lzip` `bzip2` `compress`
+
+    *multithreaded encode through worker pools
+  |
+  class: pool
+}
+
+note: {
+  label: |md
+    one adapter interface (`src/codec/ac_*.c`) — a new codec is one file plus one registry entry
+  |
+  near: bottom-center
+  style.font-color: "#666666"
+}
+
+cli -> decider
+cli -> container
+cli -> adapters
+decider -> pool
+container -> pool
+adapters -> pool
