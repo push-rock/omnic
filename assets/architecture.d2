@@ -22,16 +22,16 @@ classes: {
 
 cli: {
   label: |md
-    ### **CLI / C API**
+    **CLI / C API**
 
-    `c` · `d` · `pack` · `unpack` · `analyze` · `list`
+    c · d · pack · unpack · analyze · list
   |
   class: head
 }
 
 decider: {
   label: |md
-    ### **decider**
+    **decider**
 
     ~1 ms per file
 
@@ -42,7 +42,7 @@ decider: {
 
 container: {
   label: |md
-    ### **.omnic container v1**
+    **.omnic container v1**
 
     blocks · index · double CRC
 
@@ -55,7 +55,7 @@ container: {
 
 adapters: {
   label: |md
-    ### **format adapters**
+    **format adapters**
 
     14 magic sniffers
 
@@ -66,11 +66,11 @@ adapters: {
 
 pool: {
   label: |md
-    ### **codec pool — 16 vendored codecs**
+    **codec pool — 16 vendored codecs**
 
-    `zstd`* `lz4` `xz`* `lzma` `zlib` ×3 `brotli`
+    zstd*  lz4  xz*  lzma  zlib ×3  brotli
 
-    `snappy` `lzfse` `lzvn` `lzip` `bzip2` `compress`
+    snappy  lzfse  lzvn  lzip  bzip2  compress
 
     *multithreaded encode through worker pools
   |
@@ -79,15 +79,15 @@ pool: {
 
 note: {
   label: |md
-    one adapter interface (`src/codec/ac_*.c`) — a new codec is one file plus one registry entry
+    one adapter interface (src/codec/ac_*.c) — a new codec is one file plus one registry entry
   |
   near: bottom-center
   style.font-color: "#666666"
 }
 
-cli -> decider
-cli -> container
-cli -> adapters
-decider -> pool
-container -> pool
-adapters -> pool
+cli -> decider: { style: { stroke: "${line}" } }
+cli -> container: { style: { stroke: "${line}" } }
+cli -> adapters: { style: { stroke: "${line}" } }
+decider -> pool: { style: { stroke: "${line}" } }
+container -> pool: { style: { stroke: "${line}" } }
+adapters -> pool: { style: { stroke: "${line}" } }
