@@ -184,8 +184,8 @@ A 152.6 MB real game tree (Luanti 5.16 + minetest_game + VoxeLibre; 8,586 files 
 | **omnic pack (default)** | **28.97%** | **58.6 MB** | **-10.0%** | **0.76 s** |
 | omnic `-p best_ratio` | **23.02%** | **46.5 MB** | **-28.5%** | 30.2 s |
 
-- balanced wins every axis: **3.2 pp smaller ratio, 6.6× the pack speed, and full unpack 0.27 s vs zip's 0.36 s**; `fast_decompress` matches zip's ratio at 6.7× the speed; `best_ratio` sits 9.2 pp below zip — the archival tier.
-- Full unpack was the recorded loss on this corpus (0.83 s vs zip's 0.37 s); slice-by-8 CRC-32 flipped it — **0.27 s vs 0.36 s**. `--file` extraction of the 10 MB member takes 48 ms — decode-bound; the 8 ms headline is a 6 KB file.
+- balanced wins every axis: **3.2 pp smaller ratio, 6.5× the pack speed, and full unpack 0.20 s vs zip's 0.37 s**; `fast_decompress` matches zip's ratio at 6.7× the speed; `best_ratio` sits 9.2 pp below zip — the archival tier.
+- Full unpack was the recorded loss on this corpus (0.83 s vs zip's 0.37 s); slice-by-8 CRC-32 flipped it to 0.27 s, and the write pool's 32-entry gate now admits big-file archives too (Silesia: 12 entries, 202 MiB) so writes overlap the decode — **0.20 s vs 0.37 s**. `--file` extraction of the 10 MB member takes 48 ms — decode-bound; the 8 ms headline is a 6 KB file.
 
 **The 7-Zip cross-check** (v0.3.3 window, same machine — 7zr 26.06, LZMA2, both sides measured together; omnic has gained pack speed since):
 

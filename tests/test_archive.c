@@ -421,6 +421,45 @@ static void test_roundtrip_big(void) {
     remove(ARC);
 }
 
+/* 少而大的 solid 形态：条目 <32 但写量 ≥8MiB，写盘池按字节门启用（原本只认
+ * 条目数，Silesia 形态曾因此退化为串行写）。池化与串行解包均须与源树一致。 */
+static void test_fewbig_pool(void) {
+    const char *root = "omnic_arc_fewbig";
+    rm_tree(root);
+    omnic_fs_mkdir_p(root);
+    static char buf[256 * 1024];
+    for (int fi = 0; fi < 3; fi++) {
+        char p[512];
+        snprintf(p, sizeof(p), "%s/big%d.txt", root, fi);
+        FILE *f = omnic_fs_fopen(p, "wb");
+        CHECK(f != NULL);
+        if (f == NULL) return;
+        for (size_t blk = 0; blk < (4u << 20) / sizeof(buf); blk++) {
+            fill_text(buf, sizeof(buf));
+            fwrite(buf, 1, sizeof(buf), f);
+        }
+        fclose(f);
+    }
+    CHECK(pack_tree(root, ARC, mkopts(OMNIC_F_QUIET, 2)) == OMNIC_OK);
+
+    omnic_options o8 = mkopts(OMNIC_F_QUIET, 2);
+    o8.threads = 8;
+    rm_tree("omnic_arc_fewbig_p8");
+    CHECK(unpack_arc(ARC, "omnic_arc_fewbig_p8", o8) == OMNIC_OK);
+    CHECK(tree_equal(root, "omnic_arc_fewbig_p8"));
+
+    omnic_options o1 = mkopts(OMNIC_F_QUIET, 2);
+    o1.threads = 1;
+    rm_tree("omnic_arc_fewbig_p1");
+    CHECK(unpack_arc(ARC, "omnic_arc_fewbig_p1", o1) == OMNIC_OK);
+    CHECK(tree_equal(root, "omnic_arc_fewbig_p1"));
+
+    rm_tree("omnic_arc_fewbig_p8");
+    rm_tree("omnic_arc_fewbig_p1");
+    rm_tree(root);
+    remove(ARC);
+}
+
 static void test_extract(void) {
     make_tree();
     CHECK(pack_tree(TREE, ARC, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
@@ -1073,6 +1112,7 @@ int main(void) {
     test_malformed();
     test_bounds();
     test_parallel();
+    test_fewbig_pool();
     test_pack_determinism();
     test_pack_parallel_blocks();
     test_decode_pool();

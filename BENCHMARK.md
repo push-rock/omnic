@@ -45,9 +45,9 @@ Default tiers are different animals (omnic's is a speed tier, 23× faster and
 the faster one by 1.7×: block compression runs through a worker pool while a
 single 7z stream serializes LZMA2.
 
-Cross-corpus vs zip on Silesia: balanced is 3.2 pp smaller, 6.6× faster
-to pack, and 26% faster to unpack (28.97% / 0.76 s vs 32.18% / 4.97 s;
-unpack 0.27 s vs 0.36 s).
+Cross-corpus vs zip on Silesia: balanced is 3.2 pp smaller, 6.5× faster
+to pack, and 1.8× faster to unpack (28.97% / 0.76 s vs 32.18% / 4.97 s;
+unpack 0.20 s vs 0.37 s).
 
 ## What's measured, and what it costs
 
@@ -59,7 +59,9 @@ block decode+verify without writes is 0.12 s, so the per-block CRC that buys
 corruption isolation is not the bottleneck. Exclude the output directory from
 Defender and the same unpack runs **1.78 s vs tar's 2.55 s** — a 30% win. On
 the big-file Silesia corpus the former recorded loss (0.83 s vs zip's 0.37 s)
-flipped with the slice-by-8 CRC: full unpack is now **0.27 s vs 0.36 s**.
+flipped twice — slice-by-8 CRC-32, then the write-pool entry-count gate
+learning to admit big-file shapes (12 entries, 202 MiB) so writes overlap
+the decode: full unpack is now **0.20 s vs 0.37 s**.
 Details and the honest-losses notes
 live in the [README's measured section](README.md#archiving-the-same-tree-versus-every-zip-tier).
 

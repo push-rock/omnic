@@ -23,6 +23,20 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
   (robocopy baseline 3.7 s); with the output dir excluded from Defender
   it is 1.78 s vs tar.exe's 2.55 s.
 
+### Fixed — write-pool gate for big-file archives
+
+- The unpack write pool only engaged at 32+ entries, so a big-file
+  archive (Silesia: 12 entries, 202 MiB) wrote everything inline on the
+  main thread — unpack stacked decode + write instead of overlapping
+  them. The gate now also admits archives whose decoded size is ≥8 MiB
+  (a 2-entry minimum keeps single-file extraction pool-free).
+- Measured same-window, outputs byte-identical to the serial path
+  (game tree, 8,586 files; Silesia 12; cross-block `--file` pairs):
+  Silesia full unpack **0.27 s → 0.20 s** vs zip's 0.37 s (1.8×),
+  verify unchanged at 0.19 s, game-tree unpack and `--file` extraction
+  unchanged. New regression test: few-big-files shape unpacks
+  identical through both the pool and serial paths.
+
 ## [0.3.3] — 2026-11-19
 
 ### Changed — parallel block compression in pack (T12)

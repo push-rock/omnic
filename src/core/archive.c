@@ -380,7 +380,8 @@ static omnic_status arc_compress_mem(const uint8_t *buf, size_t n,
 #define CLS_BATCH 16
 #define ARC_NWRITER_DEFAULT 8
 #define ARC_NWRITER_MAX 64
-#define ARC_PAR_MIN_JOBS 32 /* 低于此数走串行：--file 单提取不付池启动成本 */
+#define ARC_PAR_MIN_JOBS 32 /* 条目数门槛：--file 单提取不付池启动成本 */
+#define ARC_PAR_MIN_BYTES (8u << 20) /* 写量门槛：少而大的 solid 形态同样启池 */
 
 typedef struct {
     const omnic_fs_entry *fs;
@@ -1902,12 +1903,21 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
     }
 
     /* 并行判定：单线程/小作业量走串行原路径（--file 单提取 8.7ms 不启池） */
+    /* 写量/块量预算先行：并行写盘判据要用（条目数或总字节任一过线） */
+    size_t n_decode_blks = 0;
+    uint64_t dec_raw_sum = 0;
+    for (size_t bi = 0; bi < ix.nblk; bi++)
+        if (want_blk == NULL || want_blk[bi]) {
+            n_decode_blks++;
+            dec_raw_sum += ix.blk[bi].raw_size;
+        }
     int writers = ARC_NWRITER_DEFAULT;
     if (o != NULL && o->threads == 1) writers = 1;
     else if (o != NULL && o->threads > 1) writers = o->threads;
     if (writers > ARC_NWRITER_MAX) writers = ARC_NWRITER_MAX;
     arc_pool pool;
-    int parallel = (!verify_only && writers > 1 && njobs >= ARC_PAR_MIN_JOBS &&
+    int parallel = (!verify_only && writers > 1 && njobs >= 2 &&
+                    (njobs >= ARC_PAR_MIN_JOBS || dec_raw_sum >= ARC_PAR_MIN_BYTES) &&
                     pool_init(&pool, &ix, dstroot, writers) == 0);
     unsigned char *went = NULL;
     if (parallel) {
@@ -1920,22 +1930,8 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
     }
 
     /* 解码池（B）：≥2 个待解块才有并行价值（单块无重叠窗口）；--file 单命中
-     * 通常单块，自然落回串行。res 环容量 = workers+1 > 在途上限 workers。
-     * 块粒度闸门：verify 无写盘竞争，恒开（实测 solid 0.56→0.42s）；unpack
-     * 写盘池在场时仅小块形态开——巨块并发解压与写盘争内存带宽，实测 solid
-     * unpack 反噬 +21%，串行解码 + 并行写盘本就是更优流水线。 */
-    size_t n_decode_blks = 0;
-    uint64_t dec_raw_sum = 0;
-    for (size_t bi = 0; bi < ix.nblk; bi++)
-        if (want_blk == NULL || want_blk[bi]) {
-            n_decode_blks++;
-            dec_raw_sum += ix.blk[bi].raw_size;
-        }
+     * 通常单块，自然落回串行。res 环容量 = workers+1 > 在途上限 workers。 */
     int dec_ok = (writers > 1 && n_decode_blks >= 2);
-    if (dec_ok && parallel && !verify_only) {
-        uint64_t avg = dec_raw_sum / n_decode_blks;
-        dec_ok = (avg < (4u << 20));
-    }
     if (dec_ok) {
         (void)omnic_crc32(0, "", 0); /* 预热分表：worker 可能先于主线程首调 */
         dec.path = archive_path;
