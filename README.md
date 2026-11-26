@@ -87,7 +87,9 @@ is covered there.
 
 ## Architecture
 
-![Architecture: CLI over three subsystems (decider, .omnic container, format adapters) over the codec pool](assets/architecture.png)
+The pack path is a pipeline: identify each file, pick its codec, compress, and pack into a CRC-verified container.
+
+![Architecture: the pack pipeline — input files → format adapters → decider → codec pool → .omnic container → archive.omnic](assets/architecture.png)
 
 - **pack**: a classify pool (8 workers) walks the tree, buckets files by
   compression affinity, blocks are built on the main thread, compressed by

@@ -57,7 +57,9 @@ scoop install omnic
 
 ## 架构
 
-![架构：CLI 之下三个子系统（决策器、.omnic 容器、格式适配层），底层是 codec 池](assets/architecture.png)
+pack 路径是一条流水线：识别每个文件、为它选 codec、压缩、装进带 CRC 校验的容器。
+
+![架构：pack 流水线——输入文件 → 格式适配层 → 决策器 → codec 池 → .omnic 容器 → archive.omnic](assets/architecture.png)
 
 - **pack**：分类池（8 worker）遍历目录树，按压缩亲和性分桶，主线程构块，第二个 worker 池压块、按派发序写出——并行与串行产物逐字节相同。
 - **unpack**：解码池超前解块，主循环按序收割条目、过 CRC，交给写盘池（≥32 条目或 ≥8 MiB 时启用）；CRC-32 走 slice-by-8。

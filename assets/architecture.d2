@@ -1,7 +1,9 @@
-# omnic architecture — render with:
+# omnic architecture — the pack pipeline.
+# Render with:
 #   d2 --layout=tala architecture.d2 architecture.svg
 #   d2 --layout=tala architecture.d2 architecture.png --scale=2
-# Palette matches the README charts (seaborn accents).
+# Grammar follows the ffmpeg docs diagrams: components as boxes,
+# artifacts as endpoints, every arrow labeled with what flows.
 
 vars: {
   blue: "#4C72B0"
@@ -14,10 +16,10 @@ vars: {
 direction: down
 
 classes: {
-  head: { style: { fill: "${blue}"; stroke: "${blue}"; font-color: "#FFFFFF"; border-radius: 10 } }
-  sub:  { style: { fill: "${pale}"; stroke: "#9FB3D9"; font-color: "${ink}"; border-radius: 8 } }
-  hero: { style: { fill: "#FFFFFF"; stroke: "${red}"; stroke-width: 2; font-color: "${ink}"; border-radius: 8 } }
-  pool: { style: { fill: "#FAFAFA"; stroke: "#C9C9C9"; font-color: "${ink}"; border-radius: 10 } }
+  entry: { style: { fill: "${blue}"; stroke: "${blue}"; font-color: "#FFFFFF"; border-radius: 10 } }
+  stage: { style: { fill: "${pale}"; stroke: "#9FB3D9"; font-color: "${ink}"; border-radius: 8 } }
+  hero:  { style: { fill: "#FFFFFF"; stroke: "${red}"; stroke-width: 2; font-color: "${ink}"; border-radius: 8 } }
+  out:   { style: { fill: "#FAFAFA"; stroke: "#C9C9C9"; font-color: "${ink}"; border-radius: 8 } }
 }
 
 cli: {
@@ -26,68 +28,73 @@ cli: {
 
     c · d · pack · unpack · analyze · list
   |
-  class: head
-}
-
-decider: {
-  label: |md
-    **decider**
-
-    ~1 ms per file
-
-    3-segment sample · 8 features · 7 content classes
-  |
-  class: sub
-}
-
-container: {
-  label: |md
-    **.omnic container v1**
-
-    blocks · index · double CRC
-
-    solid / per-file / skip
-
-    corruption isolation — spec: FORMAT.md
-  |
-  class: hero
+  class: entry
 }
 
 adapters: {
   label: |md
-    **format adapters**
+    **1 · format adapters**
 
-    14 magic sniffers
+    identify every incoming file
 
-    magic first, extension fallback
+    14 magic sniffers — magic first, extension fallback
   |
-  class: sub
+  class: stage
 }
 
-pool: {
+decider: {
   label: |md
-    **codec pool — 16 vendored codecs**
+    **2 · decider**
 
-    zstd*  lz4  xz*  lzma  zlib ×3  brotli
+    picks the right codec per file, ~1 ms
 
-    snappy  lzfse  lzvn  lzip  bzip2  compress
-
-    *multithreaded encode through worker pools
+    3-segment sample · 8 features · 7 content classes
   |
-  class: pool
+  class: stage
 }
+
+codecs: {
+  label: |md
+    **3 · codec pool**
+
+    16 vendored codecs do the compressing
+
+    zstd · lz4 · xz · brotli · snappy · …
+
+    encode runs threaded in worker pools
+  |
+  class: stage
+}
+
+container: {
+  label: |md
+    **4 · .omnic container**
+
+    packs blocks + index + double CRC
+
+    a corrupt block is isolated — the rest extracts
+  |
+  class: hero
+}
+
+archive: {
+  label: "archive.omnic"
+  shape: document
+  class: out
+}
+
+e1: cli -> adapters { label: "input files"; style: { stroke: "${line}" } }
+e2: adapters -> decider { label: "type + stats"; style: { stroke: "${line}" } }
+e3: decider -> codecs { label: "chosen codec"; style: { stroke: "${line}" } }
+e4: codecs -> container { label: "compressed blocks"; style: { stroke: "${line}" } }
+e5: container -> archive { label: "write"; style: { stroke: "${line}" } }
 
 note: {
   label: |md
-    one adapter interface (src/codec/ac_*.c) — a new codec is one file plus one registry entry
+    d / unpack runs the reverse pipeline — every block CRC-checked, corrupt blocks isolated, the rest extracts.
+
+    a new codec is one file (src/codec/ac_*.c) plus one registry entry.
   |
   near: bottom-center
   style.font-color: "#666666"
 }
-
-cli -> decider: { style: { stroke: "${line}" } }
-cli -> container: { style: { stroke: "${line}" } }
-cli -> adapters: { style: { stroke: "${line}" } }
-decider -> pool: { style: { stroke: "${line}" } }
-container -> pool: { style: { stroke: "${line}" } }
-adapters -> pool: { style: { stroke: "${line}" } }
