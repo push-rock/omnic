@@ -575,10 +575,18 @@ static void test_extract(void) {
         remove(lf);
     }
 
+    /* --file 反斜杠路径（Windows 习惯）：匹配前规范化成 '/'，照常命中 */
+    rm_tree("omnic_arc_x5");
+    const char *names5[] = {"中文目录\\中文文件.txt"};
+    memset(&g_rep, 0, sizeof(g_rep));
+    CHECK(omnic_unpack_files(ARC, "omnic_arc_x5", names5, 1, &o, &g_rep) == OMNIC_OK);
+    CHECK(omnic_fs_fopen("omnic_arc_x5/中文目录/中文文件.txt", "rb") != NULL);
+
     rm_tree("omnic_arc_x1");
     rm_tree("omnic_arc_x2");
     rm_tree("omnic_arc_x3");
     rm_tree("omnic_arc_x4");
+    rm_tree("omnic_arc_x5");
     remove(ARC);
     rm_tree(TREE);
 }

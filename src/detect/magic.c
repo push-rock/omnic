@@ -3,7 +3,7 @@
 #include <string.h>
 
 typedef struct {
-    uint8_t bytes[8];
+    uint8_t bytes[12]; /* 最长魔数：snappy framed 标识 10 字节 */
     uint8_t len;
     omnic_fmt_id fmt;
 } omnic_magic;
@@ -11,14 +11,16 @@ typedef struct {
 /* 前缀表（需求 4.4 节）：长前缀在前，保证精确优先。
  * zlib stream 的 CMF/FLG 组合仅枚举常见值（78 01/5E/9C/DA）。 */
 static const omnic_magic g_magic[] = {
-    {{0xFF, 0x06, 0x00, 0x00, 0x53, 0x4E, 0x50, 0x41}, 8, OMNIC_FMT_SNAPPY},   /* sNaPpY framed */
+    {{0xFF, 0x06, 0x00, 0x00, 0x73, 0x4E, 0x61, 0x50, 0x70, 0x59}, 10, OMNIC_FMT_SNAPPY}, /* sNaPpY framed */
     {{0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00}, 6, OMNIC_FMT_XZ},                   /* \xfd7zXZ\0 */
     {{0x28, 0xB5, 0x2F, 0xFD}, 4, OMNIC_FMT_ZSTD},
     {{0x4C, 0x5A, 0x49, 0x50}, 4, OMNIC_FMT_LZIP},                             /* "LZIP" */
     {{0x04, 0x22, 0x4D, 0x18}, 4, OMNIC_FMT_LZ4},
-    {{0x62, 0x76, 0x78, 0x2D}, 4, OMNIC_FMT_LZFSE},                            /* "bvx-" */
+    {{0x62, 0x76, 0x78, 0x31}, 4, OMNIC_FMT_LZFSE},                            /* "bvx1" */
+    {{0x62, 0x76, 0x78, 0x32}, 4, OMNIC_FMT_LZFSE},                            /* "bvx2" */
+    {{0x62, 0x76, 0x78, 0x2D}, 4, OMNIC_FMT_LZFSE},                            /* "bvx-" raw block */
+    {{0x62, 0x76, 0x78, 0x6E}, 4, OMNIC_FMT_LZVN},                             /* "bvxn" lzvn block */
     {{0x42, 0x5A, 0x68}, 3, OMNIC_FMT_BZIP2},                                  /* "BZh" */
-    {{0x62, 0x76, 0x6E}, 3, OMNIC_FMT_LZVN},                                   /* "bvn" */
     {{0x5D, 0x00, 0x00}, 3, OMNIC_FMT_LZMA_ALONE},                             /* props 0x5D + size */
     {{0x1F, 0x8B}, 2, OMNIC_FMT_GZIP},
     {{0x1F, 0x9D}, 2, OMNIC_FMT_COMPRESS_Z},

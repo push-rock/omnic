@@ -360,6 +360,14 @@ static void test_detect(void) {
     CHECK(omnic_detect_magic((const uint8_t *)"\xFD\x37\x7A\x58\x5A\x00", 6) == OMNIC_FMT_XZ);
     CHECK(omnic_detect_magic((const uint8_t *)"\x42\x5A\x68\x31", 4) == OMNIC_FMT_BZIP2);
     CHECK(omnic_detect_magic((const uint8_t *)"\x04\x22\x4D\x18", 4) == OMNIC_FMT_LZ4);
+    CHECK(omnic_detect_magic((const uint8_t *)"\xFF\x06\x00\x00\x73\x4E\x61\x50\x70\x59", 10) == OMNIC_FMT_SNAPPY);
+    CHECK(omnic_detect_magic((const uint8_t *)"\x62\x76\x78\x31", 4) == OMNIC_FMT_LZFSE);
+    CHECK(omnic_detect_magic((const uint8_t *)"\x62\x76\x78\x32", 4) == OMNIC_FMT_LZFSE);
+    CHECK(omnic_detect_magic((const uint8_t *)"\x62\x76\x78\x2D", 4) == OMNIC_FMT_LZFSE);
+    CHECK(omnic_detect_magic((const uint8_t *)"\x62\x76\x78\x6E", 4) == OMNIC_FMT_LZVN);
+    /* 旧 bug 里的错误魔数必须不再命中：snappy 的 "SNPA"、lzvn 的三字节 "bvn" */
+    CHECK(omnic_detect_magic((const uint8_t *)"\xFF\x06\x00\x00\x53\x4E\x50\x41", 8) == OMNIC_FMT_UNKNOWN);
+    CHECK(omnic_detect_magic((const uint8_t *)"\x62\x76\x6E", 3) == OMNIC_FMT_UNKNOWN);
     CHECK(omnic_detect_magic((const uint8_t *)"\x78\x9C", 2) == OMNIC_FMT_ZLIB);
     CHECK(omnic_detect_magic((const uint8_t *)"\x1F\x9D\x90", 3) == OMNIC_FMT_COMPRESS_Z);
     CHECK(omnic_detect_magic((const uint8_t *)"\x00\x01\x02\x03", 4) == OMNIC_FMT_UNKNOWN);

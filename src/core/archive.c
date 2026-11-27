@@ -2091,6 +2091,14 @@ static int glob_match(const char *pat, const char *s) {
 }
 
 static int name_matches(const char *pat, size_t pat_len, const char *name) {
+    /* 归档条目名一律 '/'；Windows 用户习惯敲反斜杠，匹配前先规范化 */
+    char norm[OMNIC_FS_PATH_MAX];
+    if (pat_len >= sizeof(norm)) return 0; /* 超长 pattern 不可能命中 */
+    memcpy(norm, pat, pat_len);
+    norm[pat_len] = '\0';
+    for (size_t i = 0; i < pat_len; i++)
+        if (norm[i] == '\\') norm[i] = '/';
+    pat = norm;
     if (pat_len > 0 && pat[pat_len - 1] == '/') {
         size_t pl = pat_len - 1;
         return strncmp(name, pat, pl) == 0 && (name[pl] == '/' || name[pl] == '\0');
