@@ -31,12 +31,12 @@ $ omnic d xray.lzfse                               # 别的工具打不开的格
 xray.lzfse: lzfse | balanced
 
 $ omnic unpack gamedir.omnic --verify              # 这个归档还完好么？
-verified 8586/8586 files, 4 blocks OK
+verified 8586/8586 entries, 4 blocks OK
 ```
 
 ## 概览
 
-omnic 的主场是混合内容的目录树——游戏资产、项目文件夹、构建产物：逐文件挑算法，已压缩的直接直通。你的工具不认识的格式，它也能直接开。目前还不支持加密和图形界面，也还不能完整替代 tar（暂不保存符号链接和权限位）——这些都会在后续版本中陆续支持。当前的全部边界见[它还做不到的事](#它还做不到的事)。
+omnic 的主场是混合内容的目录树——游戏资产、项目文件夹、构建产物：逐文件挑算法，已压缩的直接直通。你的工具不认识的格式，它也能直接开。目前还不支持加密和图形界面，也还不能完整替代 tar（还没有 `--exclude`，不保存访问控制列表和文件属主）——这些都会在后续版本中陆续支持。当前的全部边界见[它还做不到的事](#它还做不到的事)。
 
 - **开 14 种格式。** gzip、zlib、raw deflate、zstd、xz、lzma、lzip、bzip2、
   lz4、brotli、snappy、compress（`.Z`），以及苹果的 lzfse/lzvn。内置
@@ -125,6 +125,8 @@ options:
   -q, --quiet
   --per-file          pack: one block per file (fast single-file extract)
   --no-skip           pack: compress already-compressed assets too
+  --strict            pack: fail if any entry had to be skipped (links, special files)
+  --ctime             pack: also store creation times
   --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)
   --file <pattern>    unpack: extract entries (exact path, dir/ prefix, or * glob; repeatable)
   --list              unpack: list entries without extracting
@@ -183,7 +185,7 @@ Silesia（202 MiB，12 个内容域混合文件，均无扩展名——每个决
   ```console
   $ omnic unpack gamedir.omnic              # 这个归档里被翻转了一个字节
   omnic: block 0 (fmt 0) corrupted — skipped, affected: luanti-5.16.1-win64/textures/base/pack/air.png …
-  omnic: extracted 7435/8586 files (1151 failed)
+  omnic: extracted 7435/8586 entries (1151 failed)
   $ echo $?
   2
   ```
@@ -241,13 +243,21 @@ omnic 不带任何新算法：单文件模式只是路由到某个 codec——�
 
 截至 v0.3.3 的边界——把它用于备份之前请先读这一节。
 
-- **还不是完整的 tar 替代品。** v1 不保存符号链接和 POSIX 权限位（格式已为
-  两者预留了位置），也没有 `--exclude`；这三项和加密都排在后续版本。7-Zip 的
-  格式广度和 25 年成熟度，omnic 目前确实还没有。
+- **还不是完整的 tar 替代品。** 没有 `--exclude`，不保存访问控制列表、NTFS 备用
+  数据流和文件属主，也没有加密——都排在后续版本。7-Zip 的格式广度和 25 年
+  成熟度，omnic 目前确实还没有。
+- **链接和权限保住了，还有些没保住。** 符号链接、目录联接、硬链接都能原样往返，
+  POSIX 权限位和 Windows 的只读、隐藏、系统属性也可以；加 `--ctime` 连创建
+  时间一起存。FIFO、设备文件和 omnic 不认识的重解析点会被留下，`pack` 会说出来
+  ——跳过了几个、属于哪一类、前八个的名字；加 `--strict` 则直接判为失败（退出
+  码 2），什么都不写。在 Windows 上创建文件符号链接需要开发者模式或管理员权限，
+  没有的话这些条目会如实计为失败。
+- **只恢复文件的时间。** 目录的修改时间不恢复：往目录里写文件本身就会刷新它，
+  只有空目录保得住。与其半保半丢，不如都不保。
 - **它不开 zip、7z、rar 归档。** 那 14 种是单流压缩格式；omnic 自己读写
   的归档是 `.omnic`。
-- **每个归档最多 65,535 个条目。** v1 格式上限；更大的目录树 `pack` 会
-  当场拒绝。
+- **两端都要用新版 omnic。** 从这一版起格式是 v2；omnic 0.3.x 打开 v2 归档会
+  报「需要更新的 omnic」。0.3.x 写的归档照常能读。
 - **索引只有一份，在文件尾部。** 被截断或尾部损坏的归档会被整体拒绝——
   隔离只覆盖数据块内部的损坏。
 - **爆炸半径是一个块，而块可能很大。** 块上限 64 MiB（`--block-size

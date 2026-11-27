@@ -32,7 +32,7 @@ $ omnic d xray.lzfse                               # a format your other tools d
 xray.lzfse: lzfse | balanced
 
 $ omnic unpack gamedir.omnic --verify              # is this archive still good?
-verified 8586/8586 files, 4 blocks OK
+verified 8586/8586 entries, 4 blocks OK
 ```
 
 ## At a glance
@@ -40,9 +40,9 @@ verified 8586/8586 files, 4 blocks OK
 omnic is built for mixed trees — game assets, project folders, build output:
 every file gets the codec that suits it, and already-compressed files pass
 straight through. It also opens the formats your other tools don't. Not there
-yet: encryption, a GUI and full tar replacement (symlinks and permissions
-aren't stored) — all of them will follow in later versions. The complete list
-of today's edges is in [What it doesn't do](#what-it-doesnt-do-yet).
+yet: encryption, a GUI, `--exclude`, ACLs and full tar replacement — all of
+them will follow in later versions. The complete list of today's edges is in
+[What it doesn't do](#what-it-doesnt-do-yet).
 
 - **Opens 14 formats.** gzip, zlib, raw deflate, zstd, xz, lzma, lzip, bzip2,
   lz4, brotli, snappy, compress (`.Z`) and Apple's lzfse/lzvn. 16 codecs are
@@ -142,6 +142,8 @@ options:
   -q, --quiet
   --per-file          pack: one block per file (fast single-file extract)
   --no-skip           pack: compress already-compressed assets too
+  --strict            pack: fail if any entry had to be skipped (links, special files)
+  --ctime             pack: also store creation times
   --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)
   --file <pattern>    unpack: extract entries (exact path, dir/ prefix, or * glob; repeatable)
   --list              unpack: list entries without extracting
@@ -221,7 +223,7 @@ VoxeLibre: PNG textures, Lua scripts, Ogg audio, models, fonts, DLLs):
   ```console
   $ omnic unpack gamedir.omnic              # one byte inside this archive was flipped
   omnic: block 0 (fmt 0) corrupted — skipped, affected: luanti-5.16.1-win64/textures/base/pack/air.png …
-  omnic: extracted 7435/8586 files (1151 failed)
+  omnic: extracted 7435/8586 entries (1151 failed)
   $ echo $?
   2
   ```
@@ -290,14 +292,27 @@ tier, and the Kraken comparison are in [BENCHMARK.md](BENCHMARK.md).
 
 The edges as of v0.3.3 — read this before trusting it with a backup.
 
-- **Not a full tar replacement yet.** v1 stores neither symlinks nor POSIX
-  permissions (the format reserves room for both) and has no `--exclude`;
-  those three, and encryption, are slated for later versions. 7-Zip's format
-  breadth and 25 years of maturity are things omnic does not have yet.
+- **Not a full tar replacement yet.** No `--exclude`, no ACLs, no NTFS
+  alternate data streams, no file ownership, no encryption — all slated for
+  later versions. 7-Zip's format breadth and 25 years of maturity are things
+  omnic does not have yet.
+- **Links and permissions are kept; some things still aren't.** Symlinks,
+  junctions and hard links round-trip, and so do POSIX permission bits and
+  the Windows read-only, hidden and system attributes; `--ctime` adds
+  creation times. FIFOs, device files and reparse points omnic does not
+  understand are left out, and `pack` says so — how many, of which kind, and
+  the first eight names; `--strict` turns that into a failure (exit code 2)
+  and writes nothing. Creating a file symlink on Windows needs Developer Mode
+  or administrator rights; without them those entries are reported as failed.
+- **Only file times are restored.** A directory's modification time is not:
+  writing files into a directory updates it, so only an empty directory could
+  keep its original time. Rather than restore it half the time, omnic
+  restores it never.
 - **It doesn't open zip, 7z or rar archives.** The 14 formats are single-stream
   compression formats; the archive omnic writes and reads is its own, `.omnic`.
-- **65,535 entries per archive.** A v1 limit of the format; `pack` refuses a
-  larger tree up front.
+- **Archives need a current omnic on both ends.** The format is v2 since this
+  version; omnic 0.3.x refuses a v2 archive with "needs a newer omnic".
+  Archives written by 0.3.x stay readable.
 - **The index is a single copy at the tail of the file.** A truncated or
   tail-damaged archive is refused outright — isolation covers damage inside
   the data blocks.

@@ -4,6 +4,90 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
 
 ## [Unreleased]
 
+### Added — format v2: links, permissions, hard links, 32-bit counts
+
+- `.omnic` archives now keep what a backup needs and v1 dropped on the
+  floor: symbolic links and Windows junctions with their targets, hard
+  links (one copy of the data, every name kept), POSIX permission bits and
+  the Windows read-only / hidden / system attributes, and creation times
+  with `pack --ctime`. Entry and block counts are 32-bit, so the
+  65,535-entry ceiling is gone. [FORMAT.md](FORMAT.md) is updated to v2.
+- omnic writes v2 from now on. Archives written by 0.3.x stay readable;
+  omnic 0.3.x refuses a v2 archive with "archive needs a newer omnic".
+- Measured on the game tree (8,586 files) and Silesia, same window, the v1
+  and v2 binaries alternating: archives are byte-for-byte the same length
+  (Silesia) or up to 230 bytes smaller (game tree), ratios unchanged at two
+  decimals (65.77 / 68.43 / 63.22 / 62.17%), pack time unchanged (1.58 s vs
+  1.59 s default; Silesia `best_ratio` 91.5 s vs 91.2 s of CPU).
+- Unpack order is a security property: directories, files, hard links,
+  symbolic links, directory permissions. No file is ever written through a
+  link the unpacker itself created, so an archive cannot use a link to
+  escape the output directory. Permission bits are applied after the data,
+  so a read-only file or directory cannot block its own extraction.
+- On Windows a file symlink needs Developer Mode or administrator rights;
+  without them the entry is reported as failed and the exit code is 2. A
+  directory symlink with an absolute target falls back to a junction, which
+  needs no privilege, and the summary says so. Detecting hard links costs
+  one extra handle per file on Windows (16 µs); it runs inside the
+  classification pool and does not show in pack time.
+- Tests: an archive written by the 0.3.x binary is checked in as a fixture
+  and must keep extracting. A bit-flip sweep over a whole archive (1,368
+  single-bit flips) accepts only the bytes FORMAT.md calls reserved, and
+  the reader never crashes on any of them.
+
+### Changed — directory modification times are no longer restored
+
+- Unpack used to set each directory's mtime right after creating it. The
+  files written into the directory afterwards updated it again, so the
+  time only ever survived for empty directories. Rather than restore it
+  half the time, `unpack` now restores it never: file mtimes are restored,
+  a directory's mtime is the extraction time. (The mtime is still stored
+  for directory entries.)
+
+### Fixed — a failed `pack` no longer destroys the archive it overwrites
+
+- `pack` opened the output path with truncation before it had read a
+  single source file, so any later failure (a file locked by another
+  process, an unreadable directory) left a broken file where the previous
+  archive had been. It now writes `<archive>.tmp` in the same directory
+  and renames it over the target only after the footer is on disk.
+- Reproduced with one source file held open exclusively by another
+  process: before, `--verify` on that path reported "bad footer magic";
+  now the previous archive is byte-identical to what it was and still
+  verifies. If the final rename fails (the old archive is open
+  elsewhere) the new file is discarded and the error says so.
+
+### Added — skipped entries are reported; `--strict`
+
+- FIFOs, sockets, device files, and reparse points omnic cannot read as
+  links (cloud-file placeholders, dedup, app execution aliases) are left
+  out of an archive. They used to go silently; `pack` now prints how many
+  entries it skipped, by kind, and the first eight names. With `--strict` a
+  pack that skips anything fails with exit code 2 and writes nothing.
+
+### Fixed — long paths on Windows; one bad directory no longer aborts an unpack
+
+- Every file operation (`c`, `d`, `pack`, `unpack`) now goes through a
+  `\\?\` path, so the 260-character `MAX_PATH` limit no longer applies.
+  Before, with a 354-character path in the tree: `pack` dropped 4 entries
+  without a word, and unpacking that archive stopped with exit code 3
+  after creating 7 empty directories — not one file extracted. Now all
+  15 files are packed and extracted.
+- A directory that cannot be created is counted as a failed entry; the
+  rest of the archive is still extracted and the exit code is 2. Only an
+  output root that cannot be created stops the unpack.
+- `omnic pack dir/` works — the trailing separator a shell's Tab
+  completion adds is dropped from the default archive path instead of
+  deriving `dir/.omnic`, which sits inside the source tree and was
+  refused.
+- Archives are unchanged: the game tree (8,586 files) and Silesia pack to
+  byte-identical files before and after. Measured in one window, the two
+  binaries alternating on the game tree: pack 1.50 s → 1.49 s; full
+  unpack 5.29 s → 4.52 s and 6.01 s → 5.65 s (a third pair is not
+  counted, the machine suspended mid-round). Regression tests:
+  test_archive 145 → 175 checks, test_core 642 → 647. Each fix was
+  verified by breaking it again and watching its check fail.
+
 ### Changed — CRC-32 slice-by-8
 
 - `omnic_crc32` (the archive CRC-32, zip-compatible ISO-HDLC) now runs
