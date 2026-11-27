@@ -1732,16 +1732,9 @@ static void test_v1_archive_readable(void) {
     CHECK(stat_meta("omnic_arc_v1_out/rand.bin", &e, 0) == 0 && e.size == 1024);
     CHECK(stat_meta("omnic_arc_v1_out/sub", &e, 0) == 0 && e.is_dir == 1);
     CHECK(file_exists("omnic_arc_v1_out/sub/中文.txt") == 1);
-    /* 文件时间：打包前设成了 2020-01-02 03:04:05（本地时间） */
-    struct tm tm;
-    memset(&tm, 0, sizeof(tm));
-    tm.tm_year = 120;
-    tm.tm_mon = 0;
-    tm.tm_mday = 2;
-    tm.tm_hour = 3;
-    tm.tm_min = 4;
-    tm.tm_sec = 5;
-    long long want = (long long)mktime(&tm);
+    /* 文件时间：样本里存的 mtime 是固定的 Unix 秒 1577905445（2020-01-01 19:04:05 UTC）。
+     * 直接比对绝对值——别用 mktime 反推，那依赖 CI 运行机的本地时区。 */
+    const long long want = 1577905445LL;
     CHECK(a.mtime >= want - 2 && a.mtime <= want + 2);
     CHECK(omnic_arc_list(F, &o) == OMNIC_OK);
     rm_tree(O);
