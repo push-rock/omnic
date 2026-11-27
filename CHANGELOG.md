@@ -63,6 +63,28 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
   sections; honest-losses consolidated (solid `--file` extract, per-file
   best_ratio vs 7z, Defender tax, `--list` re-measured at 7.5 ms).
 
+### Changed — README as a landing page; unpack times measured
+
+- README restructured around a first-time visitor: plain tagline, a
+  demo that shows the three hooks (opens 14 formats, explains its pick
+  file by file, packs a tree), install, usage, then results and a
+  complete list of limits — including three the page did not state
+  (65,535 entries per archive, a damaged index is fatal, zip/7z/rar
+  archives are not opened). The two archive tables are charts now, raw
+  numbers collapsed below them; BENCHMARK.md keeps every table and
+  gains a per-file heatmap. zh-CN mirrored. The `winget` line is
+  dropped until the package lands.
+- Full-unpack times measured for the first time — wall clock of a
+  whole extraction into a fresh directory, best of 5, every tool
+  interleaved, a later window than the pack and ratio columns.
+  Silesia: omnic 0.20 s, zip 0.38 s, 7-Zip 0.93–1.43 s. Game tree:
+  omnic 4.08 s, zip 2.64 s, 7-Zip 6.41–6.50 s. This figure swings by
+  a third between sessions (Windows Defender's per-file scan); the
+  earlier 3.2 s vs 1.8 s stays recorded next to it.
+- `tools/plot_readme.py` regenerates the three new charts from the
+  table values and checks its own layout (text bounds, overlaps, dots
+  under text).
+
 ## [0.3.3] — 2026-11-19
 
 ### Changed — parallel block compression in pack (T12)
