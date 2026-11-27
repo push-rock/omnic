@@ -12,8 +12,11 @@
 
 #ifdef _WIN32
 #include <io.h>
+#include <windows.h>
 #else
 #include <unistd.h>
+#include <sys/stat.h>
+#include <utime.h>
 #endif
 
 #include <zstd.h>
@@ -40,9 +43,25 @@ static int g_run = 0;
         }                                                                    \
     } while (0)
 
-/* 索引明文布局（与 archive.c 序列化对齐） */
+/* 索引明文布局（与 archive.c 序列化对齐）：v2 条目定长 34B（type/flags/block_id/in_off/
+ * size/crc/mtime），可选字段按 flags 跟在后面，次序固定。 */
 #define T_BLK_ROW 32
-#define T_ENT_FIX 26
+#define T_ENT_FIX 34
+#define T_EF_CTIME 0x04u
+#define T_EF_MODE 0x08u
+#define T_EF_ATTRS 0x10u
+#define T_EF_LINKTO 0x40u
+
+/* 一条记录定长部分的长度（含可选字段）；row 指向 name 之后的 type 字节 */
+static size_t ent_row_len(const uint8_t *row) {
+    uint8_t f = row[1];
+    size_t len = T_ENT_FIX;
+    if (f & T_EF_LINKTO) len += 4;
+    if (f & T_EF_CTIME) len += 8;
+    if (f & T_EF_MODE) len += 2;
+    if (f & T_EF_ATTRS) len += 2;
+    return len;
+}
 
 static const char *TREE = "omnic_arc_tree";
 static const char *ARC = "omnic_arc_t.omnic";
@@ -141,8 +160,8 @@ static int tree_equal(const char *a, const char *b) {
     omnic_fs_entry *fa = omnic_fs_walk(a, &na, &sk);
     omnic_fs_entry *fb = omnic_fs_walk(b, &nb, &sk);
     if (fa == NULL || fb == NULL) {
-        free(fa);
-        free(fb);
+        omnic_fs_entries_free(fa, na);
+        omnic_fs_entries_free(fb, nb);
         return 0;
     }
     qsort(fa, na, sizeof(*fa), cmp_fs_ent);
@@ -151,9 +170,15 @@ static int tree_equal(const char *a, const char *b) {
     if (ok) {
         for (size_t i = 0; i < na && ok; i++) {
             if (strcmp(fa[i].rel, fb[i].rel) != 0 || fa[i].is_dir != fb[i].is_dir ||
-                fa[i].size != fb[i].size) {
+                fa[i].link_kind != fb[i].link_kind || fa[i].size != fb[i].size) {
                 ok = 0;
                 break;
+            }
+            if (fa[i].link_kind != 0) { /* 链接：比种类与目标，不跟随 */
+                if (fa[i].link_target == NULL || fb[i].link_target == NULL ||
+                    strcmp(fa[i].link_target, fb[i].link_target) != 0)
+                    ok = 0;
+                continue;
             }
             if (fa[i].is_dir) continue;
             char pa[1024], pb[1024];
@@ -182,8 +207,8 @@ static int tree_equal(const char *a, const char *b) {
             }
         }
     }
-    free(fa);
-    free(fb);
+    omnic_fs_entries_free(fa, na);
+    omnic_fs_entries_free(fb, nb);
     return ok;
 }
 
@@ -246,8 +271,21 @@ static uint8_t *load_index_plain(const char *arc, size_t *out_n, uint64_t *index
     uint64_t io = 0, ic = 0;
     for (int i = 0; i < 8; i++) io |= (uint64_t)ftr[8 + i] << (8 * i);  /* 小端（与 put64 一致） */
     for (int i = 0; i < 8; i++) ic |= (uint64_t)ftr[16 + i] << (8 * i);
-    *nent = (uint32_t)ftr[28] | ((uint32_t)ftr[29] << 8);
-    *nblk = (uint32_t)ftr[30] | ((uint32_t)ftr[31] << 8);
+    /* 计数：v2 在头部（32 位），尾部那 4 字节保留为 0；v1 才在尾部（16 位） */
+    uint8_t hdr[32];
+    if (fseek(f, 0, SEEK_SET) != 0 || fread(hdr, 1, 32, f) != 32) {
+        fclose(f);
+        return NULL;
+    }
+    if ((hdr[8] | (hdr[9] << 8)) >= 2) {
+        *nent = (uint32_t)hdr[16] | ((uint32_t)hdr[17] << 8) | ((uint32_t)hdr[18] << 16) |
+                ((uint32_t)hdr[19] << 24);
+        *nblk = (uint32_t)hdr[12] | ((uint32_t)hdr[13] << 8) | ((uint32_t)hdr[14] << 16) |
+                ((uint32_t)hdr[15] << 24);
+    } else {
+        *nent = (uint32_t)ftr[28] | ((uint32_t)ftr[29] << 8);
+        *nblk = (uint32_t)ftr[30] | ((uint32_t)ftr[31] << 8);
+    }
     uint8_t *zbuf = (uint8_t *)malloc((size_t)ic);
     if (zbuf == NULL || fseek(f, (long)io, SEEK_SET) != 0 ||
         fread(zbuf, 1, (size_t)ic, f) != (size_t)ic) {
@@ -274,8 +312,7 @@ static uint8_t *load_index_plain(const char *arc, size_t *out_n, uint64_t *index
 }
 
 /* 改后回写：truncate 到 index_off → zstd/3 压缩 → 新索引 + 新 Footer */
-static int save_index_plain(const char *arc, uint8_t *plain, size_t n, uint64_t index_off,
-                            uint32_t nent, uint32_t nblk) {
+static int save_index_plain(const char *arc, uint8_t *plain, size_t n, uint64_t index_off) {
     size_t zcap = ZSTD_compressBound(n);
     uint8_t *zbuf = (uint8_t *)malloc(zcap);
     if (zbuf == NULL) return -1;
@@ -304,10 +341,7 @@ static int save_index_plain(const char *arc, uint8_t *plain, size_t n, uint64_t 
     for (int i = 0; i < 8; i++) ftr[8 + i] = (uint8_t)(index_off >> (8 * i));   /* 小端 */
     for (int i = 0; i < 8; i++) ftr[16 + i] = (uint8_t)(zn >> (8 * i));
     for (int i = 0; i < 4; i++) ftr[24 + i] = (uint8_t)(crc >> (8 * i));
-    ftr[28] = (uint8_t)(nent & 0xFF);
-    ftr[29] = (uint8_t)(nent >> 8);
-    ftr[30] = (uint8_t)(nblk & 0xFF);
-    ftr[31] = (uint8_t)(nblk >> 8);
+    /* 尾部 28..32：v2 保留为 0（计数以头部为准） */
     fwrite(ftr, 1, 32, f);
     /* "r+" 不截断：重压索引比原短时尾部残留旧字节，SEEK_END 读 Footer 会落空 */
 #if defined(_WIN32)
@@ -328,7 +362,7 @@ static long find_ent(const uint8_t *plain, uint32_t nblk, uint32_t nent, const c
     for (uint32_t i = 0; i < nent; i++) {
         uint32_t nl = plain[off] | ((uint32_t)plain[off + 1] << 8);
         if (nl == nlen && memcmp(plain + off + 2, name, nl) == 0) return (long)off;
-        off += 2 + nl + T_ENT_FIX + 8;
+        off += 2 + nl + ent_row_len(plain + off + 2 + nl);
     }
     return -1;
 }
@@ -624,7 +658,7 @@ static void test_corruption(void) {
                 uint32_t nl = (uint32_t)pl[eo] | ((uint32_t)pl[eo + 1] << 8);
                 pl[eo + 2 + nl + 22] ^= 0xFF; /* 条目行内 crc 字段（+22） */
             }
-            CHECK(save_index_plain(ARC, pl, n, io, nent, nblk) == 0);
+            CHECK(save_index_plain(ARC, pl, n, io) == 0);
             free(pl);
         }
     }
@@ -651,21 +685,20 @@ static void test_malformed(void) {
     memset(&g_rep, 0, sizeof(g_rep));
     CHECK(omnic_unpack(ARC, "omnic_arc_m1", &o, &g_rep) == OMNIC_E_DATA);
     CHECK(pack_tree(TREE, ARC, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
-    flip_byte(ARC, file_size(ARC) - 2);
+    flip_byte(ARC, file_size(ARC) - 32); /* Footer 魔数首字节 */
     memset(&g_rep, 0, sizeof(g_rep));
     CHECK(omnic_unpack(ARC, "omnic_arc_m2", &o, &g_rep) == OMNIC_E_DATA);
 
-    /* Footer nent 与 Header 不一致：改 Footer nent 字段 */
+    /* 头部的条目计数与索引内容对不上（v2 起计数以头部 32 位为准）：n_entries 最低位翻转 */
     CHECK(pack_tree(TREE, ARC, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
     {
         FILE *f = omnic_fs_fopen(ARC, "r+b");
         CHECK(f != NULL);
         if (f != NULL) {
-            fseek(f, -4, SEEK_END); /* nent/nblk 在 Footer 尾 4B */
-            uint8_t nb[4];
-            fread(nb, 1, 4, f);
-            fseek(f, -4, SEEK_END);
-            fputc(nb[0] ^ 0x01, f); /* nent±1 制造交叉不一致 */
+            fseek(f, 16, SEEK_SET);
+            int c = fgetc(f);
+            fseek(f, 16, SEEK_SET);
+            fputc(c ^ 0x01, f); /* 计数 ±1：多了读不够，少了索引读不完 */
             fclose(f);
         }
     }
@@ -697,7 +730,7 @@ static void test_malformed(void) {
             } else {
                 if (eo >= 0) memcpy(pl + eo + 2, "a.txt", 5); /* b.txt 名改成 a.txt */
             }
-            CHECK(save_index_plain(ARC, pl, n, io, nent, nblk) == 0);
+            CHECK(save_index_plain(ARC, pl, n, io) == 0);
             free(pl);
         }
         char out[64];
@@ -819,7 +852,7 @@ static void test_parallel(void) {
                         got_out = 1;
                     }
                 }
-                off += 2 + nl + T_ENT_FIX + 8;
+                off += 2 + nl + ent_row_len(pl + off + 2 + nl);
             }
             /* 块 0 行：fmt@0 comp@12 raw@20；存储域 = store?raw:comp，翻其中点 */
             uint64_t comp = 0, raw = 0;
@@ -863,7 +896,7 @@ static void test_parallel(void) {
                 uint32_t nl = (uint32_t)pl[eo] | ((uint32_t)pl[eo + 1] << 8);
                 pl[eo + 2 + nl + 22] ^= 0xFF; /* 条目行内 crc 字段 */
             }
-            CHECK(save_index_plain(ARC2, pl, n, io, nent, nblk) == 0);
+            CHECK(save_index_plain(ARC2, pl, n, io) == 0);
             free(pl);
         }
     }
@@ -1076,7 +1109,7 @@ static void test_decode_pool(void) {
                             dst[nl] = '\0';
                         }
                     }
-                    off += 2 + nl + T_ENT_FIX + 8;
+                    off += 2 + nl + ent_row_len(pl + off + 2 + nl);
                 }
                 CHECK(got_in);
                 CHECK(got_pre);
@@ -1103,6 +1136,659 @@ static void test_decode_pool(void) {
     rm_tree(T4);
 }
 
+/* ---- 失败的 pack 不毁旧归档 / 跳过条目上报 / 深路径 / 目录建不出来不中止 ---- */
+
+static unsigned char *slurp(const char *path, size_t *n) {
+    FILE *f = omnic_fs_fopen(path, "rb");
+    if (f == NULL) return NULL;
+    long sz = -1;
+    unsigned char *b = NULL;
+    if (fseek(f, 0, SEEK_END) == 0) sz = ftell(f);
+    if (sz >= 0) {
+        rewind(f);
+        b = (unsigned char *)malloc((size_t)sz ? (size_t)sz : 1);
+        if (b != NULL && fread(b, 1, (size_t)sz, f) != (size_t)sz) {
+            free(b);
+            b = NULL;
+        }
+    }
+    fclose(f);
+    if (b != NULL) *n = (size_t)sz;
+    return b;
+}
+
+/* 让 path 读不了（pack 中途失败的注入）。返回 1=已生效，0=本环境做不到（如 root）。 */
+static int deny_read(const char *path, int on) {
+#ifdef _WIN32
+    static HANDLE held = INVALID_HANDLE_VALUE;
+    if (on) {
+        wchar_t w[2048];
+        MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048);
+        held = CreateFileW(w, GENERIC_READ, 0 /* 独占：谁也打不开 */, NULL, OPEN_EXISTING, 0, NULL);
+        return held != INVALID_HANDLE_VALUE;
+    }
+    if (held != INVALID_HANDLE_VALUE) CloseHandle(held);
+    held = INVALID_HANDLE_VALUE;
+    return 1;
+#else
+    static mode_t orig = (mode_t)-1;
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if (on) {
+        orig = st.st_mode & 07777;
+        if (chmod(path, 0) != 0) return 0;
+        if (access(path, R_OK) == 0) { /* root：读得了，注入无效 */
+            chmod(path, orig);
+            orig = (mode_t)-1;
+            return 0;
+        }
+        return 1;
+    }
+    return orig == (mode_t)-1 || chmod(path, orig) == 0;
+#endif
+}
+
+/* 一条链接类条目：Windows 用目录联接（不需特权），POSIX 用符号链接。返回 1=建成了 */
+static int make_link(const char *tree) {
+#ifdef _WIN32
+    char cwd[1024], cmd[4096];
+    if (_getcwd(cwd, sizeof(cwd)) == NULL) return 0;
+    snprintf(cmd, sizeof(cmd), "cmd /c mklink /J \"%s\\%s\\link\" \"%s\\%s\\real\" >nul 2>&1", cwd, tree,
+             cwd, tree);
+    return system(cmd) == 0;
+#else
+    char link[1024];
+    snprintf(link, sizeof(link), "%s/link", tree);
+    return symlink("real", link) == 0;
+#endif
+}
+
+/* 一条特殊文件（命名管道）。Windows 造不出，返回 0 */
+static int make_fifo(const char *tree) {
+#ifndef _WIN32
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/pipe", tree);
+    return mkfifo(p, 0600) == 0;
+#else
+    (void)tree;
+    return 0;
+#endif
+}
+
+/* rm -rf / rd /s 处理不了超过 260 字符的路径：用 omnic 自己的接口删，先子后父 */
+static void rm_tree_deep(const char *root) {
+    size_t n = 0;
+    omnic_fs_skip_report sk;
+    omnic_fs_entry *v = omnic_fs_walk_report(root, &n, &sk);
+    if (v != NULL) {
+        for (size_t k = n; k-- > 0;) { /* walk 先父后子：倒序即先子后父 */
+            char p[OMNIC_FS_PATH_MAX + 1100]; /* root + '/' + rel(rel 最长 4095) */
+            snprintf(p, sizeof(p), "%s/%s", root, v[k].rel);
+            if (v[k].is_dir)
+                omnic_fs_rmdir(p);
+            else
+                omnic_fs_remove_force(p);
+        }
+        omnic_fs_entries_free(v, n);
+    }
+    omnic_fs_rmdir(root);
+}
+
+/* 存在性检查（打开即关：留着的句柄会让随后的清理删不掉文件） */
+static int file_exists(const char *path) {
+    FILE *f = omnic_fs_fopen(path, "rb");
+    if (f == NULL) return 0;
+    fclose(f);
+    return 1;
+}
+
+static void test_pack_atomic_publish(void) {
+    const char *T = "omnic_arc_ap", *A = "omnic_arc_ap.omnic";
+    rm_tree(T);
+    omnic_fs_mkdir_p(T);
+    char txt[256];
+    fill_text(txt, 200);
+    wfile("omnic_arc_ap/a.txt", txt, 200);
+    wfile("omnic_arc_ap/b.txt", txt, 200);
+    CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+
+    size_t good_n = 0;
+    unsigned char *good = slurp(A, &good_n);
+    CHECK(good != NULL && good_n > 0);
+
+    /* pack 中途失败：输出路径上必须还是上一份好归档，且不留临时文件 */
+    if (deny_read("omnic_arc_ap/b.txt", 1)) {
+        CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET, 0)) != OMNIC_OK);
+        size_t now_n = 0;
+        unsigned char *now = slurp(A, &now_n);
+        CHECK(now != NULL && now_n == good_n && (good == NULL || memcmp(now, good, good_n) == 0));
+        free(now);
+        CHECK(file_exists("omnic_arc_ap.omnic.tmp") == 0);
+        deny_read("omnic_arc_ap/b.txt", 0);
+    } else {
+        printf("note: cannot make a file unreadable here; failure-injection checks skipped\n");
+    }
+
+    /* 恢复后重打包：新归档整体替换旧的 */
+    fill_text(txt, 120);
+    wfile("omnic_arc_ap/a.txt", txt, 120);
+    CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(file_exists("omnic_arc_ap.omnic.tmp") == 0);
+    rm_tree("omnic_arc_ap_out");
+    CHECK(unpack_arc(A, "omnic_arc_ap_out", mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(files_equal("omnic_arc_ap/a.txt", "omnic_arc_ap_out/a.txt"));
+    CHECK(files_equal("omnic_arc_ap/b.txt", "omnic_arc_ap_out/b.txt"));
+    free(good);
+    rm_tree(T);
+    rm_tree("omnic_arc_ap_out");
+    remove(A);
+}
+
+static void test_pack_reports_skipped(void) {
+    const char *T = "omnic_arc_sk", *A = "omnic_arc_sk.omnic";
+    rm_tree(T);
+    omnic_fs_mkdir_p("omnic_arc_sk/real");
+    char txt[256];
+    fill_text(txt, 100);
+    wfile("omnic_arc_sk/a.txt", txt, 100);
+    wfile("omnic_arc_sk/real/t.txt", txt, 100);
+    int link_ok = make_link(T), fifo_ok = make_fifo(T);
+    printf("note: link entry created: %d, fifo created: %d\n", link_ok, fifo_ok);
+
+    size_t n = 0;
+    omnic_fs_skip_report sk;
+    omnic_fs_entry *v = omnic_fs_walk_report(T, &n, &sk);
+    CHECK(v != NULL && n == 3 + (size_t)link_ok); /* 链接收录；只有特殊文件不收录 */
+    CHECK(sk.total == (size_t)fifo_ok);
+    CHECK(sk.special == (size_t)fifo_ok);
+    CHECK(sk.n_first == sk.total);
+    free(v);
+
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+    CHECK(pack_tree(T, A, o) == OMNIC_OK); /* 默认：照常打包，跳过的如实上报 */
+    CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK);
+    remove(A);
+    omnic_options strict = mkopts(OMNIC_F_QUIET | OMNIC_F_STRICT, 0);
+    CHECK(pack_tree(T, A, strict) == (fifo_ok ? OMNIC_E_DATA : OMNIC_OK)); /* 有跳过才失败 */
+    if (fifo_ok) {
+        CHECK(file_exists(A) == 0); /* 且不留下任何输出 */
+        CHECK(file_exists("omnic_arc_sk.omnic.tmp") == 0);
+    } else {
+        remove(A);
+    }
+    /* 没有被跳过条目的树，--strict 不受影响 */
+    CHECK(pack_tree("omnic_arc_sk/real", A, strict) == OMNIC_OK);
+    remove(A);
+#ifdef _WIN32
+    omnic_fs_rmdir("omnic_arc_sk/link"); /* 只删联接本身，不动目标 */
+#else
+    omnic_fs_remove("omnic_arc_sk/link");
+    omnic_fs_remove("omnic_arc_sk/pipe");
+#endif
+    rm_tree(T);
+}
+
+static void test_long_path_roundtrip(void) {
+    /* 路径总长超过 MAX_PATH(260)：Windows 上不带 \\?\ 前缀的 Win32 调用到这里就失效 */
+    const char *T = "omnic_arc_lp", *O = "omnic_arc_lp_out", *A = "omnic_arc_lp.omnic";
+    static char deep[OMNIC_FS_PATH_MAX], out[OMNIC_FS_PATH_MAX + 1100]; /* O + deep 去掉前缀 */
+    rm_tree_deep(T);
+    rm_tree_deep(O);
+    snprintf(deep, sizeof(deep), "%s", T);
+    for (int i = 0; i < 14; i++)
+        strncat(deep, "/lvl_xxxxxxxxxxxxxxxxxxxxxxxx", sizeof(deep) - strlen(deep) - 1);
+    omnic_fs_mkdir_p(deep);
+    char txt[64];
+    fill_text(txt, 40);
+    strncat(deep, "/deep.txt", sizeof(deep) - strlen(deep) - 1);
+    wfile(deep, txt, 40);
+    CHECK(strlen(deep) > 300);
+
+    size_t n = 0, sk = 0;
+    omnic_fs_entry *v = omnic_fs_walk(T, &n, &sk);
+    CHECK(v != NULL && n == 15 && sk == 0); /* 14 级目录 + 1 个文件，一个不落 */
+    free(v);
+    CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(unpack_arc(A, O, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    snprintf(out, sizeof(out), "%s%s", O, deep + strlen(T));
+    CHECK(files_equal(deep, out));
+    rm_tree_deep(T);
+    rm_tree_deep(O);
+    remove(A);
+}
+
+static void test_unpack_dir_failure_continues(void) {
+    const char *T = "omnic_arc_df", *O = "omnic_arc_df_out", *A = "omnic_arc_df.omnic";
+    rm_tree(T);
+    rm_tree(O);
+    omnic_fs_mkdir_p("omnic_arc_df/sub/inner");
+    char txt[256];
+    fill_text(txt, 100);
+    wfile("omnic_arc_df/a.txt", txt, 100);
+    wfile("omnic_arc_df/sub/inner/x.txt", txt, 100);
+    CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    /* 输出位置上 sub 是个普通文件：目录 sub/inner 建不出来 */
+    omnic_fs_mkdir_p(O);
+    wfile("omnic_arc_df_out/sub", "x", 1);
+    CHECK(unpack_arc(A, O, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_E_DATA);
+    CHECK(file_exists("omnic_arc_df_out/a.txt"));     /* 其余条目照常解出 */
+    CHECK(file_exists("omnic_arc_df_out/sub/inner/x.txt") == 0);
+    rm_tree(T);
+    rm_tree(O);
+    remove(A);
+}
+
+/* 设置目录的 mtime（测试用；解包代码自己不再对目录设时间） */
+static void set_dir_time(const char *path, long long t) {
+#ifdef _WIN32
+    wchar_t w[2048];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048);
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    ULARGE_INTEGER u;
+    u.QuadPart = (unsigned long long)t * 10000000ULL + 116444736000000000ULL;
+    FILETIME ft;
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    SetFileTime(h, NULL, &ft, &ft);
+    CloseHandle(h);
+#else
+    struct utimbuf tb;
+    tb.actime = (time_t)t;
+    tb.modtime = (time_t)t;
+    utime(path, &tb);
+#endif
+}
+
+/* 目录的修改时间一律不恢复（往目录里写文件会刷新它，只有空目录保得住——半保半丢不如都不保） */
+static void test_dir_mtime_not_restored(void) {
+    const char *T = "omnic_arc_dm", *O = "omnic_arc_dm_out", *A = "omnic_arc_dm.omnic";
+    rm_tree(T);
+    rm_tree(O);
+    omnic_fs_mkdir_p("omnic_arc_dm/d");
+    omnic_fs_mkdir_p("omnic_arc_dm/empty");
+    char txt[64];
+    fill_text(txt, 30);
+    wfile("omnic_arc_dm/d/x.txt", txt, 30);
+    set_dir_time("omnic_arc_dm/d", 1000000000LL); /* 2001-09-09 */
+    set_dir_time("omnic_arc_dm/empty", 1000000000LL);
+    CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(unpack_arc(A, O, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    long long now = (long long)time(NULL), td = 0, te = 0;
+    size_t n = 0;
+    omnic_fs_skip_report sk;
+    omnic_fs_entry *v = omnic_fs_walk_report(O, &n, &sk);
+    if (v != NULL)
+        for (size_t i = 0; i < n; i++) {
+            if (strcmp(v[i].rel, "d") == 0) td = v[i].mtime;
+            if (strcmp(v[i].rel, "empty") == 0) te = v[i].mtime;
+        }
+    free(v);
+    CHECK(td > now - 3600); /* 两个目录都是解包时刻 */
+    CHECK(te > now - 3600);
+    rm_tree(T);
+    rm_tree(O);
+    remove(A);
+}
+
+/* ---- v2：链接 / 硬链接 / 权限与属性 / 创建时间 / 32 位计数 / v1 归档可读 / 畸形输入不崩 ---- */
+
+/* 取一个路径对应条目的元数据：借遍历接口读父目录（跨平台，不另写系统调用） */
+typedef struct {
+    int is_dir, link_kind, has_mode;
+    char target[1024];
+    unsigned attrs, mode;
+    long long mtime, ctime;
+    unsigned long long size;
+} t_meta;
+
+static int stat_meta(const char *path, t_meta *m, unsigned want) {
+    char dir[2048];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *base = strrchr(dir, '/');
+    if (base == NULL) return -1;
+    *base++ = '\0';
+    size_t n = 0;
+    omnic_fs_skip_report sk;
+    omnic_fs_entry *v = omnic_fs_walk_ex(dir, &n, &sk, want);
+    int found = 0;
+    memset(m, 0, sizeof(*m));
+    if (v != NULL)
+        for (size_t i = 0; i < n && !found; i++) {
+            if (strcmp(v[i].rel, base) != 0) continue;
+            m->is_dir = v[i].is_dir;
+            m->link_kind = v[i].link_kind;
+            if (v[i].link_target != NULL) snprintf(m->target, sizeof(m->target), "%s", v[i].link_target);
+            m->attrs = v[i].attrs;
+            m->mode = v[i].mode;
+            m->has_mode = v[i].has_mode;
+            m->mtime = v[i].mtime;
+            m->ctime = v[i].ctime;
+            m->size = v[i].size;
+            found = 1;
+        }
+    omnic_fs_entries_free(v, n);
+    return found ? 0 : -1;
+}
+
+static uint32_t rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/* 文件/目录的创建时间（测试用；仅 Windows 有可移植的设置接口） */
+static void set_creation_time(const char *path, long long t) {
+#ifdef _WIN32
+    wchar_t w[2048];
+    MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 2048);
+    HANDLE h = CreateFileW(w, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    ULARGE_INTEGER u;
+    u.QuadPart = (unsigned long long)t * 10000000ULL + 116444736000000000ULL;
+    FILETIME ft;
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    SetFileTime(h, &ft, NULL, NULL);
+    CloseHandle(h);
+#else
+    (void)path;
+    (void)t;
+#endif
+}
+
+static void test_v2_links(void) {
+    const char *T = "omnic_arc_lk", *O = "omnic_arc_lk_out", *A = "omnic_arc_lk.omnic";
+    const char *X = "omnic_arc_lk_x";
+    rm_tree(T);
+    rm_tree(O);
+    rm_tree(X);
+    omnic_fs_mkdir_p("omnic_arc_lk/sub");
+    char txt[256];
+    fill_text(txt, 200);
+    wfile("omnic_arc_lk/a.txt", txt, 200);
+    wfile("omnic_arc_lk/sub/x.txt", txt, 150);
+    int hl_ok = (omnic_fs_make_hardlink("omnic_arc_lk/a.txt", "omnic_arc_lk/hard.txt") == OMNIC_OK);
+    /* 目录链接：Windows 用目录联接（不需特权，目标须为绝对路径），POSIX 用符号链接。
+     * 文件符号链接两边都尽力建：Windows 普通权限下建不了，相关检查随之略过。 */
+    int jn_ok = 0, sl_ok = 0;
+#ifdef _WIN32
+    char cwd[1024], tgt[2048];
+    if (_getcwd(cwd, sizeof(cwd)) != NULL) {
+        snprintf(tgt, sizeof(tgt), "%s\\%s\\sub", cwd, T);
+        jn_ok = (omnic_fs_make_junction("omnic_arc_lk/dlink", tgt) == OMNIC_OK);
+    }
+    int unpriv = 0;
+    sl_ok = (omnic_fs_make_symlink("omnic_arc_lk/slink", "a.txt", 0, &unpriv) == OMNIC_OK);
+#else
+    jn_ok = (omnic_fs_make_symlink("omnic_arc_lk/dlink", "sub", 1, NULL) == OMNIC_OK);
+    sl_ok = (omnic_fs_make_symlink("omnic_arc_lk/slink", "a.txt", 0, NULL) == OMNIC_OK);
+#endif
+    printf("note: hard link: %d, directory link: %d, file symlink: %d\n", hl_ok, jn_ok, sl_ok);
+    CHECK(hl_ok == 1);
+    CHECK(jn_ok == 1);
+
+    size_t n = 0;
+    omnic_fs_skip_report sk;
+    omnic_fs_entry *v = omnic_fs_walk_report(T, &n, &sk);
+    CHECK(v != NULL && sk.total == 0);             /* 链接是条目，不再是"跳过" */
+    CHECK(n == 4 + (size_t)jn_ok + (size_t)sl_ok); /* a.txt, sub, sub/x.txt, hard.txt + 链接 */
+    omnic_fs_entries_free(v, n);
+
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+    CHECK(pack_tree(T, A, o) == OMNIC_OK);
+    CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK);
+    CHECK(unpack_arc(A, O, o) == OMNIC_OK);
+    CHECK(tree_equal(T, O)); /* 内容、链接种类与目标 */
+
+    /* 硬链接是真的：同一文件身份；改一处，另一处跟着变 */
+    unsigned long long d1 = 0, i1 = 0, d2 = 0, i2 = 0;
+    CHECK(omnic_fs_file_id("omnic_arc_lk_out/a.txt", &d1, &i1) == OMNIC_OK);
+    CHECK(omnic_fs_file_id("omnic_arc_lk_out/hard.txt", &d2, &i2) == OMNIC_OK);
+    CHECK(d1 == d2 && i1 == i2 && !(d1 == 0 && i1 == 0));
+    wfile("omnic_arc_lk_out/hard.txt", "changed!", 8);
+    /* 读文件本身核对（目录枚举给出的副本信息在 NTFS 上可能滞后） */
+    size_t hn = 0;
+    unsigned char *hb = slurp("omnic_arc_lk_out/a.txt", &hn);
+    CHECK(hb != NULL && hn == 8); /* 经 hard.txt 改的，a.txt 跟着变 */
+    free(hb);
+    t_meta m;
+
+    /* --file 单选：硬链接的目标条目不在场，就地物化成独立副本；符号链接照建 */
+    const char *names[2] = {"hard.txt", "slink"};
+    CHECK(omnic_unpack_files(A, X, names, sl_ok ? 2u : 1u, &o, &g_rep) == OMNIC_OK);
+    CHECK(files_equal("omnic_arc_lk/a.txt", "omnic_arc_lk_x/hard.txt"));
+    CHECK(omnic_fs_file_id("omnic_arc_lk_x/hard.txt", &d2, &i2) == OMNIC_OK);
+    CHECK(!(d1 == d2 && i1 == i2)); /* 独立副本，不与原输出目录里的文件结成硬链接 */
+    CHECK(file_exists("omnic_arc_lk_x/a.txt") == 0); /* 没有顺手多解出目标条目 */
+    if (sl_ok) {
+        CHECK(stat_meta("omnic_arc_lk_x/slink", &m, 0) == 0 && m.link_kind == OMNIC_FS_LINK_SYMLINK &&
+              strcmp(m.target, "a.txt") == 0);
+    }
+
+    /* 再解一次（全量提取的覆盖语义）：既存的链接被替换，仍然成功 */
+    CHECK(unpack_arc(A, O, o) == OMNIC_OK);
+    CHECK(tree_equal(T, O));
+
+    /* 清理：先删链接本身——目录联接若被顺着走进去，删掉的是目标里的内容 */
+    omnic_fs_remove_force("omnic_arc_lk/dlink");
+    omnic_fs_remove_force("omnic_arc_lk/slink");
+    omnic_fs_remove_force("omnic_arc_lk_out/dlink");
+    omnic_fs_remove_force("omnic_arc_lk_out/slink");
+    omnic_fs_remove_force("omnic_arc_lk_x/slink");
+    rm_tree(T);
+    rm_tree(O);
+    rm_tree(X);
+    remove(A);
+}
+
+static void test_v2_meta(void) {
+    const char *T = "omnic_arc_md", *O = "omnic_arc_md_out", *A = "omnic_arc_md.omnic";
+    rm_tree_deep(T);
+    rm_tree_deep(O);
+    omnic_fs_mkdir_p("omnic_arc_md/dir");
+    char txt[128];
+    fill_text(txt, 60);
+    wfile("omnic_arc_md/plain.txt", txt, 60);
+    wfile("omnic_arc_md/ro.txt", txt, 60);
+    wfile("omnic_arc_md/x.sh", "#!/bin/sh\necho hi\n", 18);
+    omnic_fs_meta m;
+    memset(&m, 0, sizeof(m));
+#ifdef _WIN32
+    m.attrs = OMNIC_FS_ATTR_READONLY | OMNIC_FS_ATTR_HIDDEN;
+    CHECK(omnic_fs_set_meta("omnic_arc_md/ro.txt", &m) == OMNIC_OK);
+    m.attrs = OMNIC_FS_ATTR_SYSTEM;
+    CHECK(omnic_fs_set_meta("omnic_arc_md/x.sh", &m) == OMNIC_OK);
+    m.attrs = OMNIC_FS_ATTR_HIDDEN;
+    CHECK(omnic_fs_set_meta("omnic_arc_md/dir", &m) == OMNIC_OK);
+#else
+    m.mode = 0600;
+    CHECK(omnic_fs_set_meta("omnic_arc_md/ro.txt", &m) == OMNIC_OK);
+    m.mode = 0755;
+    CHECK(omnic_fs_set_meta("omnic_arc_md/x.sh", &m) == OMNIC_OK);
+    m.mode = 0750;
+    CHECK(omnic_fs_set_meta("omnic_arc_md/dir", &m) == OMNIC_OK);
+#endif
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+    CHECK(pack_tree(T, A, o) == OMNIC_OK);
+    CHECK(unpack_arc(A, O, o) == OMNIC_OK);
+    t_meta ro, xs, dir, pl;
+    CHECK(stat_meta("omnic_arc_md_out/ro.txt", &ro, 0) == 0);
+    CHECK(stat_meta("omnic_arc_md_out/x.sh", &xs, 0) == 0);
+    CHECK(stat_meta("omnic_arc_md_out/dir", &dir, 0) == 0);
+    CHECK(stat_meta("omnic_arc_md_out/plain.txt", &pl, 0) == 0);
+#ifdef _WIN32
+    CHECK((ro.attrs & (OMNIC_FS_ATTR_READONLY | OMNIC_FS_ATTR_HIDDEN)) ==
+          (OMNIC_FS_ATTR_READONLY | OMNIC_FS_ATTR_HIDDEN));
+    CHECK((xs.attrs & OMNIC_FS_ATTR_SYSTEM) != 0);
+    CHECK((dir.attrs & OMNIC_FS_ATTR_HIDDEN) != 0); /* 目录的属性在文件全部写完后设 */
+    CHECK(pl.attrs == 0);
+#else
+    CHECK(ro.has_mode && ro.mode == 0600); /* 私密文件保持私密 */
+    CHECK(xs.has_mode && xs.mode == 0755); /* 可执行文件解出来就能运行 */
+    CHECK(dir.has_mode && dir.mode == 0750);
+    CHECK(pl.has_mode && pl.mode == 0644);
+#endif
+    CHECK(files_equal("omnic_arc_md/x.sh", "omnic_arc_md_out/x.sh"));
+    /* 全量提取再解一次：只读的既存文件也照常覆盖（覆盖语义不因为保了只读属性而变） */
+    CHECK(unpack_arc(A, O, o) == OMNIC_OK);
+    CHECK(files_equal("omnic_arc_md/ro.txt", "omnic_arc_md_out/ro.txt"));
+    /* --file 单选到已存在的文件：不带 -f 拒绝；带 -f 覆盖只读文件并重新保上只读 */
+    const char *names[1] = {"ro.txt"};
+    CHECK(omnic_unpack_files(A, O, names, 1, &o, &g_rep) != OMNIC_OK);
+    omnic_options of = mkopts(OMNIC_F_QUIET | OMNIC_F_FORCE, 0);
+    CHECK(omnic_unpack_files(A, O, names, 1, &of, &g_rep) == OMNIC_OK);
+    CHECK(stat_meta("omnic_arc_md_out/ro.txt", &ro, 0) == 0);
+#ifdef _WIN32
+    CHECK((ro.attrs & OMNIC_FS_ATTR_READONLY) != 0);
+#else
+    CHECK(ro.has_mode && ro.mode == 0600);
+#endif
+    rm_tree_deep(T);
+    rm_tree_deep(O);
+    remove(A);
+}
+
+static void test_v2_ctime(void) {
+    const char *T = "omnic_arc_ct", *O = "omnic_arc_ct_out", *A = "omnic_arc_ct.omnic";
+    rm_tree(T);
+    rm_tree(O);
+    omnic_fs_mkdir_p(T);
+    char txt[64];
+    fill_text(txt, 30);
+    wfile("omnic_arc_ct/a.txt", txt, 30);
+    const long long old = 1000000000LL; /* 2001-09-09 */
+    set_creation_time("omnic_arc_ct/a.txt", old);
+    long long now = (long long)time(NULL);
+    t_meta e;
+
+    /* 默认不存创建时间：解出来是新建文件的时间 */
+    CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(unpack_arc(A, O, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(stat_meta("omnic_arc_ct_out/a.txt", &e, OMNIC_FS_WANT_CTIME) == 0);
+    CHECK(e.ctime > now - 3600);
+    /* --ctime：存下来；Windows 上原样恢复 */
+    rm_tree(O);
+    CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET | OMNIC_F_CTIME, 0)) == OMNIC_OK);
+    CHECK(unpack_arc(A, O, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(stat_meta("omnic_arc_ct_out/a.txt", &e, OMNIC_FS_WANT_CTIME) == 0);
+#ifdef _WIN32
+    CHECK(e.ctime >= old - 2 && e.ctime <= old + 2);
+#else
+    CHECK(e.ctime > now - 3600); /* POSIX：创建时间只存不恢复（没有可移植的设置接口） */
+#endif
+    rm_tree(T);
+    rm_tree(O);
+    remove(A);
+}
+
+static void test_v2_layout(void) {
+    /* 头部版本 2；计数在头部（32 位）；尾部那 4 个字节保留为 0 */
+    const char *T = "omnic_arc_ly", *A = "omnic_arc_ly.omnic";
+    rm_tree(T);
+    omnic_fs_mkdir_p("omnic_arc_ly/d");
+    char txt[64];
+    fill_text(txt, 30);
+    wfile("omnic_arc_ly/f.txt", txt, 30);
+    CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    size_t n = 0;
+    unsigned char *b = slurp(A, &n);
+    CHECK(b != NULL && n > 64);
+    if (b != NULL) {
+        CHECK(b[8] == OMNIC_ARC_VERSION && b[9] == 0);
+        CHECK(rd32(b + 16) == 2);  /* 目录 + 文件 */
+        CHECK(rd32(b + 12) == 1);  /* 一个块 */
+        CHECK(rd32(b + 20) == 32); /* data_off */
+        CHECK(memcmp(b + n - 32, "OMNICEND", 8) == 0);
+        CHECK(b[n - 4] == 0 && b[n - 3] == 0 && b[n - 2] == 0 && b[n - 1] == 0);
+        free(b);
+    }
+    rm_tree(T);
+    remove(A);
+}
+
+static void test_v1_archive_readable(void) {
+    /* 由 v1 写入端（提交 c064007 的二进制）打出的归档：压缩块 + store 块 + 子目录 + 空文件 + 中文名。
+     * v2 的读取端必须原样解出。从构建目录或仓库根运行都能找到样本。 */
+    const char *cand[2] = {"../tests/fixtures/v1_sample.omnic", "tests/fixtures/v1_sample.omnic"};
+    const char *F = NULL;
+    for (int i = 0; i < 2 && F == NULL; i++)
+        if (file_exists(cand[i])) F = cand[i];
+    CHECK(F != NULL);
+    if (F == NULL) return;
+    size_t n = 0;
+    unsigned char *b = slurp(F, &n);
+    CHECK(b != NULL && n == 1349);
+    CHECK(b != NULL && b[8] == 1 && b[9] == 0); /* 版本 1 */
+    free(b);
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+    const char *O = "omnic_arc_v1_out";
+    rm_tree(O);
+    CHECK(omnic_arc_verify(F, &o, &g_rep) == OMNIC_OK);
+    CHECK(unpack_arc(F, O, o) == OMNIC_OK);
+    t_meta a, e;
+    CHECK(stat_meta("omnic_arc_v1_out/a.txt", &a, 0) == 0 && a.size > 300 && a.is_dir == 0);
+    CHECK(stat_meta("omnic_arc_v1_out/empty.bin", &e, 0) == 0 && e.size == 0);
+    CHECK(stat_meta("omnic_arc_v1_out/rand.bin", &e, 0) == 0 && e.size == 1024);
+    CHECK(stat_meta("omnic_arc_v1_out/sub", &e, 0) == 0 && e.is_dir == 1);
+    CHECK(file_exists("omnic_arc_v1_out/sub/中文.txt") == 1);
+    /* 文件时间：打包前设成了 2020-01-02 03:04:05（本地时间） */
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = 120;
+    tm.tm_mon = 0;
+    tm.tm_mday = 2;
+    tm.tm_hour = 3;
+    tm.tm_min = 4;
+    tm.tm_sec = 5;
+    long long want = (long long)mktime(&tm);
+    CHECK(a.mtime >= want - 2 && a.mtime <= want + 2);
+    CHECK(omnic_arc_list(F, &o) == OMNIC_OK);
+    rm_tree(O);
+}
+
+static void test_index_fuzz(void) {
+    /* 逐比特翻转一个小归档：任何一处损坏都不得让读取端崩溃；能通过校验的只允许是
+     * 规范里声明"保留、读取端忽略"的字节（头部 24..32、尾部最后 4 字节）。 */
+    const char *T = "omnic_arc_fz", *A = "omnic_arc_fz.omnic";
+    rm_tree(T);
+    omnic_fs_mkdir_p(T);
+    char txt[64];
+    fill_text(txt, 40);
+    wfile("omnic_arc_fz/f.txt", txt, 40);
+    CHECK(pack_tree(T, A, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    size_t n = 0;
+    unsigned char *good = slurp(A, &n);
+    unsigned char *buf = (unsigned char *)malloc(n);
+    CHECK(good != NULL && buf != NULL && n > 64);
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+    size_t flips = 0, accepted = 0, bad_accept = 0;
+    for (size_t i = 0; good != NULL && buf != NULL && i < n; i++) {
+        for (int k = 0; k < 8; k++) {
+            memcpy(buf, good, n);
+            buf[i] ^= (unsigned char)(1u << k);
+            FILE *f = fopen(A, "wb"); /* 短 ASCII 路径：CRT fopen 足够 */
+            if (f == NULL) break;
+            fwrite(buf, 1, n, f);
+            fclose(f);
+            flips++;
+            memset(&g_rep, 0, sizeof(g_rep));
+            if (omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK) {
+                accepted++;
+                if (!((i >= 24 && i < 32) || i + 4 >= n)) bad_accept++;
+            }
+        }
+    }
+    printf("note: fuzz: %zu single-bit flips, %zu accepted, %zu outside reserved bytes\n", flips,
+           accepted, bad_accept);
+    CHECK(flips == n * 8);
+    CHECK(bad_accept == 0);
+    free(buf);
+    free(good);
+    rm_tree(T);
+    remove(A);
+}
+
 int main(void) {
     test_roundtrip();
     test_roundtrip_edges();
@@ -1116,6 +1802,17 @@ int main(void) {
     test_pack_determinism();
     test_pack_parallel_blocks();
     test_decode_pool();
+    test_pack_atomic_publish();
+    test_pack_reports_skipped();
+    test_long_path_roundtrip();
+    test_unpack_dir_failure_continues();
+    test_dir_mtime_not_restored();
+    test_v2_links();
+    test_v2_meta();
+    test_v2_ctime();
+    test_v2_layout();
+    test_v1_archive_readable();
+    test_index_fuzz();
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

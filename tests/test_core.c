@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include "codec/codec.h"
+#include "core/fs.h"
 #include "core/registry.h"
 #include "core/util.h"
 #include "detect/entropy.h"
@@ -1346,6 +1347,17 @@ static void test_decision_latency(void) {
     free(buf);
 }
 
+/* pack 的默认归档名：源路径的尾分隔符要去掉（shell 补全给出的正是 "dir/"） */
+static void test_default_archive_path(void) {
+    static const char *in[] = {"dir/", "dir\\", "a/b/", "a/b", "C:\\"};
+    static const char *want[] = {"dir.omnic", "dir.omnic", "a/b.omnic", "a/b.omnic", "C:\\.omnic"};
+    for (int i = 0; i < 5; i++) {
+        char *p = omnic_fs_default_archive_path(in[i]);
+        CHECK(p != NULL && strcmp(p, want[i]) == 0);
+        free(p);
+    }
+}
+
 int main(void) {
     cleanup_all();
     make_src();
@@ -1353,6 +1365,7 @@ int main(void) {
     test_feature();
     test_trial();
     test_detect();
+    test_default_archive_path();
     test_auto_and_skip();
     test_roundtrip_full("zstd");
     test_roundtrip_full("lz4");

@@ -104,10 +104,25 @@ static int bb_put(bytebuf *b, const void *p, size_t n) {
 /* ---- 布局 ---- */
 #define ARC_HDR 32u
 #define ARC_FTR 32u
-#define ARC_ENT_FIX 26u  /* type/pad/block_id/in_off/size/crc */
+/* 条目定长部分：v1 = type/pad/block_id/in_off/size/crc（26B，mtime 另计）；
+ * v2 = type/flags/block_id/in_off/size/crc/mtime（34B，可选字段按固定次序跟在后面） */
+#define ARC_ENT_FIX_V1 26u
+#define ARC_ENT_FIX 34u
 #define ARC_BLK_ROW 32u
 static const uint8_t ARC_MAGIC_H[8] = {'O', 'M', 'N', 'I', 'C', 'A', 'R', 'C'};
 static const uint8_t ARC_MAGIC_F[8] = {'O', 'M', 'N', 'I', 'C', 'E', 'N', 'D'};
+#define ARC_NO_BLOCK 0xFFFFFFFFu /* 目录 / 硬链接条目的 block_id */
+
+/* 条目类型与 v2 标志位（FORMAT.md §EntryTable）。未知标志位一律拒绝，扩展须升版本 */
+enum { ARC_T_FILE = 0, ARC_T_DIR = 1, ARC_T_SYMLINK = 2, ARC_T_HARDLINK = 3 };
+#define ARC_EF_LINK_DIR 0x01u      /* 符号链接的目标是目录 */
+#define ARC_EF_LINK_JUNCTION 0x02u /* Windows 目录联接（目标为绝对路径） */
+#define ARC_EF_HAS_CTIME 0x04u
+#define ARC_EF_HAS_MODE 0x08u
+#define ARC_EF_HAS_ATTRS 0x10u
+#define ARC_EF_HAS_LINKTO 0x40u /* 硬链接：link_to 字段存在 */
+#define ARC_EF_KNOWN 0x5Fu
+#define ARC_LINK_MAX (1u << 20) /* 链接目标的字节上限：畸形索引不得撑爆内存 */
 
 #ifndef OMNIC_CODEC_ZSTD
 #error "internal: stub must precede helpers"
@@ -125,11 +140,16 @@ typedef struct {
 
 typedef struct {
     char *name;
-    uint8_t type; /* 0=file 1=dir */
-    uint32_t block_id;
-    uint64_t in_off, size;
+    uint8_t type; /* ARC_T_* */
+    uint8_t flags; /* ARC_EF_* */
+    uint32_t block_id; /* 有数据的条目（文件、符号链接）所在块；否则 ARC_NO_BLOCK */
+    uint64_t in_off, size; /* 符号链接的 size = 目标串字节数 */
     uint32_t crc;
     long long mtime;
+    long long ctime;  /* 0 = 未存 */
+    unsigned mode;    /* 0 = 未存 */
+    unsigned attrs;   /* 0 = 未存 */
+    uint32_t link_to; /* 硬链接：指向的文件条目下标 */
 } arc_entry;
 
 typedef struct {
@@ -137,6 +157,7 @@ typedef struct {
     size_t nblk;
     arc_entry *ent;
     size_t nent;
+    unsigned version;
 } arc_index;
 
 static void arc_index_mem_free(arc_index *ix) {
@@ -172,9 +193,10 @@ static int cmp_strp(const void *a, const void *b) {
     return strcmp(*(const char *const *)a, *(const char *const *)b);
 }
 
-/* ---- 索引明文序列化：块表(32B/块) ‖ 条目表(name_len/name/26B[+mtime8]) ---- */
+/* ---- 索引明文序列化（写入端只写 v2）：块表(32B/块) ‖ 条目表。
+ * 条目 = name_len/name + 定长 34B + 可选字段（次序固定：link_to, ctime, mode, attrs）。 ---- */
 static int arc_index_serialize(const arc_block *blk, size_t nblk, const arc_entry *ent,
-                               size_t nent, int has_mtime, bytebuf *out) {
+                               size_t nent, bytebuf *out) {
     for (size_t i = 0; i < nblk; i++) {
         uint8_t row[ARC_BLK_ROW];
         memset(row, 0, sizeof(row));
@@ -188,25 +210,48 @@ static int arc_index_serialize(const arc_block *blk, size_t nblk, const arc_entr
     }
     for (size_t i = 0; i < nent; i++) {
         uint16_t nl = (uint16_t)strlen(ent[i].name);
-        if (bb_put(out, &nl, 2) != 0) return -1;
+        uint8_t nlb[2];
+        put16(nlb, nl);
+        if (bb_put(out, nlb, 2) != 0) return -1;
         if (bb_put(out, ent[i].name, nl) != 0) return -1;
-        uint8_t row[ARC_ENT_FIX + 8];
+        uint8_t row[ARC_ENT_FIX + 4 + 8 + 2 + 2];
         memset(row, 0, sizeof(row));
         row[0] = ent[i].type;
+        row[1] = ent[i].flags;
         put32(row + 2, ent[i].block_id);
         put64(row + 6, ent[i].in_off);
         put64(row + 14, ent[i].size);
         put32(row + 22, ent[i].crc);
-        if (has_mtime) put64(row + 26, (uint64_t)ent[i].mtime);
-        if (bb_put(out, row, has_mtime ? ARC_ENT_FIX + 8 : ARC_ENT_FIX) != 0) return -1;
+        put64(row + 26, (uint64_t)ent[i].mtime);
+        size_t len = ARC_ENT_FIX;
+        if (ent[i].flags & ARC_EF_HAS_LINKTO) {
+            put32(row + len, ent[i].link_to);
+            len += 4;
+        }
+        if (ent[i].flags & ARC_EF_HAS_CTIME) {
+            put64(row + len, (uint64_t)ent[i].ctime);
+            len += 8;
+        }
+        if (ent[i].flags & ARC_EF_HAS_MODE) {
+            put16(row + len, (uint16_t)ent[i].mode);
+            len += 2;
+        }
+        if (ent[i].flags & ARC_EF_HAS_ATTRS) {
+            put16(row + len, (uint16_t)ent[i].attrs);
+            len += 2;
+        }
+        if (bb_put(out, row, len) != 0) return -1;
     }
     return 0;
 }
 
-/* ---- unpack：索引解析（全部结构校验在此，ARCHIVE_SPEC §4.1）---- */
+/* ---- unpack：索引解析（全部结构校验在此，FORMAT.md）。v1 与 v2 的条目记录分别解析，
+ * 归一到同一张内存表。---- */
 static omnic_status arc_index_parse(const uint8_t *p, size_t n, uint32_t nent,
-                                    uint32_t nblk, int has_mtime, arc_index *ix) {
+                                    uint32_t nblk, unsigned version, int has_mtime,
+                                    arc_index *ix) {
     memset(ix, 0, sizeof(*ix));
+    ix->version = version;
     if (nblk > 0) {
         if (n < (size_t)nblk * ARC_BLK_ROW) return OMNIC_E_DATA;
         ix->blk = (arc_block *)calloc(nblk, sizeof(arc_block));
@@ -230,12 +275,16 @@ static omnic_status arc_index_parse(const uint8_t *p, size_t n, uint32_t nent,
         p += (size_t)nblk * ARC_BLK_ROW;
         n -= (size_t)nblk * ARC_BLK_ROW;
     }
+    const size_t rowlen =
+        (version == 1) ? ARC_ENT_FIX_V1 + (has_mtime ? 8u : 0u) : ARC_ENT_FIX;
+    /* 计数来自不可信的头：按每条记录的最小长度（name_len + 1 字节名字 + 定长）先卡一道，
+     * 再按它分配 */
+    if (nent > 0 && (uint64_t)nent * (2u + 1u + rowlen) > (uint64_t)n) return OMNIC_E_DATA;
     if (nent > 0) {
         ix->ent = (arc_entry *)calloc(nent, sizeof(arc_entry));
         if (ix->ent == NULL) return OMNIC_E_SYSTEM;
         ix->nent = nent;
     }
-    size_t rowlen = ARC_ENT_FIX + (has_mtime ? 8u : 0u);
     for (uint32_t i = 0; i < nent; i++) {
         if (n < 2) return OMNIC_E_DATA;
         uint16_t nl = get16(p);
@@ -254,24 +303,91 @@ static omnic_status arc_index_parse(const uint8_t *p, size_t n, uint32_t nent,
             free(name);
             return OMNIC_E_DATA;
         }
-        ix->ent[i].name = name;
-        ix->ent[i].type = p[0];
-        ix->ent[i].block_id = get32(p + 2);
-        ix->ent[i].in_off = get64(p + 6);
-        ix->ent[i].size = get64(p + 14);
-        ix->ent[i].crc = get32(p + 22);
-        if (has_mtime) ix->ent[i].mtime = (long long)get64(p + 26);
+        arc_entry *e = &ix->ent[i];
+        e->name = name;
+        e->type = p[0];
+        e->block_id = get32(p + 2);
+        e->in_off = get64(p + 6);
+        e->size = get64(p + 14);
+        e->crc = get32(p + 22);
+        if (version == 1) {
+            if (has_mtime) e->mtime = (long long)get64(p + 26);
+            if (e->type != ARC_T_FILE && e->type != ARC_T_DIR) return OMNIC_E_DATA; /* v1 只认文件与目录 */
+        } else {
+            e->flags = p[1];
+            e->mtime = (long long)get64(p + 26);
+        }
         p += rowlen;
         n -= rowlen;
-        if (ix->ent[i].type == 0) {
-            if (ix->ent[i].block_id >= ix->nblk) return OMNIC_E_DATA;
-            if (ix->ent[i].in_off > (1u << 30) || ix->ent[i].size > (1u << 30)) return OMNIC_E_DATA;
-            const arc_block *b = &ix->blk[ix->ent[i].block_id];
-            if (ix->ent[i].in_off + ix->ent[i].size > b->raw_size) return OMNIC_E_DATA;
-        } else if (ix->ent[i].type != 1) {
-            return OMNIC_E_DATA;
+        if (version == 1) {
+            /* v1 目录条目的块号：规范写 0xFFFFFFFF，参考实现实际写的是 0——两种都收 */
+            if (e->type == ARC_T_DIR) {
+                if (e->size != 0 || e->in_off != 0 || e->crc != 0) return OMNIC_E_DATA;
+                e->block_id = ARC_NO_BLOCK;
+            } else if (e->block_id >= ix->nblk || e->in_off > (1u << 30) || e->size > (1u << 30) ||
+                       e->in_off + e->size > ix->blk[e->block_id].raw_size) {
+                return OMNIC_E_DATA;
+            }
+            continue;
+        }
+        /* v2：未知标志位一律拒绝；可选字段按固定次序跟随 */
+        if (e->type > ARC_T_HARDLINK || (e->flags & ~ARC_EF_KNOWN) != 0) return OMNIC_E_DATA;
+        if ((e->flags & ARC_EF_HAS_LINKTO) != 0) {
+            if (n < 4) return OMNIC_E_DATA;
+            e->link_to = get32(p);
+            p += 4;
+            n -= 4;
+        }
+        if ((e->flags & ARC_EF_HAS_CTIME) != 0) {
+            if (n < 8) return OMNIC_E_DATA;
+            e->ctime = (long long)get64(p);
+            p += 8;
+            n -= 8;
+        }
+        if ((e->flags & ARC_EF_HAS_MODE) != 0) {
+            if (n < 2) return OMNIC_E_DATA;
+            e->mode = get16(p);
+            if (e->mode & ~07777u) return OMNIC_E_DATA;
+            p += 2;
+            n -= 2;
+        }
+        if ((e->flags & ARC_EF_HAS_ATTRS) != 0) {
+            if (n < 2) return OMNIC_E_DATA;
+            e->attrs = get16(p);
+            if (e->attrs & ~OMNIC_FS_ATTR_MASK) return OMNIC_E_DATA;
+            p += 2;
+            n -= 2;
+        }
+        if (e->type == ARC_T_FILE || e->type == ARC_T_SYMLINK) {
+            if (e->block_id >= ix->nblk || e->in_off > (1u << 30) || e->size > (1u << 30) ||
+                e->in_off + e->size > ix->blk[e->block_id].raw_size)
+                return OMNIC_E_DATA;
+            if (e->type == ARC_T_SYMLINK) { /* 链接标志只属于链接条目；目标串非空、有上限 */
+                if (e->size == 0 || e->size > ARC_LINK_MAX ||
+                    ((e->flags & ARC_EF_LINK_DIR) != 0 && (e->flags & ARC_EF_LINK_JUNCTION) != 0))
+                    return OMNIC_E_DATA;
+            } else if ((e->flags & (ARC_EF_LINK_DIR | ARC_EF_LINK_JUNCTION | ARC_EF_HAS_LINKTO)) != 0) {
+                return OMNIC_E_DATA;
+            }
+        } else {
+            if (e->size != 0 || e->in_off != 0 || e->crc != 0 || e->block_id != ARC_NO_BLOCK)
+                return OMNIC_E_DATA;
+            if (e->type == ARC_T_DIR) {
+                if ((e->flags & (ARC_EF_LINK_DIR | ARC_EF_LINK_JUNCTION | ARC_EF_HAS_LINKTO)) != 0)
+                    return OMNIC_E_DATA;
+            } else if ((e->flags & ARC_EF_HAS_LINKTO) == 0) {
+                return OMNIC_E_DATA; /* 硬链接必须指明目标条目 */
+            }
         }
     }
+    /* 硬链接的目标必须是普通文件条目：不认另一条硬链接，也不认自己 */
+    for (uint32_t i = 0; i < ix->nent; i++) {
+        if (ix->ent[i].type != ARC_T_HARDLINK) continue;
+        uint32_t t = ix->ent[i].link_to;
+        if (t == i || t >= ix->nent || ix->ent[t].type != ARC_T_FILE) return OMNIC_E_DATA;
+    }
+    /* 计数与内容必须严格吻合：索引尾部有剩余字节 = 头部计数被改小，不能悄悄少解条目 */
+    if (n != 0) return OMNIC_E_DATA;
     /* 条目名唯一性（§4.1）：指针排序后查相邻，O(n log n) */
     if (nent > 1) {
         const char **names = (const char **)malloc((size_t)nent * sizeof(char *));
@@ -336,6 +452,36 @@ typedef struct {
     int store;
 } file_plan;
 
+/* 文件身份（硬链接识别）：分类时每个普通文件顺手取一次（Windows 上约 16 µs，
+ * 摊在分类池里；POSIX 上就是一次 stat）。全 0 = 未知。 */
+typedef struct {
+    unsigned long long dev, ino;
+    size_t idx;
+} arc_fid;
+
+static int fid_cmp(const void *pa, const void *pb) {
+    const arc_fid *a = (const arc_fid *)pa, *b = (const arc_fid *)pb;
+    if (a->dev != b->dev) return a->dev < b->dev ? -1 : 1;
+    if (a->ino != b->ino) return a->ino < b->ino ? -1 : 1;
+    return a->idx < b->idx ? -1 : (a->idx > b->idx ? 1 : 0);
+}
+
+/* 同一文件身份的多个目录项：索引序里首个持有数据，其余成为指向它的硬链接条目
+ * （与线程调度无关，产物确定）。ids 按下标对应条目，调用后被排序。 */
+static void mark_hardlinks(arc_index *ix, arc_fid *ids, size_t n) {
+    qsort(ids, n, sizeof(*ids), fid_cmp);
+    for (size_t k = 1; k < n; k++) {
+        const arc_fid *a = &ids[k - 1], *b = &ids[k];
+        if (b->dev == 0 && b->ino == 0) continue;
+        if (a->dev != b->dev || a->ino != b->ino) continue;
+        size_t owner = a->idx; /* 第三个及以后的链接：前一项可能已是硬链接条目 */
+        while (ix->ent[owner].type == ARC_T_HARDLINK) owner = ix->ent[owner].link_to;
+        ix->ent[b->idx].type = ARC_T_HARDLINK;
+        ix->ent[b->idx].flags |= ARC_EF_HAS_LINKTO;
+        ix->ent[b->idx].link_to = (uint32_t)owner;
+    }
+}
+
 /* 块表扩容入表（offset 相对 data_off） */
 static int arc_block_new(arc_index *ix, size_t *cap, uint8_t fmt, uint8_t level,
                          uint64_t offset) {
@@ -389,6 +535,7 @@ typedef struct {
     const char *root;
     const omnic_options *o;
     file_plan *plan;
+    arc_fid *ids; /* [i]：按下标私有写，join 后主线程统一识别硬链接 */
     size_t n, next;
     int stop;
     omnic_status first_err;
@@ -414,6 +561,7 @@ static int cls_one(cls_ctx *c, size_t i) {
         snprintf(c->plan[i].codec, sizeof(c->plan[i].codec), "%s", arep.codec);
         c->plan[i].level = arep.level;
     }
+    (void)omnic_fs_file_id(src, &c->ids[i].dev, &c->ids[i].ino); /* 取不到按未知：不当硬链接 */
     return 0;
 }
 
@@ -431,7 +579,7 @@ ARC_THREAD_FN cls_worker(void *arg) {
         if (cnt == 0) break;
         for (size_t k = 0; k < cnt; k++) {
             size_t i = i0 + k;
-            if (c->ix->ent[i].type == 1) continue; /* 目录条目不分类 */
+            if (c->ix->ent[i].type != ARC_T_FILE) continue; /* 目录、链接不分类 */
             if (cls_one(c, i) != 0) {
                 arc_mutex_lock(&c->lock);
                 if (c->first_err == OMNIC_OK) {
@@ -712,6 +860,23 @@ static void cmp_pool_shutdown(cmp_ctx *c, arc_thread_t *tid, int spawned) {
 }
 
 /* ---- pack（A3：store-only；A4 接决策分桶与压缩块）---- */
+
+/* 未收录条目的上报：非 strict 逐类计数打到 stderr；strict 记为错误（CLI 退出前打印） */
+static void report_skipped(const char *root, const omnic_fs_skip_report *sk, int strict) {
+    if (strict) {
+        omnic_set_error("%zu entries under %s cannot be archived (--strict): %zu special files or "
+                        "unsupported links, %zu unreadable, %zu paths too long",
+                        sk->total, root, sk->special, sk->unreadable, sk->too_long);
+        return;
+    }
+    fprintf(stderr, "omnic: skipped %zu entries under %s (not in the archive): %zu special files or "
+                    "unsupported links, %zu unreadable, %zu paths too long\n",
+            sk->total, root, sk->special, sk->unreadable, sk->too_long);
+    for (size_t i = 0; i < sk->n_first; i++)
+        fprintf(stderr, "omnic:   skipped: %s%s\n", sk->first[i],
+                (i + 1 == sk->n_first && sk->total > sk->n_first) ? " ..." : "");
+}
+
 omnic_status omnic_pack(const char *root, const char *archive_path,
                         const omnic_options *o, omnic_report *rep) {
     (void)o;
@@ -723,6 +888,9 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     file_plan *plan = NULL;
     arc_bucket *bkts = NULL;
     size_t nb = 0;
+    char tmp_path[OMNIC_FS_PATH_MAX];
+    tmp_path[0] = '\0';
+    arc_fid *ids = NULL; /* 文件身份表：分类后用于识别硬链接 */
 
     /* T1/AR-ERR-002：输出归档不得位于源树内（自吞风险） */
     {
@@ -738,15 +906,32 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
         }
     }
 
-    size_t n = 0, skipped = 0;
-    omnic_fs_entry *fs = omnic_fs_walk(root, &n, &skipped);
+    /* 归档先写同目录的临时文件，成功后才改名到 archive_path：失败的路上，输出
+     * 路径上原有的归档（可能是上一份好备份）不会被截断 */
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", archive_path) >= (int)sizeof(tmp_path)) {
+        omnic_set_error("archive path too long: %s", archive_path);
+        return OMNIC_E_USAGE;
+    }
+
+    size_t n = 0;
+    omnic_fs_skip_report sk;
+    unsigned want = (o != NULL && (o->flags & OMNIC_F_CTIME) != 0) ? OMNIC_FS_WANT_CTIME : 0;
+    omnic_fs_entry *fs = omnic_fs_walk_ex(root, &n, &sk, want);
     if (fs == NULL && n == 0) {
         omnic_set_error("fs walk failed: %s", root);
         return OMNIC_E_SYSTEM;
     }
-    if (n > 65535u) {
-        omnic_set_error("too many entries (%zu > 65535) — v1 limit", n);
-        free(fs);
+    if (sk.total > 0) {
+        int strict = (o != NULL && (o->flags & OMNIC_F_STRICT) != 0);
+        if (strict || o == NULL || (o->flags & OMNIC_F_QUIET) == 0) report_skipped(root, &sk, strict);
+        if (strict) {
+            omnic_fs_entries_free(fs, n);
+            return OMNIC_E_DATA;
+        }
+    }
+    if (n > 0xFFFFFFFFull) { /* v2：条目计数 32 位；实践中先撞内存 */
+        omnic_set_error("too many entries (%zu)", n);
+        omnic_fs_entries_free(fs, n);
         return OMNIC_E_USAGE;
     }
 
@@ -763,21 +948,45 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     memset(&ix, 0, sizeof(ix));
     ix.ent = (arc_entry *)calloc(n ? n : 1, sizeof(arc_entry));
     if (ix.ent == NULL) {
-        free(fs);
+        omnic_fs_entries_free(fs, n);
         return OMNIC_E_SYSTEM;
     }
     ix.nent = n;
+    ix.version = OMNIC_ARC_VERSION;
     for (size_t i = 0; i < n; i++) {
-        ix.ent[i].name = arc_dup_name(fs[i].rel);
-        if (ix.ent[i].name == NULL) {
+        arc_entry *e = &ix.ent[i];
+        e->name = arc_dup_name(fs[i].rel);
+        if (e->name == NULL) {
             omnic_set_error("entry name not representable: %s", fs[i].rel);
             goto fail;
         }
-        ix.ent[i].type = fs[i].is_dir ? 1 : 0;
-        ix.ent[i].mtime = fs[i].mtime;
+        e->mtime = fs[i].mtime;
+        e->block_id = ARC_NO_BLOCK; /* 有数据的条目落块时回填 */
+        if (fs[i].link_kind != 0) {
+            e->type = ARC_T_SYMLINK; /* 目标串当数据存进 store 桶 */
+            if (fs[i].link_kind == OMNIC_FS_LINK_DIR_SYMLINK) e->flags |= ARC_EF_LINK_DIR;
+            else if (fs[i].link_kind == OMNIC_FS_LINK_JUNCTION) e->flags |= ARC_EF_LINK_JUNCTION;
+        } else if (fs[i].is_dir) {
+            e->type = ARC_T_DIR;
+        } else {
+            e->type = ARC_T_FILE;
+        }
+        /* 可选字段：有才存——普通文件/目录的记录因此与 v1 等长 */
+        if (fs[i].ctime != 0) {
+            e->ctime = fs[i].ctime;
+            e->flags |= ARC_EF_HAS_CTIME;
+        }
+        if (fs[i].has_mode && fs[i].link_kind == 0) {
+            e->mode = fs[i].mode;
+            e->flags |= ARC_EF_HAS_MODE;
+        }
+        if (fs[i].attrs != 0) {
+            e->attrs = fs[i].attrs;
+            e->flags |= ARC_EF_HAS_ATTRS;
+        }
     }
 
-    f = omnic_fs_fopen(archive_path, "wb");
+    f = omnic_fs_fopen(tmp_path, "wb");
     if (f == NULL) {
         /* 父目录不存在则自动创建（产品友好），重试一次 */
         char parent[OMNIC_FS_PATH_MAX];
@@ -788,7 +997,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
             if (slash != NULL) {
                 *slash = '\0';
                 if (omnic_fs_mkdir_p(parent) == OMNIC_OK)
-                    f = omnic_fs_fopen(archive_path, "wb");
+                    f = omnic_fs_fopen(tmp_path, "wb");
             }
         }
     }
@@ -825,6 +1034,9 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
      * 区别仅 in_bytes 累加点（并行在 join 后按同一口径补算）。 ---- */
     plan = (file_plan *)calloc(n ? n : 1, sizeof(file_plan));
     if (plan == NULL) goto oom;
+    ids = (arc_fid *)calloc(n ? n : 1, sizeof(arc_fid));
+    if (ids == NULL) goto oom;
+    for (size_t i = 0; i < n; i++) ids[i].idx = i;
     size_t n_files = 0;
     for (size_t i = 0; i < n; i++)
         if (ix.ent[i].type == 0) n_files++;
@@ -842,6 +1054,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
         c.root = root;
         c.o = o;
         c.plan = plan;
+        c.ids = ids;
         c.n = n;
         c.first_err = OMNIC_OK;
         arc_mutex_init(&c.lock);
@@ -863,7 +1076,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     }
     if (!cls_parallel) {
         for (size_t i = 0; i < n; i++) {
-        if (ix.ent[i].type == 1) continue;
+        if (ix.ent[i].type != ARC_T_FILE) continue; /* 目录、链接不分类 */
         char src[OMNIC_FS_PATH_MAX * 2];
         if (snprintf(src, sizeof(src), "%s/%s", root, fs[i].rel) >= (int)sizeof(src)) {
             omnic_set_error("path too long: %s", fs[i].rel);
@@ -884,21 +1097,25 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
             snprintf(plan[i].codec, sizeof(plan[i].codec), "%s", arep.codec);
             plan[i].level = arep.level;
         }
+        (void)omnic_fs_file_id(src, &ids[i].dev, &ids[i].ino); /* 取不到按未知：不当硬链接 */
         if (explain)
             printf("  %s: %s -> %s\n", fs[i].rel, omnic_class_str(arep.klass),
                    plan[i].store ? "pass-through" : plan[i].codec);
         rep->in_bytes += fs[i].size;
         }
     }
+    mark_hardlinks(&ix, ids, n);
+    free(ids);
+    ids = NULL;
     if (!quiet)
         printf("  classified %llu entries in %.2fs\n", (unsigned long long)n,
                 omnic_now_sec() - t0);
 
     /* ---- 分桶（D10：同 (codec,level) 聚合；per-file 模式每文件独立桶） ---- */
     for (size_t i = 0; i < n; i++) {
-        if (ix.ent[i].type == 1) continue;
+        if (ix.ent[i].type != ARC_T_FILE && ix.ent[i].type != ARC_T_SYMLINK) continue;
         arc_bucket *t = NULL;
-        if (plan[i].store) {
+        if (plan[i].store || ix.ent[i].type == ARC_T_SYMLINK) { /* 链接的目标串原样进 store 桶 */
             for (size_t k = 0; k < nb; k++)
                 if (bkts[k].is_store) { t = &bkts[k]; break; }
             if (t == NULL) {
@@ -992,22 +1209,26 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
             int blk_open = 0;
             for (size_t fi = 0; fi < b->n; fi++) {
                 size_t i = b->idx[fi];
+                const char *mem = (ix.ent[i].type == ARC_T_SYMLINK) ? fs[i].link_target : NULL;
                 char src[OMNIC_FS_PATH_MAX * 2];
-                if (snprintf(src, sizeof(src), "%s/%s", root, fs[i].rel) >= (int)sizeof(src)) {
-                    omnic_set_error("path too long: %s", fs[i].rel);
-                    goto fail;
-                }
-                FILE *in = omnic_fs_fopen(src, "rb");
-                if (in == NULL) {
-                    omnic_set_error("cannot read source file: %s", src);
-                    goto fail;
+                FILE *in = NULL;
+                if (mem == NULL) { /* 符号链接的"内容"是目标串（内存）；普通文件读盘 */
+                    if (snprintf(src, sizeof(src), "%s/%s", root, fs[i].rel) >= (int)sizeof(src)) {
+                        omnic_set_error("path too long: %s", fs[i].rel);
+                        goto fail;
+                    }
+                    in = omnic_fs_fopen(src, "rb");
+                    if (in == NULL) {
+                        omnic_set_error("cannot read source file: %s", src);
+                        goto fail;
+                    }
                 }
                 uint64_t cur = blk_open ? ix.blk[ix.nblk - 1].raw_size : 0;
                 if (!blk_open || (cur > 0 && (cur + fs[i].size > block_max ||
                                               fs[i].size > block_max))) {
                     if (blk_open) ix.blk[ix.nblk - 1].crc = blk_crc;
                     if (arc_block_new(&ix, &tbl_cap, 0, 0, arc_pos - data_off) != 0) {
-                        fclose(in);
+                        if (in != NULL) fclose(in);
                         goto oom;
                     }
                     blk_crc = 0;
@@ -1019,10 +1240,20 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
                 ix.ent[i].size = fs[i].size;
                 uint32_t file_crc = 0;
                 uint8_t buf[64 * 1024];
-                size_t r;
-                while ((r = fread(buf, 1, sizeof(buf), in)) > 0) {
+                size_t done = 0;
+                /* 按遍历时的长度写：文件此后变短就中止——短写会让同块后续条目的偏移全错 */
+                while (done < fs[i].size) {
+                    size_t r;
+                    if (mem != NULL) {
+                        r = (size_t)(fs[i].size - done);
+                        if (r > sizeof(buf)) r = sizeof(buf);
+                        memcpy(buf, mem + done, r);
+                    } else {
+                        r = fread(buf, 1, sizeof(buf), in);
+                        if (r == 0) break;
+                    }
                     if (fwrite(buf, 1, r, f) != r) {
-                        fclose(in);
+                        if (in != NULL) fclose(in);
                         goto io_fail;
                     }
                     arc_pos += r;
@@ -1030,12 +1261,20 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
                     cb->comp_size = cb->raw_size;
                     file_crc = omnic_crc32(file_crc, buf, r);
                     blk_crc = omnic_crc32(blk_crc, buf, r);
+                    done += r;
                 }
-                int bad = ferror(in);
-                fclose(in);
-                if (bad) {
-                    omnic_set_error("read failed: %s", src);
-                    goto fail;
+                if (in != NULL) {
+                    int rd_err = ferror(in);
+                    int short_read = (done != fs[i].size);
+                    fclose(in);
+                    if (rd_err) {
+                        omnic_set_error("read failed: %s", src);
+                        goto fail;
+                    }
+                    if (short_read) {
+                        omnic_set_error("source file changed size while packing: %s", src);
+                        goto fail;
+                    }
                 }
                 ix.ent[i].crc = file_crc;
             }
@@ -1258,7 +1497,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
 
     /* 索引（zstd）+ Footer；n_blocks 回填 Header */
     bytebuf plain = {NULL, 0, 0};
-    if (arc_index_serialize(ix.blk, ix.nblk, ix.ent, ix.nent, 1, &plain) != 0) goto oom;
+    if (arc_index_serialize(ix.blk, ix.nblk, ix.ent, ix.nent, &plain) != 0) goto oom;
     size_t zcap = ZSTD_compressBound(plain.n);
     uint8_t *zbuf = (uint8_t *)malloc(zcap);
     if (zbuf == NULL) {
@@ -1287,19 +1526,30 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     if (arc_seek(f, index_off + zn) != 0) goto io_fail; /* 回填后回到尾部写 Footer */
 
     uint8_t ftr[ARC_FTR];
+    memset(ftr, 0, sizeof(ftr)); /* 尾部的计数字节在 v2 保留为 0：不能留栈上的旧值 */
     memcpy(ftr, ARC_MAGIC_F, 8);
     put64(ftr + 8, index_off);
     put64(ftr + 16, zn);
     put32(ftr + 24, index_crc);
-    put16(ftr + 28, (uint16_t)ix.nent);
-    put16(ftr + 30, (uint16_t)ix.nblk);
+    /* v2：尾部的 4 个计数字节保留为 0——计数以头部的 32 位为准（v1 在那里只有 16 位） */
     if (fwrite(ftr, 1, sizeof(ftr), f) != sizeof(ftr)) goto io_fail;
 
     rep->out_bytes = index_off + zn + ARC_FTR;
     rep->ratio = rep->in_bytes ? (double)rep->out_bytes / (double)rep->in_bytes : 0.0;
     arc_index_mem_free(&ix);
-    free(fs);
-    if (fclose(f) != 0) return OMNIC_E_SYSTEM;
+    omnic_fs_entries_free(fs, n);
+    fs = NULL; /* 之后的 goto fail 还会再走一遍清理 */
+    if (fclose(f) != 0) {
+        f = NULL;
+        omnic_set_error("write failed on archive: %s", archive_path);
+        goto fail;
+    }
+    f = NULL;
+    /* 发布：同目录改名是原子的，输出路径上只可能是旧归档或完整的新归档 */
+    if (omnic_fs_replace(tmp_path, archive_path) != OMNIC_OK) {
+        omnic_set_error("cannot replace archive (open in another process?): %s", archive_path);
+        goto fail;
+    }
     return OMNIC_OK;
 
 io_fail:
@@ -1310,10 +1560,12 @@ oom:
 fail:
     if (cmp_on) cmp_pool_shutdown(&cmp, cmp_tid, cmp_spawned);
     free(plan);
+    free(ids);
     buckets_free(bkts, nb);
     arc_index_mem_free(&ix);
-    free(fs);
+    omnic_fs_entries_free(fs, n);
     if (f != NULL) fclose(f);
+    if (tmp_path[0] != '\0') omnic_fs_remove(tmp_path);
     return OMNIC_E_SYSTEM;
 }
 
@@ -1340,8 +1592,28 @@ static omnic_status arc_open_index(const char *archive_path, FILE **out_f, arc_i
         fclose(f);
         return OMNIC_E_DATA;
     }
-    if (get16(hdr + 8) != OMNIC_ARC_VERSION) {
-        omnic_set_error("unsupported .omnic version %u", get16(hdr + 8));
+    unsigned version = get16(hdr + 8);
+    if (version < OMNIC_ARC_VERSION_MIN || version > OMNIC_ARC_VERSION) {
+        omnic_set_error(version > OMNIC_ARC_VERSION
+                            ? "archive needs a newer omnic (format version %u)"
+                            : "unsupported .omnic version %u",
+                        version);
+        fclose(f);
+        return OMNIC_E_DATA;
+    }
+    unsigned hflags = get16(hdr + 10);
+    /* 未知标志位明确拒绝：否则按旧布局去读带新字段的索引只会读出错数据。
+     * v2 的记录恒带 mtime，所以头部标志必须是那两位本身；v1 的 bit0 表示有无 mtime。 */
+    if ((hflags & ~(OMNIC_ARC_F_MTIME | OMNIC_ARC_F_INDEX_ZSTD)) != 0 ||
+        (hflags & OMNIC_ARC_F_INDEX_ZSTD) == 0 ||
+        (version == OMNIC_ARC_VERSION && hflags != (OMNIC_ARC_F_MTIME | OMNIC_ARC_F_INDEX_ZSTD))) {
+        omnic_set_error("unsupported archive flags 0x%x", hflags);
+        fclose(f);
+        return OMNIC_E_DATA;
+    }
+    /* 读取端按固定的数据区起点算块偏移：别处的值不能默默放过 */
+    if (get32(hdr + 20) != ARC_HDR) {
+        omnic_set_error("unsupported data offset %u", get32(hdr + 20));
         fclose(f);
         return OMNIC_E_DATA;
     }
@@ -1353,8 +1625,9 @@ static omnic_status arc_open_index(const char *archive_path, FILE **out_f, arc_i
     }
     uint64_t index_off = get64(ftr + 8), index_comp = get64(ftr + 16);
     uint32_t index_crc = get32(ftr + 24);
-    uint32_t nent = get16(ftr + 28), nblk = get16(ftr + 30);
-    if (get32(hdr + 16) != nent || get32(hdr + 12) != nblk) {
+    /* 计数以 32 位的头为准（v2 起）；v1 另与尾部的 16 位计数交叉核对 */
+    uint32_t nent = get32(hdr + 16), nblk = get32(hdr + 12);
+    if (version == 1 && (get16(ftr + 28) != nent || get16(ftr + 30) != nblk)) {
         omnic_set_error("archive header/footer mismatch — corrupt archive");
         fclose(f);
         return OMNIC_E_DATA;
@@ -1403,7 +1676,9 @@ static omnic_status arc_open_index(const char *archive_path, FILE **out_f, arc_i
         fclose(f);
         return OMNIC_E_DATA;
     }
-    omnic_status pst = arc_index_parse(plain, plain_n, nent, nblk, 1, ix);
+    /* v2 的记录恒带 mtime；v1 才看头部标志位 */
+    omnic_status pst = arc_index_parse(plain, plain_n, nent, nblk, version,
+                                        version == 1 ? ((hflags & OMNIC_ARC_F_MTIME) != 0) : 1, ix);
     free(plain);
     if (pst == OMNIC_E_SYSTEM) {
         fclose(f);
@@ -1424,7 +1699,8 @@ static void report_bad_block(const arc_index *ix, size_t bi, unsigned fmt, unsig
     fprintf(stderr, "omnic: block %zu (fmt %u) corrupted — skipped, affected:", bi, fmt);
     size_t shown = 0;
     for (size_t i = 0; i < ix->nent && shown < 10; i++)
-        if (ix->ent[i].type == 0 && ix->ent[i].block_id == (uint32_t)bi) {
+        if ((ix->ent[i].type == ARC_T_FILE || ix->ent[i].type == ARC_T_SYMLINK) &&
+            ix->ent[i].block_id == (uint32_t)bi) {
             fprintf(stderr, " %s", ix->ent[i].name);
             shown++;
         }
@@ -1438,11 +1714,17 @@ static void report_bad_block(const arc_index *ix, size_t bi, unsigned fmt, unsig
  * 纯 I/O；提取/失败计数与串行路径同一口径。 */
 #define ARC_SLOT_RING 4     /* 在飞块上限 = 背压；内存上界 ≈ 4 × block_max */
 
-/* 落盘一个条目（串行/并行共用）。dst 为完整目标路径。
+/* 落盘一个条目（串行/并行共用）。dst 为完整目标路径；e 的 mtime/ctime/权限位/属性
+ * 与数据一并恢复。force：-f，既存的只读文件先删后建。
  * 返回 0=成功 1=无法创建 2=写入不完整。 */
-static int write_entry(const char *dst, const uint8_t *data, const arc_entry *e) {
+static int write_entry(const char *dst, const uint8_t *data, const arc_entry *e, int force) {
+    omnic_fs_meta m;
+    m.mtime = e->mtime;
+    m.ctime = e->ctime;
+    m.mode = e->mode;
+    m.attrs = e->attrs;
     int opened = 0;
-    omnic_status st = omnic_fs_write_file(dst, data, (size_t)e->size, e->mtime, &opened);
+    omnic_status st = omnic_fs_write_file_meta(dst, data, (size_t)e->size, &m, force, &opened);
     if (st != OMNIC_OK && opened == 0) {
         /* 兜底：目录条目序外缺失（畸形归档）才补建父目录——正常路径目录先行
          * 已建全，逐文件 mkdir_p 的 syscall 开销占解压墙钟大头 */
@@ -1452,11 +1734,26 @@ static int write_entry(const char *dst, const uint8_t *data, const arc_entry *e)
             omnic_status ms = omnic_fs_mkdir_p(dst);
             *slash = '/';
             if (ms == OMNIC_OK)
-                st = omnic_fs_write_file(dst, data, (size_t)e->size, e->mtime, &opened);
+                st = omnic_fs_write_file_meta(dst, data, (size_t)e->size, &m, force, &opened);
         }
     }
     if (st == OMNIC_OK) return 0;
     return opened ? 2 : 1;
+}
+
+/* 条目落盘后的权限收尾（目录条目在文件全部写完后调用） */
+static omnic_status set_entry_meta(const char *dst, const arc_entry *e) {
+    omnic_fs_meta m;
+    m.mtime = e->mtime;
+    m.ctime = e->ctime;
+    m.mode = e->mode;
+    m.attrs = e->attrs;
+    return omnic_fs_set_meta(dst, &m);
+}
+
+/* 解包侧的条目有数据：文件，以及目标串存在数据块里的符号链接 */
+static int ent_has_data(const arc_entry *e) {
+    return e->type == ARC_T_FILE || e->type == ARC_T_SYMLINK;
 }
 
 /* 解码单块为裸字节（store 直读 / 压缩流解压，块层 CRC 先行）。
@@ -1636,6 +1933,7 @@ typedef struct {
 typedef struct {
     const arc_index *ix; /* 只读共享 */
     const char *dstroot;
+    int force;           /* -f：既存的只读文件先删后建（只读，worker 可见） */
     int8_t *result;      /* [ent] 0=成功 1=无法创建 2=短写 3=OOM */
     arc_mutex_t mu;
     arc_cond_t cv_work;  /* worker：队列空且未停机 */
@@ -1668,7 +1966,7 @@ ARC_THREAD_FN writer_main(void *arg) {
         char *dst = (char *)malloc(dl);
         if (dst != NULL) {
             snprintf(dst, dl, "%s/%s", p->dstroot, e->name);
-            rc = write_entry(dst, p->slot[j->slot].buf + e->in_off, e);
+            rc = write_entry(dst, p->slot[j->slot].buf + e->in_off, e, p->force);
             free(dst);
         }
         arc_mutex_lock(&p->mu);
@@ -1687,10 +1985,12 @@ ARC_THREAD_FN writer_main(void *arg) {
 }
 
 /* 起 worker 池；失败（无一线程可建）返回 -1，调用方退回串行路径。 */
-static int pool_init(arc_pool *p, const arc_index *ix, const char *dstroot, int writers) {
+static int pool_init(arc_pool *p, const arc_index *ix, const char *dstroot, int writers,
+                     int force) {
     memset(p, 0, sizeof(*p));
     p->ix = ix;
     p->dstroot = dstroot;
+    p->force = force;
     p->result = (int8_t *)calloc(ix->nent ? ix->nent : 1, 1);
     if (p->result == NULL) return -1;
     arc_mutex_init(&p->mu);
@@ -1806,6 +2106,172 @@ static int name_matches(const char *pat, size_t pat_len, const char *name) {
     return strcmp(pat, name) == 0;
 }
 
+/* ---- 链接类条目与目录权限的收尾（文件全部落盘之后） ----
+ * - 硬链接：全量提取时真建硬链接；--file 单选时目标条目未必在场，就地物化成一份副本。
+ * - 符号链接最后建：任何文件都不会经由刚建的链接写到输出目录外面去。
+ * - 目录的权限位/属性最后设、先子后父：只读的目录不能挡住往里写文件、改子目录。 */
+typedef struct {
+    size_t *ent;   /* 条目下标，按索引序 */
+    char **target; /* 目标串（malloc） */
+    size_t n, cap;
+} arc_linkq;
+
+static void linkq_free(arc_linkq *q) {
+    for (size_t k = 0; k < q->n; k++) free(q->target[k]);
+    free(q->target);
+    free(q->ent);
+    memset(q, 0, sizeof(*q));
+}
+
+/* 符号链接的目标先攒着（块缓冲会被回收）；返回 0=入队 */
+static int linkq_push(arc_linkq *q, size_t i, const arc_entry *e, const uint8_t *raw) {
+    if (q->n == q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 16;
+        size_t *ne = (size_t *)realloc(q->ent, cap * sizeof(*ne));
+        if (ne == NULL) return -1;
+        q->ent = ne;
+        char **nt = (char **)realloc(q->target, cap * sizeof(*nt));
+        if (nt == NULL) return -1;
+        q->target = nt;
+        q->cap = cap;
+    }
+    char *t = (char *)malloc((size_t)e->size + 1);
+    if (t == NULL) return -1;
+    memcpy(t, raw + e->in_off, (size_t)e->size);
+    t[e->size] = '\0';
+    q->ent[q->n] = i;
+    q->target[q->n] = t;
+    q->n++;
+    return 0;
+}
+
+static char *join_dst(const char *root, const char *name) {
+    size_t dl = strlen(root) + strlen(name) + 2;
+    char *dst = (char *)malloc(dl);
+    if (dst != NULL) sprintf(dst, "%s/%s", root, name);
+    return dst;
+}
+
+static int target_is_absolute(const char *t) {
+    return t[0] == '/' || t[0] == '\\' ||
+           (((t[0] >= 'A' && t[0] <= 'Z') || (t[0] >= 'a' && t[0] <= 'z')) && t[1] == ':');
+}
+
+static void finish_links(const arc_index *ix, const char *dstroot, const unsigned char *want_ent,
+                         int force, arc_linkq *links, FILE *f, size_t *extracted, size_t *failed,
+                         unsigned quiet) {
+    int selective = (want_ent != NULL);
+    int err_set = 0; /* 报错只记第一条（g_err 只有一个槽） */
+    /* 目录权限：倒序即先子后父（遍历是先父后子） */
+    for (size_t i = ix->nent; i-- > 0;) {
+        const arc_entry *e = &ix->ent[i];
+        if (e->type != ARC_T_DIR || selective || (e->mode == 0 && e->attrs == 0)) continue;
+        char *dst = join_dst(dstroot, e->name);
+        if (dst == NULL) {
+            (*failed)++;
+            continue;
+        }
+        if (set_entry_meta(dst, e) != OMNIC_OK) {
+            (*failed)++;
+            if (!err_set) {
+                omnic_set_error("cannot set permissions on directory: %s", dst);
+                err_set = 1;
+            }
+        }
+        free(dst);
+    }
+    /* 硬链接：目标文件此刻已在盘上 */
+    for (size_t i = 0; i < ix->nent; i++) {
+        const arc_entry *e = &ix->ent[i];
+        if (e->type != ARC_T_HARDLINK || (selective && !want_ent[i])) continue;
+        const arc_entry *own = &ix->ent[e->link_to];
+        char *dst = join_dst(dstroot, e->name);
+        if (dst == NULL) {
+            (*failed)++;
+            continue;
+        }
+        int rc = 1;
+        if (!selective) {
+            char *odst = join_dst(dstroot, own->name);
+            if (odst != NULL) {
+                omnic_fs_remove_force(dst); /* 全量提取与文件同语义：覆盖 */
+                rc = (omnic_fs_make_hardlink(odst, dst) == OMNIC_OK) ? 0 : 1;
+                free(odst);
+            }
+        } else {
+            uint8_t *raw = NULL;
+            if (decode_block(f, &ix->blk[own->block_id], &raw) == 0) {
+                /* 数据取自目标条目（大小/偏移/校验），元数据用本条目自己的 */
+                arc_entry tmp = *own;
+                tmp.mtime = e->mtime;
+                tmp.ctime = e->ctime;
+                tmp.mode = e->mode;
+                tmp.attrs = e->attrs;
+                rc = write_entry(dst, raw + own->in_off, &tmp, force);
+                free(raw);
+            }
+        }
+        if (rc == 0) {
+            (*extracted)++;
+        } else {
+            (*failed)++;
+            if (!err_set) {
+                omnic_set_error("cannot create hard link: %s", dst);
+                err_set = 1;
+            }
+        }
+        free(dst);
+    }
+    /* 符号链接最后建 */
+    size_t as_junction = 0;
+    for (size_t k = 0; k < links->n; k++) {
+        const arc_entry *e = &ix->ent[links->ent[k]];
+        char *dst = join_dst(dstroot, e->name);
+        if (dst == NULL) {
+            (*failed)++;
+            continue;
+        }
+        int rc = 1, unprivileged = 0;
+        if (selective && !force && arc_file_exists(dst)) {
+            omnic_set_error("'%s' already exists — use -f to overwrite", dst);
+            err_set = 1;
+        } else {
+            omnic_fs_remove_force(dst); /* 全量提取与文件同语义：覆盖（含既存的目录链接） */
+            const char *t = links->target[k];
+            int is_dir = (e->flags & ARC_EF_LINK_DIR) != 0;
+            if ((e->flags & ARC_EF_LINK_JUNCTION) != 0) {
+                if (target_is_absolute(t)) /* 联接的目标必须是绝对路径 */
+                    rc = (omnic_fs_make_junction(dst, t) == OMNIC_OK) ? 0 : 1;
+            } else {
+                rc = (omnic_fs_make_symlink(dst, t, is_dir, &unprivileged) == OMNIC_OK) ? 0 : 1;
+                if (rc != 0 && unprivileged && is_dir && target_is_absolute(t) &&
+                    omnic_fs_make_junction(dst, t) == OMNIC_OK) {
+                    rc = 0; /* 没有建符号链接的权限：目标为绝对路径的目录链接退而成目录联接 */
+                    as_junction++;
+                }
+            }
+        }
+        if (rc == 0) {
+            (*extracted)++;
+        } else {
+            (*failed)++;
+            if (!err_set) {
+                if (unprivileged)
+                    omnic_set_error("cannot create symbolic link (Windows: enable Developer Mode "
+                                    "or run as administrator): %s",
+                                    dst);
+                else
+                    omnic_set_error("cannot create symbolic link: %s", dst);
+                err_set = 1;
+            }
+        }
+        free(dst);
+    }
+    if (!quiet && as_junction > 0)
+        fprintf(stderr, "omnic: %zu directory symlinks created as junctions (no symlink privilege)\n",
+                as_junction);
+}
+
 /* unpack_core：整树提取 / --file 过滤提取 / --verify 校验三种形态共用。
  * only!=NULL 时仅解命中条目所在块；verify_only 时不落盘只验双层 CRC。 */
 static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
@@ -1824,6 +2290,8 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
     arc_thread_t dec_tid[ARC_NWRITER_MAX];
     int dec_spawned = 0, dec_on = 0, dec_halt = 0;
     size_t dec_seq = 0, dec_reaped = 0;
+    arc_linkq links; /* 符号链接目标队列（异常路径也要释放） */
+    memset(&links, 0, sizeof(links));
 
     FILE *f = NULL;
     arc_index ix;
@@ -1841,10 +2309,11 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
         for (size_t k = 0; k < n_only; k++) {
             size_t hit = 0;
             for (size_t i = 0; i < ix.nent; i++) {
-                if (ix.ent[i].type != 0) continue;
-                if (!name_matches(only[k], strlen(only[k]), ix.ent[i].name)) continue;
+                const arc_entry *e = &ix.ent[i];
+                if (e->type == ARC_T_DIR) continue; /* 目录条目不可单选；文件、符号链接、硬链接可以 */
+                if (!name_matches(only[k], strlen(only[k]), e->name)) continue;
                 want_ent[i] = 1;
-                want_blk[ix.ent[i].block_id] = 1;
+                if (ent_has_data(e)) want_blk[e->block_id] = 1;
                 hit++;
             }
             if (hit == 0) {
@@ -1860,17 +2329,18 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
             return OMNIC_E_USAGE;
         }
     }
-    /* 分桶（D8）：非目录条目按 block_id 计数排序，替代逐块 O(nent) 全表扫描；
-     * 桶计数即坏块失败口径（原 blk_ents）。njobs = 待写作业总数。 */
+    /* 分桶（D8）：有数据的条目按 block_id 计数排序，替代逐块 O(nent) 全表扫描；
+     * 桶计数即坏块失败口径（原 blk_ents）——只数被选中的，坏块才不会连累同块的
+     * 未选条目。njobs = 待写作业总数。 */
     blk_cnt = (size_t *)calloc(ix.nblk ? ix.nblk : 1, sizeof(size_t));
     blk_off = (size_t *)malloc((ix.nblk + 1) * sizeof(size_t));
     ent_ord = (size_t *)malloc((ix.nent ? ix.nent : 1) * sizeof(size_t));
     if (blk_cnt == NULL || blk_off == NULL || ent_ord == NULL) goto sys_fail_ix;
     size_t njobs = 0;
     for (size_t i = 0; i < ix.nent; i++)
-        if (ix.ent[i].type == 0) {
+        if (ent_has_data(&ix.ent[i]) && (want_ent == NULL || want_ent[i])) {
             blk_cnt[ix.ent[i].block_id]++;
-            if (want_ent == NULL || want_ent[i]) njobs++;
+            njobs++;
         }
     blk_off[0] = 0;
     for (size_t bi = 0; bi < ix.nblk; bi++) blk_off[bi + 1] = blk_off[bi] + blk_cnt[bi];
@@ -1878,27 +2348,30 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
         size_t *cur = (size_t *)calloc(ix.nblk ? ix.nblk : 1, sizeof(size_t));
         if (cur == NULL) goto sys_fail_ix;
         for (size_t i = 0; i < ix.nent; i++)
-            if (ix.ent[i].type == 0)
+            if (ent_has_data(&ix.ent[i]) && (want_ent == NULL || want_ent[i]))
                 ent_ord[blk_off[ix.ent[i].block_id] + cur[ix.ent[i].block_id]++] = i;
         free(cur);
     }
 
     if (!verify_only && want_ent == NULL && omnic_fs_mkdir_p(dstroot) != OMNIC_OK)
         goto sys_fail_ix;
-    /* 目录条目先行（含空目录；仅全量提取） */
+    /* 目录条目先行（含空目录；仅全量提取）。单个目录建不出来只记失败、继续——
+     * 其下文件在写盘阶段逐个落败；输出根目录建不出来才在上面就中止。
+     * 目录的 mtime 一律不恢复：往目录里写文件本身就会刷新它，只有空目录保得住——
+     * 半保半丢不如都不保（文件时间照常恢复）。 */
+    size_t dirs_failed = 0;
     if (!verify_only && want_ent == NULL) {
         for (size_t i = 0; i < ix.nent; i++) {
-            if (ix.ent[i].type != 1) continue;
+            if (ix.ent[i].type != ARC_T_DIR) continue;
             char *dst = (char *)malloc(strlen(dstroot) + strlen(ix.ent[i].name) + 2);
             if (dst == NULL) goto sys_fail_ix;
             sprintf(dst, "%s/%s", dstroot, ix.ent[i].name);
             omnic_status st = omnic_fs_mkdir_p(dst);
-            if (st == OMNIC_OK) omnic_fs_set_mtime(dst, ix.ent[i].mtime);
-            free(dst);
             if (st != OMNIC_OK) {
-                omnic_set_error("cannot create directory under %s", dstroot);
-                goto sys_fail_ix;
+                if (dirs_failed == 0) omnic_set_error("cannot create directory: %s", dst);
+                dirs_failed++;
             }
+            free(dst);
         }
     }
 
@@ -1915,10 +2388,13 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
     if (o != NULL && o->threads == 1) writers = 1;
     else if (o != NULL && o->threads > 1) writers = o->threads;
     if (writers > ARC_NWRITER_MAX) writers = ARC_NWRITER_MAX;
+    int force = (o != NULL && (o->flags & OMNIC_F_FORCE) != 0);
+    /* 全量提取本来就是覆盖语义：既存的只读文件也直接覆盖；--file 单选才要求 -f */
+    int wforce = force || want_ent == NULL;
     arc_pool pool;
     int parallel = (!verify_only && writers > 1 && njobs >= 2 &&
                     (njobs >= ARC_PAR_MIN_JOBS || dec_raw_sum >= ARC_PAR_MIN_BYTES) &&
-                    pool_init(&pool, &ix, dstroot, writers) == 0);
+                    pool_init(&pool, &ix, dstroot, writers, wforce) == 0);
     unsigned char *went = NULL;
     if (parallel) {
         went = (unsigned char *)calloc(ix.nent ? ix.nent : 1, 1);
@@ -2009,6 +2485,10 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                     extracted++;
                     continue;
                 }
+                if (e->type == ARC_T_SYMLINK) { /* 目标入队；文件全部落盘后才建链接 */
+                    if (linkq_push(&links, i, e, raw) != 0) failed++;
+                    continue;
+                }
                 if (want_ent != NULL) {
                     size_t dl = strlen(dstroot) + strlen(e->name) + 2;
                     char *dst = (char *)malloc(dl);
@@ -2033,7 +2513,7 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                     char *dst = (char *)malloc(dl);
                     if (dst == NULL) { free(raw); goto sys_fail_ix; }
                     sprintf(dst, "%s/%s", dstroot, e->name);
-                    int rc = write_entry(dst, raw + e->in_off, e);
+                    int rc = write_entry(dst, raw + e->in_off, e, wforce);
                     if (rc == 1) omnic_set_error("cannot create: %s", dst);
                     free(dst);
                     if (rc != 0) {
@@ -2084,6 +2564,10 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                 extracted++;
                 continue;
             }
+            if (e->type == ARC_T_SYMLINK) { /* 目标入队；文件全部落盘后才建链接 */
+                if (linkq_push(&links, i, e, raw) != 0) failed++;
+                continue;
+            }
             /* --file 目标已存在且未 -f → 拒绝（T5）；并行路径派发前主线程拦截 */
             if (want_ent != NULL) {
                 size_t dl = strlen(dstroot) + strlen(e->name) + 2;
@@ -2112,7 +2596,7 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                     goto sys_fail_ix;
                 }
                 sprintf(dst, "%s/%s", dstroot, e->name);
-                int rc = write_entry(dst, raw + e->in_off, e);
+                int rc = write_entry(dst, raw + e->in_off, e, wforce);
                 if (rc == 1) omnic_set_error("cannot create: %s", dst);
                 free(dst);
                 if (rc != 0) {
@@ -2153,6 +2637,10 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
         free(pool.result);
         free(went);
     }
+    /* 硬链接 / 符号链接 / 目录权限：文件全部落盘之后 */
+    if (!verify_only)
+        finish_links(&ix, dstroot, want_ent, force, &links, f, &extracted, &failed, quiet);
+    linkq_free(&links);
     free(blk_cnt);
     free(blk_off);
     free(ent_ord);
@@ -2163,16 +2651,20 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
     rep->in_bytes = rep->out_bytes;
     if (verify_only) {
         if (!quiet)
-            printf("verified %zu/%zu files, %zu blocks OK\n", extracted, extracted + failed,
+            printf("verified %zu/%zu entries, %zu blocks OK\n", extracted, extracted + failed,
                    blocks_ok);
-    } else if (failed > 0 && !quiet) {
-        fprintf(stderr, "omnic: extracted %zu/%zu files (%zu failed)\n", extracted,
+    } else if ((failed > 0 || dirs_failed > 0) && !quiet) {
+        if (dirs_failed > 0)
+            fprintf(stderr, "omnic: %zu directories could not be created under %s\n", dirs_failed,
+                    dstroot);
+        fprintf(stderr, "omnic: extracted %zu/%zu entries (%zu failed)\n", extracted,
                 extracted + failed, failed);
     }
-    return failed ? OMNIC_E_DATA : OMNIC_OK;
+    return (failed || dirs_failed) ? OMNIC_E_DATA : OMNIC_OK;
 
 sys_fail_ix:
     if (dec_spawned > 0) dec_pool_shutdown(&dec, dec_tid, dec_spawned);
+    linkq_free(&links);
     free(blk_cnt);
     free(blk_off);
     free(ent_ord);
@@ -2199,7 +2691,8 @@ omnic_status omnic_arc_verify(const char *archive_path, const omnic_options *o,
     return unpack_core(archive_path, NULL, NULL, 0, 1, o, rep);
 }
 
-/* --list：只读索引不读 Data 区（§5.2）；ratio 为该条目所在块级压缩率 */
+/* --list：只读索引不读 Data 区（§5.2）；ratio 为该条目所在块级压缩率。
+ * 符号链接的目标串在数据块里，列表不解码，只标出它是链接。 */
 omnic_status omnic_arc_list(const char *archive_path, const omnic_options *o) {
     if (archive_path == NULL) return OMNIC_E_USAGE;
     FILE *f = NULL;
@@ -2207,12 +2700,21 @@ omnic_status omnic_arc_list(const char *archive_path, const omnic_options *o) {
     omnic_status st = arc_open_index(archive_path, &f, &ix);
     if (st != OMNIC_OK) return st;
     if (!(o != NULL && (o->flags & OMNIC_F_QUIET))) {
-        size_t files = 0, dirs = 0;
+        size_t files = 0, dirs = 0, links = 0;
         for (size_t i = 0; i < ix.nent; i++) {
             const arc_entry *e = &ix.ent[i];
-            if (e->type == 1) {
+            if (e->type == ARC_T_DIR) {
                 printf("%s\t-\tdir\n", e->name);
                 dirs++;
+                continue;
+            }
+            if (e->type == ARC_T_SYMLINK || e->type == ARC_T_HARDLINK) {
+                /* 硬链接条目自身不带数据：显示它指向的文件的大小 */
+                unsigned long long sz = (e->type == ARC_T_HARDLINK) ? ix.ent[e->link_to].size
+                                                                    : e->size;
+                printf("%s\t%llu\t%s\n", e->name, sz,
+                       e->type == ARC_T_SYMLINK ? "symlink" : "hardlink");
+                links++;
                 continue;
             }
             const arc_block *b = &ix.blk[e->block_id];
@@ -2222,6 +2724,7 @@ omnic_status omnic_arc_list(const char *archive_path, const omnic_options *o) {
             files++;
         }
         printf("%zu files, %zu dirs, %zu blocks\n", files, dirs, ix.nblk);
+        if (links > 0) printf("%zu links\n", links);
     }
     arc_index_mem_free(&ix);
     fclose(f);

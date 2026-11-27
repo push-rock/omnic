@@ -34,6 +34,8 @@ static void usage(FILE *out) {
           "  -q, --quiet\n"
           "  --per-file          pack: one block per file (fast single-file extract)\n"
           "  --no-skip           pack: compress already-compressed assets too\n"
+           "  --strict            pack: fail if any entry had to be skipped (links, special files)\n"
+           "  --ctime             pack: also store creation times\n"
           "  --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)\n"
           "  --file <pattern>    unpack: extract entries (exact path, dir/ prefix, or * glob; repeatable)\n"
           "  --list              unpack: list entries without extracting\n"
@@ -115,10 +117,12 @@ static int cmd_pack_unpack(const omnic_args *a) {
         memset(&rep, 0, sizeof(rep));
         omnic_status st;
         if (strcmp(a->cmd, "pack") == 0) {
-            char def_arc[4096];
-            snprintf(def_arc, sizeof(def_arc), "%s.omnic", a->files[i]);
+            /* 默认归档名去掉源路径的尾分隔符："dir/" 直接拼会得到 "dir/.omnic"，
+             * 落在源树内被拒——而 shell 补全给出的正是尾斜杠 */
+            char *def_arc = omnic_fs_default_archive_path(a->files[i]);
             const char *arc = (a->opts.output_dir != NULL) ? a->opts.output_dir : def_arc;
             st = omnic_pack(a->files[i], arc, &a->opts, &rep);
+            free(def_arc);
         } else {
             rc = run_unpack(a->files[i], a);
             continue;

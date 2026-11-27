@@ -1,12 +1,14 @@
-/* archive：.omnic 归档（ARCHIVE_SPEC v1）。pack 打包目录树，unpack 还原/提取。
+/* archive：.omnic 归档（FORMAT.md v1/v2）。pack 打包目录树，unpack 还原/提取。
  * 实现于 archive.c；lib API 同步声明于 omnic.h（AR-LIB-001）。 */
 #ifndef OMNIC_ARCHIVE_H
 #define OMNIC_ARCHIVE_H
 
 #include "omnic.h"
 
-/* 格式版本与 flags（ARCHIVE_SPEC §3.2） */
-#define OMNIC_ARC_VERSION 1u
+/* 格式版本与 flags（FORMAT.md）。v2 起：条目带权限位/属性/创建时间、符号链接、
+ * 目录联接、硬链接，条目与块计数 32 位。读取端两个版本都认。 */
+#define OMNIC_ARC_VERSION_MIN 1u /* 读取端认的最旧版本 */
+#define OMNIC_ARC_VERSION 2u     /* 写入端写出的版本；读取端认到它为止 */
 #define OMNIC_ARC_F_MTIME 0x01u
 #define OMNIC_ARC_F_INDEX_ZSTD 0x04u
 

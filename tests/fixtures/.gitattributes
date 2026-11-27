@@ -1,0 +1,2 @@
+# Archive fixtures are binary: never convert line endings, never diff as text.
+*.omnic binary

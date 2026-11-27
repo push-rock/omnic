@@ -59,6 +59,10 @@ static int parse_long_opt(omnic_args *a, int argc, char **argv, int *i) {
         a->opts.flags |= OMNIC_F_PER_FILE;
     } else if (strcmp(arg, "--no-skip") == 0) {
         a->opts.flags |= OMNIC_F_NO_SKIP;
+    } else if (strcmp(arg, "--strict") == 0) {
+        a->opts.flags |= OMNIC_F_STRICT;
+    } else if (strcmp(arg, "--ctime") == 0) {
+        a->opts.flags |= OMNIC_F_CTIME;
     } else if (strcmp(arg, "--list") == 0) {
         a->opts.flags |= OMNIC_F_LIST;
     } else if (strcmp(arg, "--verify") == 0) {
@@ -218,6 +222,11 @@ int omnic_parse_args(int argc, char **argv, omnic_args *a) {
     if (strcmp(a->cmd, "pack") == 0 && (a->opts.codec != NULL || a->opts.level != 0)) {
         fprintf(stderr, "omnic: -c/--codec and -l/--level do not apply to pack "
                         "(routing is per-file; use 'omnic c' for a single stream)\n");
+        return 1;
+    }
+    if (strcmp(a->cmd, "pack") != 0 &&
+        (a->opts.flags & (OMNIC_F_STRICT | OMNIC_F_CTIME)) != 0) {
+        fprintf(stderr, "omnic: --strict and --ctime only apply to pack\n");
         return 1;
     }
     return 0;

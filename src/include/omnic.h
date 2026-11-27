@@ -1,4 +1,4 @@
-﻿/* omnic - universal compressor
+/* omnic - universal compressor
  * Public API of libomnic (INT-LIB-001).
  * See docs/ARCHITECTURE.md for the design baseline. */
 #ifndef OMNIC_H
@@ -92,6 +92,8 @@ typedef struct omnic_options {
 #define OMNIC_F_NO_SKIP 0x20u  /* 归档：已压缩资产并入压缩桶（ratio 优先） */
 #define OMNIC_F_LIST 0x40u      /* 归档：--list 只列不解 */
 #define OMNIC_F_VERIFY 0x80u   /* 归档：--verify 只校验不落盘 */
+#define OMNIC_F_STRICT 0x100u  /* 归档：--strict 有条目被跳过（链接/特殊文件/不可读）即失败 */
+#define OMNIC_F_CTIME 0x200u   /* 归档：pack --ctime 连创建时间一起存（POSIX 上每条目多一次 statx） */
 
 /* 采样与决策参数（SYS-CMP-002：决策 ≤50ms）
  * 二期分层采样（PHASE2_DECIDER_DESIGN §3.2）：头/中/尾各 256KiB，
