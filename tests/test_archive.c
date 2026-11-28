@@ -743,10 +743,7 @@ static void test_corruption(void) {
     }
     rm_tree("omnic_arc_c4");
     memset(&g_rep, 0, sizeof(g_rep));
-    omnic_options ovc = o; /* TEMP 诊断：非 QUIET，让 CI 露出真实失败原因，定位后撤 */
-    ovc.flags &= ~OMNIC_F_QUIET;
-    st = omnic_unpack(ARC, "omnic_arc_c4", &ovc, &g_rep);
-    fprintf(stderr, "c4-diag: st=%d err='%s'\n", st, omnic_last_error());
+    st = omnic_unpack(ARC, "omnic_arc_c4", &o, &g_rep);
     CHECK(st == OMNIC_E_DATA); /* 1 条目失败 */
     CHECK(omnic_fs_fopen("omnic_arc_c4/a.txt", "rb") != NULL); /* 其余完好 */
     rm_tree("omnic_arc_c4");
@@ -983,12 +980,7 @@ static void test_parallel(void) {
         }
     }
     rm_tree("omnic_arc_pe");
-    {
-        omnic_options ovp = o8; /* TEMP 诊断：非 QUIET，定位后撤 */
-        ovp.flags &= ~OMNIC_F_QUIET;
-        CHECK(unpack_arc(ARC2, "omnic_arc_pe", ovp) == OMNIC_E_DATA);
-        fprintf(stderr, "pe-diag: err='%s'\n", omnic_last_error());
-    }
+    CHECK(unpack_arc(ARC2, "omnic_arc_pe", o8) == OMNIC_E_DATA);
     CHECK(omnic_fs_fopen("omnic_arc_pe/d1/f001.txt", "rb") != NULL);
     CHECK(omnic_fs_fopen("omnic_arc_pe/rand.bin", "rb") != NULL);
     rm_tree("omnic_arc_pe");
