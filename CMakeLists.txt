@@ -277,11 +277,17 @@ if(OMNIC_CODEC_ZSTD)
   add_test(NAME archive COMMAND test_archive)
 endif()
 
+# 没有超时的话，一个卡住的测试会把整个 CI 腿拖到 Actions 的上限才被杀，日志里什么都没有。
+# 本地实测 core 约 22 s、archive 约 29 s；TSan 腿慢 5–15 倍。900 s 对正常情况很宽裕，
+# 卡住时 15 分钟内就会在日志里报出是哪个测试超时。
+set_tests_properties(core archive PROPERTIES TIMEOUT 900)
+
 # TST-PERF-001 冒烟：16MB×3 轮中位 + 量级线（40%）。小语料下 reader/writer
 # 初始化等固定成本占比过高（mac 4MB 实测 zstd 低档虚高 ~18%），16MB 稀释到
 # 个位数；40% 线容纳 CI 共享 runner 抖动，专抓量级回归（如 read_all 翻倍类），
 # 紧验收线由本地正式跑数把关
 add_test(NAME bench_smoke COMMAND omnic_bench --size 16 --rounds 5 --check 40)
+set_tests_properties(bench_smoke PROPERTIES TIMEOUT 600)
 # CI 共享 runner 偶发调度干扰（实测同代码 worst 77%/97% 虚高的偶发）——失败
 # 重跑一次的机制在 ci.yml test 步骤（ctest --rerun-failed；ctest 无原生 retry 属性）
 
