@@ -87,9 +87,7 @@ unpack: Header → Footer → 尾部索引(坏了且有镜像则退回头部镜�
 - **新增并发路径**：回归 + 变异验收 + TSan 三件套，缺一不可（zstd -T>1
   截断在 v0.3.1 带伤上线的教训——457 checks 全绿照样漏）
 - **门禁要先验证机制存在**：写过 RETRY_FAIL（ctest 无此属性，从未生效）。
-  写"自动重跑"类承诺前 `cmake --help-property-list` 查存在 + 看一次真实触发。
-  同理，改 CI 脚本后用 `C:\Program Files\Git\bin\bash.exe -n` 过语法，再拿一份
-  仿真的 test.log 干跑一遍——"dump" 步骤曾因 grep 无匹配而自己先失败，什么都没发出来
+  写"自动重跑"类承诺前 `cmake --help-property-list` 查存在 + 看一次真实触发
 - **插档下时序断言失效**：TSan 豁免用 `__has_feature` 编译期，且全库扫同类
   （时间断言指纹 `ms <|sec <|clock\(`），豁免范围进 CHANGELOG
 - **vendored 三方库对 -fsanitize 有自我保护**（xz 拒绝时报错自带正解
@@ -132,29 +130,6 @@ CI:     ci.yml 六腿（ubuntu gcc/clang/clang+TSan, macos, win cl/MinGW）
 版本号: src/include/omnic.h OMNIC_VERSION + CHANGELOG [Unreleased]→[版本]
 tag:    v0.3.1 起用附注标签（annotated：git tag -a vX.Y.Z -m "..."）
 ```
-
-## 查 CI（2026-11-28 实测）
-
-- **没有 API 令牌**：推送走 SSH 密钥，那只管推拉代码。日志（`jobs/{id}/logs`）和
-  产物下载要令牌，会 401/403。**能匿名读的**：运行与各腿的成败、以及每个
-  check-run 的 annotations。别再去找令牌，用下面的办法拿失败原因。
-- 查询：`actions/runs?head_sha=<完整 40 位 SHA>`（短 SHA 返回 0 个运行，会误判为
-  没触发）→ `jobs_url` → `check-runs/{job_id}/annotations`。匿名配额 60 次/小时，
-  一个回合控制在 10 次内；等结果用定时任务回来查，不要轮询。
-- **失败原因在 annotations 里**：`ci.yml` 的 "dump test failures as annotations"
-  会发三类行——`FAILED-CHECK <行号>: <条件>`（测试程序在总结行之后重打的清单，
-  不受 ctest 输出截断影响）、`N checks, M failed`、ctest 的 `Test #k` 总结。
-- 还看不出来时，**让 CI 吐答案**：在出问题的测试里去掉 `OMNIC_F_QUIET`、
-  `fprintf(stderr, "...err='%s'", omnic_last_error())`，标 `TEMP`，推上去，
-  下一个提交撤掉。
-- **耗时基线**：CI 绿的时候 test 步骤本来就要 500–900 s（bench_smoke 450–850 s，
-  它是计时测试，慢是正常的）。看到"十几分钟"不是卡死，先和历史比。
-- **ctest 超时**（CMakeLists.txt 末尾）：core/archive 900 s，bench_smoke 1800 s，
-  都按 CI 实测定。新增测试要先量再设，别凭感觉填数。
-- **本地是 Windows，CI 有四个 POSIX 腿**：POSIX 上每个条目都有属主 → 每个归档都
-  带扩展区，Windows 上永远没有。所以"Windows 绿"对扩展区、xattr、属主这些路径
-  什么都不证明。套件里的 `test_area_index_rewrite` 用注入扩展区的方式在所有平台
-  上覆盖了"带扩展区 + 重写索引"；改这类路径时照它写，先在本地验证再推。
 
 ## 本机环境备忘（AI 用）
 
