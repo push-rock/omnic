@@ -743,7 +743,10 @@ static void test_corruption(void) {
     }
     rm_tree("omnic_arc_c4");
     memset(&g_rep, 0, sizeof(g_rep));
-    st = omnic_unpack(ARC, "omnic_arc_c4", &o, &g_rep);
+    omnic_options ovc = o; /* TEMP 诊断：非 QUIET，让 CI 露出真实失败原因，定位后撤 */
+    ovc.flags &= ~OMNIC_F_QUIET;
+    st = omnic_unpack(ARC, "omnic_arc_c4", &ovc, &g_rep);
+    fprintf(stderr, "c4-diag: st=%d err='%s'\n", st, omnic_last_error());
     CHECK(st == OMNIC_E_DATA); /* 1 条目失败 */
     CHECK(omnic_fs_fopen("omnic_arc_c4/a.txt", "rb") != NULL); /* 其余完好 */
     rm_tree("omnic_arc_c4");
@@ -980,7 +983,12 @@ static void test_parallel(void) {
         }
     }
     rm_tree("omnic_arc_pe");
-    CHECK(unpack_arc(ARC2, "omnic_arc_pe", o8) == OMNIC_E_DATA);
+    {
+        omnic_options ovp = o8; /* TEMP 诊断：非 QUIET，定位后撤 */
+        ovp.flags &= ~OMNIC_F_QUIET;
+        CHECK(unpack_arc(ARC2, "omnic_arc_pe", ovp) == OMNIC_E_DATA);
+        fprintf(stderr, "pe-diag: err='%s'\n", omnic_last_error());
+    }
     CHECK(omnic_fs_fopen("omnic_arc_pe/d1/f001.txt", "rb") != NULL);
     CHECK(omnic_fs_fopen("omnic_arc_pe/rand.bin", "rb") != NULL);
     rm_tree("omnic_arc_pe");
@@ -2461,6 +2469,77 @@ static void test_store_salvage(void) {
     remove(A);
 }
 
+/* Windows 上没有 owner/xattr 可采，覆盖不了"有扩展区的归档 + 索引重写"组合：
+ * 手工注入全条目 owner 区后走 c4 的索引重写流程，跨平台锁定这条路径。 */
+static void test_area_index_rewrite(void) {
+    make_tree();
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+    CHECK(pack_tree(TREE, ARC, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    {
+        size_t n;
+        uint64_t io;
+        uint32_t nent, nblk;
+        uint8_t *pl = load_index_plain(ARC, &n, &io, &nent, &nblk);
+        CHECK(pl != NULL);
+        if (pl != NULL) {
+            size_t el = (size_t)nent * 18;
+            uint8_t *ext = (uint8_t *)malloc(el);
+            CHECK(ext != NULL);
+            if (ext != NULL) {
+                size_t p = 0;
+                for (uint32_t i = 0; i < nent; i++) {
+                    ext[p++] = (uint8_t)i;
+                    ext[p++] = (uint8_t)(i >> 8);
+                    ext[p++] = (uint8_t)(i >> 16);
+                    ext[p++] = (uint8_t)(i >> 24);
+                    ext[p++] = 10;
+                    ext[p++] = 0;
+                    ext[p++] = 0;
+                    ext[p++] = 0;
+                    ext[p++] = 0x01;
+                    ext[p++] = 0xE8;
+                    ext[p++] = 0x03;
+                    ext[p++] = 0;
+                    ext[p++] = 0; /* uid=1000 */
+                    ext[p++] = 0x02;
+                    ext[p++] = 100;
+                    ext[p++] = 0;
+                    ext[p++] = 0;
+                    ext[p++] = 0; /* gid=100 */
+                }
+                CHECK(inject_ext_area(ARC, ext, p, 0) == 0);
+                free(ext);
+            }
+            free(pl);
+        }
+    }
+    {
+        size_t n;
+        uint64_t io;
+        uint32_t nent, nblk;
+        uint8_t *pl = load_index_plain(ARC, &n, &io, &nent, &nblk);
+        CHECK(pl != NULL);
+        if (pl != NULL) {
+            long eo = find_ent(pl, nblk, nent, "b.txt");
+            CHECK(eo >= 0);
+            if (eo >= 0) {
+                uint32_t nl = (uint32_t)pl[eo] | ((uint32_t)pl[eo + 1] << 8);
+                pl[eo + 2 + nl + 22] ^= 0xFF;
+            }
+            CHECK(save_index_plain(ARC, pl, n, io) == 0);
+            free(pl);
+        }
+    }
+    rm_tree("omnic_arc_dbg");
+    memset(&g_rep, 0, sizeof(g_rep));
+    omnic_status st = omnic_unpack(ARC, "omnic_arc_dbg", &o, &g_rep);
+    CHECK(st == OMNIC_E_DATA); /* 1 entry fails, the rest extract */
+    CHECK(omnic_fs_fopen("omnic_arc_dbg/a.txt", "rb") != NULL);
+    rm_tree("omnic_arc_dbg");
+    remove(ARC);
+    rm_tree(TREE);
+}
+
 int main(void) {
     test_roundtrip();
     test_roundtrip_edges();
@@ -2489,6 +2568,7 @@ int main(void) {
     test_ext_area();
     test_index_mirror();
     test_store_salvage();
+    test_area_index_rewrite();
     printf("%d checks, %d failed\n", g_run, g_fail);
     print_failures_tail();
     return g_fail ? 1 : 0;
