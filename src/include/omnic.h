@@ -82,6 +82,10 @@ typedef struct omnic_options {
     unsigned flags;        /* OMNIC_F_* */
     const char *output_dir;
     int block_mib;         /* 归档 solid 块上限（MiB）；0 = 默认 64（ARCHIVE_SPEC §5.1） */
+    /* 归档 pack：--exclude 模式列表。按条目名匹配：* 与 ? 通配；以 / 结尾排除整个子树。
+     * NULL 或 n_exclude == 0 表示不过滤。 */
+    const char *const *exclude;
+    size_t n_exclude;
 } omnic_options;
 
 #define OMNIC_F_FORCE 0x01u   /* 覆盖已存在输出；强制压缩不可压缩数据 */
@@ -94,6 +98,7 @@ typedef struct omnic_options {
 #define OMNIC_F_VERIFY 0x80u   /* 归档：--verify 只校验不落盘 */
 #define OMNIC_F_STRICT 0x100u  /* 归档：--strict 有条目被跳过（链接/特殊文件/不可读）即失败 */
 #define OMNIC_F_CTIME 0x200u   /* 归档：pack --ctime 连创建时间一起存（POSIX 上每条目多一次 statx） */
+#define OMNIC_F_XATTR 0x400u   /* 归档：pack --xattr 连 POSIX 扩展属性一起存（每条目多两次系统调用） */
 
 /* 采样与决策参数（SYS-CMP-002：决策 ≤50ms）
  * 二期分层采样（PHASE2_DECIDER_DESIGN §3.2）：头/中/尾各 256KiB，

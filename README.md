@@ -40,8 +40,8 @@ verified 8586/8586 entries, 4 blocks OK
 omnic is built for mixed trees — game assets, project folders, build output:
 every file gets the codec that suits it, and already-compressed files pass
 straight through. It also opens the formats your other tools don't. Not there
-yet: encryption, a GUI, `--exclude`, ACLs and full tar replacement — all of
-them will follow in later versions. The complete list of today's edges is in
+yet: encryption, a GUI, ACLs and full tar replacement — all of them will
+follow in later versions. The complete list of today's edges is in
 [What it doesn't do](#what-it-doesnt-do-yet).
 
 - **Opens 14 formats.** gzip, zlib, raw deflate, zstd, xz, lzma, lzip, bzip2,
@@ -144,6 +144,8 @@ options:
   --no-skip           pack: compress already-compressed assets too
   --strict            pack: fail if any entry had to be skipped (links, special files)
   --ctime             pack: also store creation times
+  --xattr             pack: also store POSIX extended attributes
+  --exclude <pattern> pack: leave out matching entries (repeatable; dir/ drops the subtree)
   --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)
   --file <pattern>    unpack: extract entries (exact path, dir/ prefix, or * glob; repeatable)
   --list              unpack: list entries without extracting
@@ -292,18 +294,22 @@ tier, and the Kraken comparison are in [BENCHMARK.md](BENCHMARK.md).
 
 The edges as of v0.3.3 — read this before trusting it with a backup.
 
-- **Not a full tar replacement yet.** No `--exclude`, no ACLs, no NTFS
-  alternate data streams, no file ownership, no encryption — all slated for
-  later versions. 7-Zip's format breadth and 25 years of maturity are things
-  omnic does not have yet.
-- **Links and permissions are kept; some things still aren't.** Symlinks,
-  junctions and hard links round-trip, and so do POSIX permission bits and
-  the Windows read-only, hidden and system attributes; `--ctime` adds
-  creation times. FIFOs, device files and reparse points omnic does not
-  understand are left out, and `pack` says so — how many, of which kind, and
-  the first eight names; `--strict` turns that into a failure (exit code 2)
-  and writes nothing. Creating a file symlink on Windows needs Developer Mode
-  or administrator rights; without them those entries are reported as failed.
+- **Not a full tar replacement yet.** No ACLs, no NTFS alternate data
+  streams, no encryption — all slated for later versions. 7-Zip's format
+  breadth and 25 years of maturity are things omnic does not have yet.
+- **Links, permissions, owners and xattrs are kept.** Symlinks, junctions
+  and hard links round-trip, and so do POSIX permission bits and the
+  Windows read-only, hidden and system attributes. `--ctime` adds creation
+  times, `--xattr` POSIX extended attributes; file owners are always stored
+  and restored when you unpack as root (a plain user gets the files under
+  their own name and a note, as with `tar`). All of that lives in an
+  optional area older readers simply skip: they still extract every file.
+  `--exclude` leaves matching entries out (`*.o`, `node_modules/`).
+  FIFOs, device files and reparse points omnic does not understand are left
+  out too, and `pack` says so — how many, of which kind, and the first eight
+  names; `--strict` turns that into a failure (exit code 2) and writes
+  nothing. Creating a file symlink on Windows needs Developer Mode or
+  administrator rights; without them those entries are reported as failed.
 - **Only file times are restored.** A directory's modification time is not:
   writing files into a directory updates it, so only an empty directory could
   keep its original time. Rather than restore it half the time, omnic

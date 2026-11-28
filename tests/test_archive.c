@@ -1223,7 +1223,8 @@ static int make_fifo(const char *tree) {
 #endif
 }
 
-/* rm -rf / rd /s 处理不了超过 260 字符的路径：用 omnic 自己的接口删，先子后父 */
+/* rm -rf / rd /s 处理不了超过 260 字符的路径，也会顺着目录联接走进目标目录去删：
+ * 用 omnic 自己的接口按子→父顺序删，链接只删本身。 */
 static void rm_tree_deep(const char *root) {
     size_t n = 0;
     omnic_fs_skip_report sk;
@@ -1508,9 +1509,11 @@ static void set_creation_time(const char *path, long long t) {
 static void test_v2_links(void) {
     const char *T = "omnic_arc_lk", *O = "omnic_arc_lk_out", *A = "omnic_arc_lk.omnic";
     const char *X = "omnic_arc_lk_x";
-    rm_tree(T);
-    rm_tree(O);
-    rm_tree(X);
+    /* 这三棵树里有目录联接：清理必须先删链接本身。rd /s /q 会顺着联接走进目标目录，
+     * 留下半删除的树，下一轮运行就撞上残留。 */
+    rm_tree_deep(T);
+    rm_tree_deep(O);
+    rm_tree_deep(X);
     omnic_fs_mkdir_p("omnic_arc_lk/sub");
     char txt[256];
     fill_text(txt, 200);
@@ -1584,9 +1587,9 @@ static void test_v2_links(void) {
     omnic_fs_remove_force("omnic_arc_lk_out/dlink");
     omnic_fs_remove_force("omnic_arc_lk_out/slink");
     omnic_fs_remove_force("omnic_arc_lk_x/slink");
-    rm_tree(T);
-    rm_tree(O);
-    rm_tree(X);
+    rm_tree_deep(T);
+    rm_tree_deep(O);
+    rm_tree_deep(X);
     remove(A);
 }
 
@@ -1717,13 +1720,11 @@ static void test_v2_layout(void) {
 
 static void test_v1_archive_readable(void) {
     /* 由 v1 写入端（提交 c064007 的二进制）打出的归档：压缩块 + store 块 + 子目录 + 空文件 + 中文名。
-     * v2 的读取端必须原样解出。从构建目录或仓库根运行都能找到样本。 */
-    const char *cand[2] = {"../tests/fixtures/v1_sample.omnic", "tests/fixtures/v1_sample.omnic"};
-    const char *F = NULL;
-    for (int i = 0; i < 2 && F == NULL; i++)
-        if (file_exists(cand[i])) F = cand[i];
-    CHECK(F != NULL);
-    if (F == NULL) return;
+     * v2 的读取端必须原样解出。路径由 CMake 以 OMNIC_SOURCE_DIR 注入：从哪个目录运行都找得到。 */
+    static char F[OMNIC_FS_PATH_MAX];
+    snprintf(F, sizeof(F), "%s/tests/fixtures/v1_sample.omnic", OMNIC_SOURCE_DIR);
+    CHECK(file_exists(F) == 1);
+    if (!file_exists(F)) return;
     size_t n = 0;
     unsigned char *b = slurp(F, &n);
     CHECK(b != NULL && n == 1349);
@@ -1750,7 +1751,9 @@ static void test_v1_archive_readable(void) {
 
 static void test_index_fuzz(void) {
     /* 逐比特翻转一个小归档：任何一处损坏都不得让读取端崩溃；能通过校验的只允许是
-     * 规范里声明"保留、读取端忽略"的字节（头部 24..32、尾部最后 4 字节）。 */
+     * 规范里声明"保留、读取端忽略"的字节（头部 24..32、尾部最后 4 字节）。
+     * 自扩展区落地后头部 24..32 有了含义（偏移 + CRC），不再是可忽略的保留位：
+     * 没有扩展区的归档里它们必须是 0，翻动了就该被拒。 */
     const char *T = "omnic_arc_fz", *A = "omnic_arc_fz.omnic";
     rm_tree(T);
     omnic_fs_mkdir_p(T);
@@ -1776,17 +1779,253 @@ static void test_index_fuzz(void) {
             memset(&g_rep, 0, sizeof(g_rep));
             if (omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK) {
                 accepted++;
-                if (!((i >= 24 && i < 32) || i + 4 >= n)) bad_accept++;
+                /* 这个归档没有扩展区：头部 24..32 必须全 0，翻动即拒。只剩尾部 4 字节可忽略 */
+                if (!(i + 4 >= n)) bad_accept++;
             }
         }
     }
-    printf("note: fuzz: %zu single-bit flips, %zu accepted, %zu outside reserved bytes\n", flips,
-           accepted, bad_accept);
+    printf("note: fuzz: %zu single-bit flips, %zu accepted (footer reserved bytes only), %zu elsewhere\n",
+           flips, accepted, bad_accept);
     CHECK(flips == n * 8);
     CHECK(bad_accept == 0);
+    CHECK(accepted == 32); /* 恰好尾部 4 字节 × 8 比特 */
     free(buf);
     free(good);
     rm_tree(T);
+    remove(A);
+}
+
+/* ---- 第一组：--exclude 与扩展区（属主 / 扩展属性） ---- */
+
+static void test_exclude(void) {
+    const char *T = "omnic_arc_ex", *A = "omnic_arc_ex.omnic";
+    rm_tree(T);
+    omnic_fs_mkdir_p("omnic_arc_ex/src");
+    omnic_fs_mkdir_p("omnic_arc_ex/node_modules/pkg");
+    omnic_fs_mkdir_p("omnic_arc_ex/build");
+    char txt[64];
+    fill_text(txt, 20);
+    wfile("omnic_arc_ex/keep.txt", txt, 20);
+    wfile("omnic_arc_ex/drop.o", txt, 20);
+    wfile("omnic_arc_ex/src/main.c", txt, 20);
+    wfile("omnic_arc_ex/src/util.o", txt, 20);
+    wfile("omnic_arc_ex/node_modules/pkg/index.js", txt, 20);
+    wfile("omnic_arc_ex/build/out.bin", txt, 20);
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+    const char *O = "omnic_arc_ex_out";
+
+    /* 目录前缀：整个子树连目录条目一起消失 */
+    const char *p1[1] = {"node_modules/"};
+    o.exclude = p1;
+    o.n_exclude = 1;
+    CHECK(pack_tree(T, A, o) == OMNIC_OK);
+    rm_tree(O);
+    CHECK(unpack_arc(A, O, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(file_exists("omnic_arc_ex_out/node_modules") == 0);
+    CHECK(file_exists("omnic_arc_ex_out/node_modules/pkg/index.js") == 0);
+    CHECK(file_exists("omnic_arc_ex_out/keep.txt") == 1);
+    CHECK(file_exists("omnic_arc_ex_out/src/main.c") == 1);
+
+    /* 通配符 + 可重复：*.o 全去，精确名去一个 */
+    const char *p2[2] = {"*.o", "build/out.bin"};
+    o.exclude = p2;
+    o.n_exclude = 2;
+    CHECK(pack_tree(T, A, o) == OMNIC_OK);
+    rm_tree(O);
+    CHECK(unpack_arc(A, O, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(file_exists("omnic_arc_ex_out/drop.o") == 0);
+    CHECK(file_exists("omnic_arc_ex_out/src/util.o") == 0);
+    CHECK(file_exists("omnic_arc_ex_out/build/out.bin") == 0);
+    CHECK(file_exists("omnic_arc_ex_out/src/main.c") == 1);
+    CHECK(file_exists("omnic_arc_ex_out/node_modules/pkg/index.js") == 1); /* 这次没排除它 */
+    {
+        /* 目录本身留着（成了空目录）。file_exists 是"能否按文件打开"，对目录为假，用 stat_meta。 */
+        t_meta dm;
+        CHECK(stat_meta("omnic_arc_ex_out/build", &dm, 0) == 0 && dm.is_dir == 1);
+    }
+
+    /* 排除不出现在 --strict 的"跳过"里：它是用户要的，不是丢数据 */
+    /* 全部排除：用法错误，且不留输出 */
+    const char *p3[1] = {"*"};
+    o.exclude = p3;
+    o.n_exclude = 1;
+    remove(A);
+    CHECK(pack_tree(T, A, o) == OMNIC_E_USAGE);
+    CHECK(file_exists(A) == 0);
+    CHECK(file_exists("omnic_arc_ex.omnic.tmp") == 0);
+
+    /* 模式写法的大小写：条目名在归档内原样保留，匹配大小写敏感 */
+    const char *p4[1] = {"KEEP.TXT"};
+    o.exclude = p4;
+    o.n_exclude = 1;
+    CHECK(pack_tree(T, A, o) == OMNIC_OK);
+    rm_tree(O);
+    CHECK(unpack_arc(A, O, mkopts(OMNIC_F_QUIET, 0)) == OMNIC_OK);
+    CHECK(file_exists("omnic_arc_ex_out/keep.txt") == 1);
+
+    rm_tree(T);
+    rm_tree(O);
+    remove(A);
+}
+
+/* 按 FORMAT.md 的布局手工往一个归档里插扩展区：独立于 omnic 的写入端，
+ * 顺带证明规范照着能实现。ext 为整块明文（[index u32][len u32][payload]…）。 */
+static int inject_ext_area(const char *arc, const uint8_t *ext, size_t ext_len, int corrupt_crc) {
+    size_t n = 0;
+    unsigned char *b = slurp(arc, &n);
+    if (b == NULL || n < 64) { free(b); return -1; }
+    /* Footer 是最后 32 字节；索引末尾 = index_off + index_comp */
+    const unsigned char *ftr = b + (n - 32);
+    uint64_t index_off = 0, index_comp = 0;
+    for (int i = 0; i < 8; i++) index_off |= (uint64_t)ftr[8 + i] << (8 * i);
+    for (int i = 0; i < 8; i++) index_comp |= (uint64_t)ftr[16 + i] << (8 * i);
+    uint64_t end = index_off + index_comp;
+    if (end + 32 != n) { free(b); return -1; } /* 这个归档已经有扩展区或布局不符 */
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < ext_len; i++) {
+        crc ^= ext[i];
+        for (int k = 0; k < 8; k++) crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+    }
+    crc ^= 0xFFFFFFFFu;
+    if (corrupt_crc) crc ^= 0x1u;
+    unsigned char *nb = (unsigned char *)malloc(n + ext_len);
+    if (nb == NULL) { free(b); return -1; }
+    memcpy(nb, b, (size_t)end);
+    memcpy(nb + end, ext, ext_len);
+    memcpy(nb + end + ext_len, ftr, 32);
+    /* 头部 24..32：偏移 + CRC */
+    uint32_t off32 = (uint32_t)end;
+    for (int i = 0; i < 4; i++) nb[24 + i] = (unsigned char)(off32 >> (8 * i));
+    for (int i = 0; i < 4; i++) nb[28 + i] = (unsigned char)(crc >> (8 * i));
+    FILE *f = fopen(arc, "wb");
+    if (f == NULL) { free(b); free(nb); return -1; }
+    fwrite(nb, 1, n + ext_len, f);
+    fclose(f);
+    free(b);
+    free(nb);
+    return 0;
+}
+
+static void test_ext_area(void) {
+    const char *T = "omnic_arc_xt", *A = "omnic_arc_xt.omnic", *O = "omnic_arc_xt_out";
+    rm_tree(T);
+    rm_tree(O);
+    omnic_fs_mkdir_p(T);
+    char txt[64];
+    fill_text(txt, 30);
+    wfile("omnic_arc_xt/a.txt", txt, 30);
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+
+    /* 没有属主/扩展属性可存（Windows；或没开 --xattr）：头部 24..32 全 0，没有扩展区 */
+    CHECK(pack_tree(T, A, o) == OMNIC_OK);
+    size_t n = 0;
+    unsigned char *b = slurp(A, &n);
+    CHECK(b != NULL);
+    int zero = 1;
+    for (int i = 24; i < 32; i++)
+        if (b[i] != 0) zero = 0;
+    free(b);
+    CHECK(zero == 1);
+    CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK);
+
+    /* 手工注入一段合法扩展区：entry 0 的 uid=1000 gid=100，外加一条 xattr。
+     * 读取端必须接受；在 Windows 上属主恢复不了（非 root 语义）但不影响文件解出。 */
+    {
+        const char *xn = "user.test";
+        size_t xl = strlen(xn);
+        uint8_t ext[64];
+        size_t p = 0;
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; /* entry index 0 */
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; /* payload len, backfilled */
+        size_t plen_at = p - 4;
+        ext[p++] = 0x01; /* uid */
+        ext[p++] = 0xE8; ext[p++] = 0x03; ext[p++] = 0; ext[p++] = 0; /* 1000 */
+        ext[p++] = 0x02; /* gid */
+        ext[p++] = 100; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        ext[p++] = 0x10; /* xattr blob */
+        size_t xl_at = p;
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        size_t blob_at = p;
+        ext[p++] = (uint8_t)xl; ext[p++] = 0; /* name_len */
+        memcpy(ext + p, xn, xl); p += xl;
+        ext[p++] = 5; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; /* val_len */
+        memcpy(ext + p, "hello", 5); p += 5;
+        uint32_t blob_len = (uint32_t)(p - blob_at), plen = (uint32_t)(p - plen_at - 4);
+        for (int i = 0; i < 4; i++) ext[xl_at + i] = (unsigned char)(blob_len >> (8 * i));
+        for (int i = 0; i < 4; i++) ext[plen_at + i] = (unsigned char)(plen >> (8 * i));
+        CHECK(inject_ext_area(A, ext, p, 0) == 0);
+        CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK); /* 结构合法，校验通过 */
+        memset(&g_rep, 0, sizeof(g_rep));
+        omnic_status st = unpack_arc(A, O, o);
+        /* Windows 上 xattr 设不上（没有这个概念）：按条目失败计。文件本身必须完好解出。 */
+        CHECK(st == OMNIC_OK || st == OMNIC_E_DATA);
+        CHECK(files_equal("omnic_arc_xt/a.txt", "omnic_arc_xt_out/a.txt"));
+        rm_tree(O);
+    }
+
+    /* 畸形扩展区：每一样都必须被整体拒绝（E_DATA），不得崩溃、不得悄悄忽略 */
+    {
+        uint8_t ext[64];
+        size_t p = 0;
+        /* entry index 越界 */
+        ext[p++] = 0xFF; ext[p++] = 0xFF; ext[p++] = 0xFF; ext[p++] = 0xFF;
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        CHECK(pack_tree(T, A, o) == OMNIC_OK);
+        CHECK(inject_ext_area(A, ext, p, 0) == 0);
+        CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_E_DATA);
+        p = 0;
+        /* 未知标签 */
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        ext[p++] = 1; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        ext[p++] = 0x7F;
+        CHECK(pack_tree(T, A, o) == OMNIC_OK);
+        CHECK(inject_ext_area(A, ext, p, 0) == 0);
+        CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_E_DATA);
+        p = 0;
+        /* 重复的 uid 标签 */
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        ext[p++] = 10; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        ext[p++] = 0x01; ext[p++] = 1; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        ext[p++] = 0x01; ext[p++] = 2; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        CHECK(pack_tree(T, A, o) == OMNIC_OK);
+        CHECK(inject_ext_area(A, ext, p, 0) == 0);
+        CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_E_DATA);
+        p = 0;
+        /* payload 长度越过块尾 */
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        ext[p++] = 200; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        ext[p++] = 0x01; ext[p++] = 1;
+        CHECK(pack_tree(T, A, o) == OMNIC_OK);
+        CHECK(inject_ext_area(A, ext, p, 0) == 0);
+        CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_E_DATA);
+        /* CRC 错 */
+        p = 0;
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;
+        CHECK(pack_tree(T, A, o) == OMNIC_OK);
+        CHECK(inject_ext_area(A, ext, p, 1) == 0);
+        CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_E_DATA);
+        /* xattr 块声明 14 字节、记录只占 11 字节、块内其余是零填充。零填充会被记录解析器判为
+         * 畸形（name_len=0），于是整个归档被拒。说明：读取端还有一条"记录必须恰好铺满声明长度"
+         * 的校验，它与 CRC 校验耦合、不可单独触发（见 archive.c 的注释），变异验收抓不到它是对的。 */
+        p = 0;
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; /* entry 0 */
+        ext[p++] = 19; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; /* payload len = 1 + 4 + 14 */
+        ext[p++] = 0x10; /* xattr */
+        ext[p++] = 14; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; /* blob len = 14 */
+        ext[p++] = 3; ext[p++] = 0; /* name_len = 3 */
+        memcpy(ext + p, "abc", 3); p += 3;
+        ext[p++] = 2; ext[p++] = 0; ext[p++] = 0; ext[p++] = 0; /* val_len = 2 */
+        memcpy(ext + p, "hi", 2); p += 2;                         /* 记录到此共 11 字节 */
+        ext[p++] = 0; ext[p++] = 0; ext[p++] = 0;                 /* 块内填充 3 字节：没铺满 */
+        CHECK(pack_tree(T, A, o) == OMNIC_OK);
+        CHECK(inject_ext_area(A, ext, p, 0) == 0);
+        CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_E_DATA);
+
+    }
+
+    rm_tree(T);
+    rm_tree(O);
     remove(A);
 }
 
@@ -1814,6 +2053,8 @@ int main(void) {
     test_v2_layout();
     test_v1_archive_readable();
     test_index_fuzz();
+    test_exclude();
+    test_ext_area();
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

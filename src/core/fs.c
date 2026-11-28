@@ -73,8 +73,55 @@ void omnic_fs_entries_free(omnic_fs_entry *v, size_t n) {
     for (size_t i = 0; i < n; i++) {
         free(v[i].rel);
         free(v[i].link_target);
+        free(v[i].xattr);
     }
     free(v);
+}
+
+/* 平台无关：扩展属性记录的编解码。读取端拿到的长度来自不可信的归档，
+ * omnic_fs_xattr_next 对每条记录都做边界检查。 */
+int omnic_fs_xattr_append(unsigned char **buf, size_t *len, const char *name, const void *val,
+                          size_t val_len) {
+    size_t nl = strlen(name);
+    if (nl == 0 || nl > 0xFFFFu || val_len > 0xFFFFFFFFu) return -1;
+    size_t need = 2 + nl + 4 + val_len;
+    if (*len > (size_t)-1 - need) return -1;
+    unsigned char *nb = (unsigned char *)realloc(*buf, *len + need);
+    if (nb == NULL) return -1;
+    unsigned char *p = nb + *len;
+    p[0] = (unsigned char)nl;
+    p[1] = (unsigned char)(nl >> 8);
+    memcpy(p + 2, name, nl);
+    p += 2 + nl;
+    for (int i = 0; i < 4; i++) p[i] = (unsigned char)(val_len >> (8 * i));
+    p += 4;
+    if (val_len != 0) memcpy(p, val, val_len);
+    *buf = nb;
+    *len += need;
+    return 0;
+}
+
+/* 遍历连续缓冲区：*pos 为游标。返回 1=取到一条，0=结束，-1=记录越界或畸形 */
+int omnic_fs_xattr_next(const unsigned char *buf, size_t len, size_t *pos, const char **name,
+                        size_t *name_len, const unsigned char **val, size_t *val_len) {
+    size_t p = *pos;
+    if (p == len) return 0;
+    if (len < 2 || p > len - 2) return -1;
+    size_t nl = (size_t)buf[p] | ((size_t)buf[p + 1] << 8);
+    p += 2;
+    if (nl == 0 || p > len - nl) return -1;
+    *name = (const char *)(buf + p);
+    *name_len = nl;
+    p += nl;
+    if (p > len - 4) return -1;
+    size_t vl = (size_t)buf[p] | ((size_t)buf[p + 1] << 8) | ((size_t)buf[p + 2] << 16) |
+                ((size_t)buf[p + 3] << 24);
+    p += 4;
+    if (vl > len - p) return -1;
+    *val = buf + p;
+    *val_len = vl;
+    *pos = p + vl;
+    return 1;
 }
 
 char *omnic_fs_default_archive_path(const char *root) {
@@ -634,6 +681,30 @@ int omnic_fs_path_inside(const char *root_abs, const char *path_abs) {
     return path_abs[rn] == '/';
 }
 
+/* Windows 上没有 POSIX 意义的属主与扩展属性：一律"没有/不能"，归档里就不会出现这些数据 */
+int omnic_fs_can_chown(void) { return 0; }
+
+omnic_status omnic_fs_set_owner(const char *path, unsigned uid, unsigned gid) {
+    (void)path; (void)uid; (void)gid;
+    return OMNIC_E_SYSTEM;
+}
+
+omnic_status omnic_fs_get_xattrs(const char *path, unsigned char **buf, size_t *len) {
+    (void)path;
+    *buf = NULL;
+    *len = 0;
+    return OMNIC_OK;
+}
+
+omnic_status omnic_fs_set_xattr(const char *path, const char *name, const void *val,
+                                size_t val_len) {
+    (void)path;
+    (void)name;
+    (void)val;
+    (void)val_len;
+    return OMNIC_E_SYSTEM;
+}
+
 #else /* POSIX */
 
 #include <dirent.h>
@@ -646,6 +717,12 @@ int omnic_fs_path_inside(const char *root_abs, const char *path_abs) {
 #include <sys/time.h>
 #include <utime.h>
 #include <time.h>
+#if defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+#define OMNIC_HAVE_XATTR 1
+#endif
+#ifdef OMNIC_HAVE_XATTR
+#include <sys/xattr.h>
+#endif
 
 /* 创建时间：BSD/macOS 有 st_birthtime（macOS 上是映射到 st_birthtimespec.tv_sec 的宏），
  * Linux 得走 statx（glibc ≥ 2.28、musl）。拿不到就当未知。 */
@@ -682,6 +759,67 @@ static char *read_link_alloc(const char *path) {
         if (cap >= (1u << 20)) return NULL;
         cap *= 2;
     }
+}
+
+/* ---- 扩展属性（xattr）与属主：POSIX 专有 ----
+ * listxattr 在两边语义不同：Linux 返回"名字串的总长"，macOS 返回"名字串总长 + 每个名字
+ * 一个 NUL"；llistxattr(…, NULL, 0) 两边都只给长度。名字一律以 NUL 分隔，逐个 lgetxattr 取值。
+ * 读一个属性失败不致命：跳过它，剩下的照存。 */
+
+int omnic_fs_can_chown(void) { return geteuid() == 0 ? 1 : 0; }
+
+omnic_status omnic_fs_set_owner(const char *path, unsigned uid, unsigned gid) {
+    if (lchown(path, (uid_t)uid, (gid_t)gid) == 0) return OMNIC_OK;
+    return OMNIC_E_SYSTEM;
+}
+
+omnic_status omnic_fs_get_xattrs(const char *path, unsigned char **buf, size_t *len) {
+    *buf = NULL;
+    *len = 0;
+#ifdef OMNIC_HAVE_XATTR
+    ssize_t sz = llistxattr(path, NULL, 0);
+    if (sz < 0) return (errno == ENOTSUP) ? OMNIC_OK : OMNIC_E_SYSTEM; /* 文件系统不支持 = 没有 */
+    if (sz == 0) return OMNIC_OK;
+    char *names = (char *)malloc((size_t)sz + 1);
+    if (names == NULL) return OMNIC_E_SYSTEM;
+    ssize_t got = llistxattr(path, names, (size_t)sz);
+    if (got != sz) { /* 两次调用之间属性变了：按当下没有处理，不存半截 */
+        free(names);
+        return OMNIC_OK;
+    }
+    names[sz] = '\0';
+    unsigned char *acc = NULL;
+    size_t acc_len = 0;
+    for (const char *nm = names; nm < names + sz; nm += strlen(nm) + 1) {
+        if (*nm == '\0') continue;
+        ssize_t vsz = lgetxattr(path, nm, NULL, 0);
+        if (vsz < 0) continue;
+        void *val = malloc(vsz > 0 ? (size_t)vsz : 1);
+        if (val == NULL) { free(names); free(acc); return OMNIC_E_SYSTEM; }
+        if (vsz > 0 && lgetxattr(path, nm, val, (size_t)vsz) != vsz) { free(val); continue; }
+        if (omnic_fs_xattr_append(&acc, &acc_len, nm, val, (size_t)vsz) != 0) {
+            free(val); free(names); free(acc);
+            return OMNIC_E_SYSTEM;
+        }
+        free(val);
+    }
+    free(names);
+    *buf = acc;
+    *len = acc_len;
+#else
+    (void)path;
+#endif
+    return OMNIC_OK;
+}
+
+omnic_status omnic_fs_set_xattr(const char *path, const char *name, const void *val,
+                                size_t val_len) {
+#ifdef OMNIC_HAVE_XATTR
+    return lsetxattr(path, name, val, val_len, 0) == 0 ? OMNIC_OK : OMNIC_E_SYSTEM;
+#else
+    (void)path; (void)name; (void)val; (void)val_len;
+    return OMNIC_E_SYSTEM;
+#endif
 }
 
 static void walk_dir(const char *dir, const char *rel, entry_vec *ev, omnic_fs_skip_report *rep,
@@ -741,10 +879,22 @@ static void walk_dir(const char *dir, const char *rel, entry_vec *ev, omnic_fs_s
             e.mode = (unsigned)(st.st_mode & 07777u);
             e.has_mode = 1;
         }
+        if ((want & OMNIC_FS_WANT_OWNER) != 0) {
+            e.uid = (unsigned)st.st_uid;
+            e.gid = (unsigned)st.st_gid;
+            e.has_owner = 1;
+        }
+        if ((want & OMNIC_FS_WANT_XATTR) != 0 &&
+            omnic_fs_get_xattrs(child_path, &e.xattr, &e.xattr_len) != OMNIC_OK) {
+            free(e.xattr); /* 读不出来就不存：不影响条目本身 */
+            e.xattr = NULL;
+            e.xattr_len = 0;
+        }
         if ((want & OMNIC_FS_WANT_CTIME) != 0) e.ctime = birthtime_of(child_path, &st);
         if (vec_push(ev, &e) != 0) {
             free(e.rel);
             free(e.link_target);
+            free(e.xattr);
             break;
         }
         if (e.is_dir) walk_dir(child_path, child_rel, ev, rep, want);

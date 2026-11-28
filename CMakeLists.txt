@@ -272,6 +272,8 @@ if(OMNIC_CODEC_ZSTD)
   add_executable(test_archive tests/test_archive.c)
   target_link_libraries(test_archive PRIVATE omnic_core)
   target_compile_definitions(test_archive PRIVATE ${OMNIC_DEFS})
+  # v1 样本归档的路径不靠相对路径猜：从哪个目录运行都能找到
+  target_compile_definitions(test_archive PRIVATE OMNIC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
   add_test(NAME archive COMMAND test_archive)
 endif()
 

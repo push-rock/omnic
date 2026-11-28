@@ -215,7 +215,7 @@ static int copy_file(const char *src, const char *dst) {
 
 static omnic_options def_opts(void) {
     /* 测试统一保留源文件（压缩成功默认删源，假设 A8） */
-    omnic_options o = {OMNIC_PROFILE_BALANCED, NULL, 0, 0, OMNIC_F_KEEP, NULL, 0};
+    omnic_options o = {OMNIC_PROFILE_BALANCED, NULL, 0, 0, OMNIC_F_KEEP, NULL, 0, NULL, 0};
     return o;
 }
 

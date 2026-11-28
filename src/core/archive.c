@@ -124,6 +124,17 @@ enum { ARC_T_FILE = 0, ARC_T_DIR = 1, ARC_T_SYMLINK = 2, ARC_T_HARDLINK = 3 };
 #define ARC_EF_KNOWN 0x5Fu
 #define ARC_LINK_MAX (1u << 20) /* 链接目标的字节上限：畸形索引不得撑爆内存 */
 
+/* ---- 扩展区（FORMAT.md §Extension area）----
+ * 头部保留字节 24..32 在 v2 里存 { u32 offset, u32 crc }：offset=0 表示没有扩展区。
+ * 布局：[数据][索引][扩展区][Footer]。扩展区按条目组织，只列有扩展数据的条目：
+ *   entry_index u32 | payload_len u32 | payload
+ * payload 是标签-长度-值：tag u8，随后是该标签定长或自带长度的值。 */
+#define ARC_EXT_OFF 24u /* 头部里扩展区偏移字段的位置 */
+#define ARC_EXT_MAX (256u << 20) /* 扩展区上限 256 MiB：畸形头部不得撑爆内存 */
+#define ARC_EXT_TAG_UID 0x01u    /* uid u32 */
+#define ARC_EXT_TAG_GID 0x02u    /* gid u32 */
+#define ARC_EXT_TAG_XATTR 0x10u  /* 扩展属性：一条或多条 [name_len u16][name][val_len u32][value] 连续存放 */
+
 #ifndef OMNIC_CODEC_ZSTD
 #error "internal: stub must precede helpers"
 #endif
@@ -150,6 +161,9 @@ typedef struct {
     unsigned mode;    /* 0 = 未存 */
     unsigned attrs;   /* 0 = 未存 */
     uint32_t link_to; /* 硬链接：指向的文件条目下标 */
+    unsigned uid, gid;    /* 来自扩展区；未存为 0 */
+    unsigned char *xattr; /* 来自扩展区，连续记录格式；无则 NULL */
+    size_t xattr_len;
 } arc_entry;
 
 typedef struct {
@@ -162,10 +176,198 @@ typedef struct {
 
 static void arc_index_mem_free(arc_index *ix) {
     if (ix == NULL) return;
-    for (size_t i = 0; i < ix->nent; i++) free(ix->ent[i].name);
+    for (size_t i = 0; i < ix->nent; i++) {
+        free(ix->ent[i].name);
+        free(ix->ent[i].xattr);
+    }
     free(ix->ent);
     free(ix->blk);
     memset(ix, 0, sizeof(*ix));
+}
+
+/* --file 模式匹配三种：尾 '/' 目录前缀、含 * / ? 走 glob、其余精确路径。
+ * glob 极简实现（无转义，* 跨 /，大小写敏感——条目名在归档内原样保留）。 */
+static int glob_match(const char *pat, const char *s) {
+    const char *star = NULL, *ss = NULL;
+    while (*s != '\0') {
+        if (*pat == *s || *pat == '?') {
+            pat++;
+            s++;
+        } else if (*pat == '*') {
+            star = pat++;
+            ss = s;
+        } else if (star != NULL) {
+            pat = star + 1;
+            s = ++ss;
+        } else {
+            return 0;
+        }
+    }
+    while (*pat == '*') pat++;
+    return *pat == '\0';
+}
+
+static int name_matches(const char *pat, size_t pat_len, const char *name) {
+    /* 归档条目名一律 '/'；Windows 用户习惯敲反斜杠，匹配前先规范化 */
+    char norm[OMNIC_FS_PATH_MAX];
+    if (pat_len >= sizeof(norm)) return 0; /* 超长 pattern 不可能命中 */
+    memcpy(norm, pat, pat_len);
+    norm[pat_len] = '\0';
+    for (size_t i = 0; i < pat_len; i++)
+        if (norm[i] == '\\') norm[i] = '/';
+    pat = norm;
+    if (pat_len > 0 && pat[pat_len - 1] == '/') {
+        size_t pl = pat_len - 1;
+        return strncmp(name, pat, pl) == 0 && (name[pl] == '/' || name[pl] == '\0');
+    }
+    int has_glob = 0;
+    for (size_t i = 0; i < pat_len; i++) {
+        if (pat[i] == '*' || pat[i] == '?') {
+            has_glob = 1;
+            break;
+        }
+    }
+    if (has_glob) return glob_match(pat, name);
+    return strcmp(pat, name) == 0;
+}
+
+/* ---- 扩展区：序列化与解析 ----
+ * 只列有扩展数据的条目，按条目下标升序。同一标签在一个条目里最多出现一次（xattr 标签
+ * 之下可以有多条属性）。解析时每一步读取都先核对剩余长度：这些字节来自不可信文件。 */
+
+/* 把一个条目的 uid/gid/xattr 编成 payload；没有任何数据返回 NULL。*len = (size_t)-1 表示 OOM */
+static uint8_t *arc_ext_entry_payload(const arc_entry *e, size_t *len) {
+    bytebuf b = {NULL, 0, 0};
+    *len = 0;
+    int have = 0;
+    if (e->uid != 0) {
+        uint8_t row[5] = {ARC_EXT_TAG_UID, 0, 0, 0, 0};
+        put32(row + 1, e->uid);
+        if (bb_put(&b, row, 5) != 0) goto oom;
+        have = 1;
+    }
+    if (e->gid != 0) {
+        uint8_t row[5] = {ARC_EXT_TAG_GID, 0, 0, 0, 0};
+        put32(row + 1, e->gid);
+        if (bb_put(&b, row, 5) != 0) goto oom;
+        have = 1;
+    }
+    if (e->xattr != NULL && e->xattr_len != 0) {
+        uint8_t hdr[5] = {ARC_EXT_TAG_XATTR, 0, 0, 0, 0};
+        put32(hdr + 1, (uint32_t)e->xattr_len);
+        if (bb_put(&b, hdr, 5) != 0 || bb_put(&b, e->xattr, e->xattr_len) != 0) goto oom;
+        have = 1;
+    }
+    if (!have) {
+        free(b.buf);
+        return NULL;
+    }
+    *len = b.n;
+    return b.buf;
+oom:
+    free(b.buf);
+    *len = (size_t)-1;
+    return NULL;
+}
+
+/* 解析一个 payload，填进条目。payload 的总长度已由调用方核对；内部再逐步核对。 */
+static omnic_status arc_ext_parse_payload(const uint8_t *p, size_t n, arc_entry *e) {
+    size_t pos = 0;
+    int seen_uid = 0, seen_gid = 0, seen_xattr = 0;
+    while (pos < n) {
+        uint8_t tag = p[pos++];
+        if (tag == ARC_EXT_TAG_UID || tag == ARC_EXT_TAG_GID) {
+            if (n - pos < 4) return OMNIC_E_DATA;
+            uint32_t v = get32(p + pos);
+            pos += 4;
+            if (v == 0) return OMNIC_E_DATA; /* 0 表示"未存"，不允许显式写出 */
+            if (tag == ARC_EXT_TAG_UID) {
+                if (seen_uid++) return OMNIC_E_DATA;
+                e->uid = v;
+            } else {
+                if (seen_gid++) return OMNIC_E_DATA;
+                e->gid = v;
+            }
+        } else if (tag == ARC_EXT_TAG_XATTR) {
+            if (seen_xattr++) return OMNIC_E_DATA;
+            if (n - pos < 4) return OMNIC_E_DATA;
+            uint32_t xl = get32(p + pos);
+            pos += 4;
+            if (xl == 0 || n - pos < xl) return OMNIC_E_DATA;
+            /* 记录必须恰好铺满声明的长度，且每条都能解析：否则拒绝整个归档。
+             * 注：xp != xl 这一支与 CRC 校验耦合——CRC 正确时未铺满的尾部只能是全零，
+             * 而全零会被上面的解析判为畸形（name_len=0）。它是纵深防御，不可单独触发。 */
+            size_t xp = 0, nl = 0, vl = 0;
+            const char *nm = NULL;
+            const unsigned char *val = NULL;
+            int r;
+            while ((r = omnic_fs_xattr_next(p + pos, xl, &xp, &nm, &nl, &val, &vl)) == 1) {
+            }
+            if (r != 0 || xp != xl) return OMNIC_E_DATA;
+            unsigned char *copy = (unsigned char *)malloc(xl);
+            if (copy == NULL) return OMNIC_E_SYSTEM;
+            memcpy(copy, p + pos, xl);
+            e->xattr = copy;
+            e->xattr_len = xl;
+            pos += xl;
+        } else {
+            return OMNIC_E_DATA; /* 未知标签：扩展区整体按损坏处理，不"忽略" */
+        }
+    }
+    return OMNIC_OK;
+}
+
+/* 从文件读出并解析扩展区。头部 offset==0 表示没有。任何不一致都是 E_DATA。
+ * 布局 [数据][索引][扩展区][Footer]：扩展区从索引末尾起、到 Footer 止；头部的 offset
+ * 必须正好等于索引末尾——它存在的意义是让读取端确认两者之间没有空洞。 */
+static omnic_status arc_ext_load(FILE *f, arc_index *ix, uint32_t off, uint32_t crc) {
+    if (off == 0) return (crc == 0) ? OMNIC_OK : OMNIC_E_DATA; /* 没有扩展区却带 CRC = 不一致 */
+    long fsz;
+    if (fseek(f, 0, SEEK_END) != 0 || (fsz = ftell(f)) < 0) return OMNIC_E_SYSTEM;
+    if ((unsigned long long)fsz < ARC_FTR) return OMNIC_E_DATA;
+    uint64_t footer_at = (uint64_t)fsz - ARC_FTR;
+    uint8_t ftr[ARC_FTR];
+    if (arc_seek(f, footer_at) != 0 || fread(ftr, 1, sizeof(ftr), f) != sizeof(ftr))
+        return OMNIC_E_SYSTEM;
+    uint64_t end = get64(ftr + 8) + get64(ftr + 16); /* 索引末尾 */
+    /* 偏移必须正好是索引末尾。注：这条与下面的 CRC 校验耦合——长度按 end 算、起点用 off，
+     * 两者不等时读到的必然不是 CRC 覆盖的那段数据。它是纵深防御，不可单独触发。 */
+    if (end != off || end > footer_at) return OMNIC_E_DATA;
+    size_t len = (size_t)(footer_at - end);
+    if (len < 8) return OMNIC_E_DATA; /* 最少一条 [index u32][payload_len u32] */
+    uint8_t *buf = (uint8_t *)malloc(len);
+    if (buf == NULL) return OMNIC_E_SYSTEM;
+    if (arc_seek(f, off) != 0 || fread(buf, 1, len, f) != len) {
+        free(buf);
+        return OMNIC_E_DATA;
+    }
+    if (omnic_crc32(0, buf, len) != crc) {
+        free(buf);
+        omnic_set_error("archive extension area corrupted");
+        return OMNIC_E_DATA;
+    }
+    omnic_status st = OMNIC_OK;
+    size_t pos = 0;
+    uint64_t last = 0;
+    int first = 1;
+    while (pos < len) {
+        if (len - pos < 8) { st = OMNIC_E_DATA; break; }
+        uint32_t idx = get32(buf + pos), plen = get32(buf + pos + 4);
+        pos += 8;
+        if (len - pos < plen) { st = OMNIC_E_DATA; break; }
+        if (idx >= ix->nent || (!first && idx <= last)) { st = OMNIC_E_DATA; break; } /* 越界或非升序 */
+        first = 0;
+        last = idx;
+        if (plen != 0) {
+            st = arc_ext_parse_payload(buf + pos, plen, &ix->ent[idx]);
+            if (st != OMNIC_OK) break;
+        }
+        pos += plen;
+    }
+    free(buf);
+    if (st == OMNIC_E_DATA && omnic_last_error()[0] == '\0')
+        omnic_set_error("archive extension area malformed");
+    return st;
 }
 
 /* ---- 条目名校验（ARCHIVE_SPEC §3.7）---- */
@@ -916,6 +1118,9 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     size_t n = 0;
     omnic_fs_skip_report sk;
     unsigned want = (o != NULL && (o->flags & OMNIC_F_CTIME) != 0) ? OMNIC_FS_WANT_CTIME : 0;
+    /* 属主：lstat 顺手就有，默认就采；扩展属性要额外的系统调用，--xattr 才采 */
+    want |= OMNIC_FS_WANT_OWNER;
+    if (o != NULL && (o->flags & OMNIC_F_XATTR) != 0) want |= OMNIC_FS_WANT_XATTR;
     omnic_fs_entry *fs = omnic_fs_walk_ex(root, &n, &sk, want);
     if (fs == NULL && n == 0) {
         omnic_set_error("fs walk failed: %s", root);
@@ -927,6 +1132,43 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
         if (strict) {
             omnic_fs_entries_free(fs, n);
             return OMNIC_E_DATA;
+        }
+    }
+    /* --exclude：在遍历之后、分类之前过滤。匹配到的条目整体丢弃；以 / 结尾的模式
+     * 连它下面的子树一起丢。这是用户明确要的东西，静默生效，不算"跳过"。 */
+    size_t n_excluded = 0;
+    if (o != NULL && o->exclude != NULL && o->n_exclude > 0) {
+        size_t kept = 0;
+        for (size_t i = 0; i < n; i++) {
+            int drop = 0;
+            for (size_t k = 0; k < o->n_exclude && !drop; k++) {
+                const char *pat = o->exclude[k];
+                size_t pl = strlen(pat);
+                if (pl == 0) continue;
+                if (pat[pl - 1] == '/') { /* 目录前缀：条目本身或其下任意路径 */
+                    size_t dl = pl - 1;
+                    drop = (strncmp(fs[i].rel, pat, dl) == 0 &&
+                            (fs[i].rel[dl] == '/' || fs[i].rel[dl] == '\0'));
+                } else {
+                    drop = name_matches(pat, pl, fs[i].rel) != 0;
+                }
+            }
+            if (drop) {
+                n_excluded++;
+                free(fs[i].rel);
+                free(fs[i].link_target);
+                free(fs[i].xattr);
+            } else {
+                fs[kept++] = fs[i]; /* 原地压缩：被丢的条目已释放，不能留下悬空指针 */
+            }
+        }
+        /* 压缩后尾部残留的是已释放条目的旧副本：清掉，避免被二次释放 */
+        memset(fs + kept, 0, (n - kept) * sizeof(*fs));
+        n = kept;
+        if (n == 0) {
+            omnic_set_error("every entry was excluded — nothing to pack");
+            omnic_fs_entries_free(fs, n);
+            return OMNIC_E_USAGE;
         }
     }
     if (n > 0xFFFFFFFFull) { /* v2：条目计数 32 位；实践中先撞内存 */
@@ -983,6 +1225,17 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
         if (fs[i].attrs != 0) {
             e->attrs = fs[i].attrs;
             e->flags |= ARC_EF_HAS_ATTRS;
+        }
+        /* 属主与扩展属性不进条目记录，走归档尾部的扩展区（FORMAT.md §Extension area） */
+        if (fs[i].has_owner) {
+            e->uid = fs[i].uid;
+            e->gid = fs[i].gid;
+        }
+        if (fs[i].xattr != NULL && fs[i].xattr_len != 0) {
+            e->xattr = (unsigned char *)malloc(fs[i].xattr_len);
+            if (e->xattr == NULL) goto oom;
+            memcpy(e->xattr, fs[i].xattr, fs[i].xattr_len);
+            e->xattr_len = fs[i].xattr_len;
         }
     }
 
@@ -1107,9 +1360,11 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     mark_hardlinks(&ix, ids, n);
     free(ids);
     ids = NULL;
-    if (!quiet)
+    if (!quiet) {
         printf("  classified %llu entries in %.2fs\n", (unsigned long long)n,
                 omnic_now_sec() - t0);
+        if (n_excluded > 0) printf("  excluded %zu entries\n", n_excluded);
+    }
 
     /* ---- 分桶（D10：同 (codec,level) 聚合；per-file 模式每文件独立桶） ---- */
     for (size_t i = 0; i < n; i++) {
@@ -1518,12 +1773,50 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     }
     uint32_t index_crc = omnic_crc32(0, zbuf, (size_t)zn);
     free(zbuf);
+    arc_pos += zn;
+
+    /* 扩展区：属主与扩展属性。只有确有数据的条目才占地方；一条都没有就整块不写，
+     * 归档与不带这些数据的 v2 逐字节同长。偏移是 32 位，超限（归档 > 4 GiB）就放弃
+     * 这块数据而不是写一个被截断的偏移——文件本身照常。 */
+    uint32_t ext_off = 0, ext_crc = 0;
+    {
+        bytebuf xb = {NULL, 0, 0};
+        int xbad = 0;
+        for (size_t i = 0; i < ix.nent && !xbad; i++) {
+            size_t plen = 0;
+            uint8_t *pl = arc_ext_entry_payload(&ix.ent[i], &plen);
+            if (pl == NULL) {
+                if (plen == (size_t)-1) xbad = 1; /* OOM：放弃整块，不算致命 */
+                continue;
+            }
+            uint8_t hdr[8];
+            put32(hdr, (uint32_t)i);
+            put32(hdr + 4, (uint32_t)plen);
+            if (bb_put(&xb, hdr, 8) != 0 || bb_put(&xb, pl, plen) != 0) xbad = 1;
+            free(pl);
+        }
+        if (!xbad && xb.n != 0 && arc_pos <= 0xFFFFFFFFull && xb.n <= ARC_EXT_MAX) {
+            if (fwrite(xb.buf, 1, xb.n, f) != xb.n) {
+                free(xb.buf);
+                goto io_fail;
+            }
+            ext_off = (uint32_t)arc_pos;
+            ext_crc = omnic_crc32(0, xb.buf, xb.n);
+            arc_pos += xb.n;
+        }
+        free(xb.buf);
+    }
 
     uint32_t nb32 = (uint32_t)ix.nblk;
     uint8_t nbrow[4];
     put32(nbrow, nb32);
     if (arc_seek(f, 12) != 0 || fwrite(nbrow, 1, 4, f) != 4) goto io_fail;
-    if (arc_seek(f, index_off + zn) != 0) goto io_fail; /* 回填后回到尾部写 Footer */
+    /* 头部保留字节：扩展区的位置与校验（没有扩展区时保持 0） */
+    uint8_t exrow[8];
+    put32(exrow, ext_off);
+    put32(exrow + 4, ext_crc);
+    if (arc_seek(f, ARC_EXT_OFF) != 0 || fwrite(exrow, 1, 8, f) != 8) goto io_fail;
+    if (arc_seek(f, arc_pos) != 0) goto io_fail; /* 回填后回到尾部写 Footer */
 
     uint8_t ftr[ARC_FTR];
     memset(ftr, 0, sizeof(ftr)); /* 尾部的计数字节在 v2 保留为 0：不能留栈上的旧值 */
@@ -1534,7 +1827,7 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     /* v2：尾部的 4 个计数字节保留为 0——计数以头部的 32 位为准（v1 在那里只有 16 位） */
     if (fwrite(ftr, 1, sizeof(ftr), f) != sizeof(ftr)) goto io_fail;
 
-    rep->out_bytes = index_off + zn + ARC_FTR;
+    rep->out_bytes = arc_pos + ARC_FTR;
     rep->ratio = rep->in_bytes ? (double)rep->out_bytes / (double)rep->in_bytes : 0.0;
     arc_index_mem_free(&ix);
     omnic_fs_entries_free(fs, n);
@@ -1688,6 +1981,18 @@ static omnic_status arc_open_index(const char *archive_path, FILE **out_f, arc_i
         if (omnic_last_error()[0] == '\0') omnic_set_error("corrupt archive index");
         fclose(f);
         return OMNIC_E_DATA;
+    }
+    /* 扩展区（属主/扩展属性）：位置与校验在头部的保留字节里。v1 没有这块，偏移必须为 0 */
+    uint32_t ext_off = get32(hdr + ARC_EXT_OFF), ext_crc = get32(hdr + ARC_EXT_OFF + 4);
+    omnic_status est = OMNIC_OK;
+    if (version >= OMNIC_ARC_VERSION) est = arc_ext_load(f, ix, ext_off, ext_crc);
+    else if (ext_off != 0 || ext_crc != 0) est = OMNIC_E_DATA;
+    if (est != OMNIC_OK) {
+        if (est == OMNIC_E_DATA && omnic_last_error()[0] == '\0')
+            omnic_set_error("corrupt archive extension area");
+        arc_index_mem_free(ix);
+        fclose(f);
+        return est;
     }
     *out_f = f;
     return OMNIC_OK;
@@ -2068,52 +2373,6 @@ static void pool_shutdown(arc_pool *p) {
     for (int i = 0; i < p->nworkers; i++) arc_thread_join(p->tid[i]);
 }
 
-/* --file 模式匹配三种：尾 '/' 目录前缀、含 * / ? 走 glob、其余精确路径。
- * glob 极简实现（无转义，* 跨 /，大小写敏感——条目名在归档内原样保留）。 */
-static int glob_match(const char *pat, const char *s) {
-    const char *star = NULL, *ss = NULL;
-    while (*s != '\0') {
-        if (*pat == *s || *pat == '?') {
-            pat++;
-            s++;
-        } else if (*pat == '*') {
-            star = pat++;
-            ss = s;
-        } else if (star != NULL) {
-            pat = star + 1;
-            s = ++ss;
-        } else {
-            return 0;
-        }
-    }
-    while (*pat == '*') pat++;
-    return *pat == '\0';
-}
-
-static int name_matches(const char *pat, size_t pat_len, const char *name) {
-    /* 归档条目名一律 '/'；Windows 用户习惯敲反斜杠，匹配前先规范化 */
-    char norm[OMNIC_FS_PATH_MAX];
-    if (pat_len >= sizeof(norm)) return 0; /* 超长 pattern 不可能命中 */
-    memcpy(norm, pat, pat_len);
-    norm[pat_len] = '\0';
-    for (size_t i = 0; i < pat_len; i++)
-        if (norm[i] == '\\') norm[i] = '/';
-    pat = norm;
-    if (pat_len > 0 && pat[pat_len - 1] == '/') {
-        size_t pl = pat_len - 1;
-        return strncmp(name, pat, pl) == 0 && (name[pl] == '/' || name[pl] == '\0');
-    }
-    int has_glob = 0;
-    for (size_t i = 0; i < pat_len; i++) {
-        if (pat[i] == '*' || pat[i] == '?') {
-            has_glob = 1;
-            break;
-        }
-    }
-    if (has_glob) return glob_match(pat, name);
-    return strcmp(pat, name) == 0;
-}
-
 /* ---- 链接类条目与目录权限的收尾（文件全部落盘之后） ----
  * - 硬链接：全量提取时真建硬链接；--file 单选时目标条目未必在场，就地物化成一份副本。
  * - 符号链接最后建：任何文件都不会经由刚建的链接写到输出目录外面去。
@@ -2278,6 +2537,58 @@ static void finish_links(const arc_index *ix, const char *dstroot, const unsigne
     if (!quiet && as_junction > 0)
         fprintf(stderr, "omnic: %zu directory symlinks created as junctions (no symlink privilege)\n",
                 as_junction);
+    /* 属主与扩展属性：同样在一切落盘之后。属主只有 root 改得了——普通用户解包时
+     * 这些数据原样留在归档里、不恢复也不报错（与 tar 的行为一致）。
+     * xattr 失败按条目失败计：它是用户用 --xattr 明确要存的东西，丢了不能不出声。 */
+    int can_chown = omnic_fs_can_chown();
+    size_t owner_skipped = 0;
+    for (size_t i = 0; i < ix->nent; i++) {
+        const arc_entry *e = &ix->ent[i];
+        if (selective && !want_ent[i]) continue;
+        if (e->uid == 0 && e->gid == 0 && e->xattr == NULL) continue;
+        char *dst = join_dst(dstroot, e->name);
+        if (dst == NULL) {
+            (*failed)++;
+            continue;
+        }
+        if ((e->uid != 0 || e->gid != 0) && e->type != ARC_T_HARDLINK) {
+            if (can_chown) {
+                if (omnic_fs_set_owner(dst, e->uid, e->gid) != OMNIC_OK) {
+                    (*failed)++;
+                    if (!err_set) {
+                        omnic_set_error("cannot set owner: %s", dst);
+                        err_set = 1;
+                    }
+                }
+            } else {
+                owner_skipped++;
+            }
+        }
+        if (e->xattr != NULL) {
+            size_t pos = 0;
+            const char *nm = NULL;
+            const unsigned char *val = NULL;
+            size_t nl = 0, vl = 0;
+            int r;
+            while ((r = omnic_fs_xattr_next(e->xattr, e->xattr_len, &pos, &nm, &nl, &val, &vl)) == 1) {
+                char name[512];
+                if (nl >= sizeof(name)) { r = -1; break; }
+                memcpy(name, nm, nl);
+                name[nl] = '\0';
+                if (omnic_fs_set_xattr(dst, name, val, vl) != OMNIC_OK) {
+                    (*failed)++;
+                    if (!err_set) {
+                        omnic_set_error("cannot set extended attribute %s: %s", name, dst);
+                        err_set = 1;
+                    }
+                }
+            }
+            if (r != 0) { (*failed)++; } /* 解析时已校验过，走到这里只能是内部不一致 */
+        }
+        free(dst);
+    }
+    if (!quiet && owner_skipped > 0)
+        fprintf(stderr, "omnic: owner not restored on %zu entries (needs root)\n", owner_skipped);
 }
 
 /* unpack_core：整树提取 / --file 过滤提取 / --verify 校验三种形态共用。

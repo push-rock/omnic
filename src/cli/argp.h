@@ -13,6 +13,9 @@ typedef struct omnic_args {
     const char **only; /* unpack --file 收集（归档内路径） */
     int n_only;
     int only_cap;
+    const char **exclude; /* pack --exclude 收集（可重复） */
+    int n_exclude;
+    int exclude_cap;
 } omnic_args;
 
 /* 返回 0 成功；1 用法错误（错误消息已打印到 stderr）。 */

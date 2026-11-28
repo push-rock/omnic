@@ -36,6 +36,8 @@ static void usage(FILE *out) {
           "  --no-skip           pack: compress already-compressed assets too\n"
            "  --strict            pack: fail if any entry had to be skipped (links, special files)\n"
            "  --ctime             pack: also store creation times\n"
+           "  --xattr             pack: also store POSIX extended attributes\n"
+           "  --exclude <pattern> pack: leave out matching entries (repeatable; dir/ drops the subtree)\n"
           "  --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)\n"
           "  --file <pattern>    unpack: extract entries (exact path, dir/ prefix, or * glob; repeatable)\n"
           "  --list              unpack: list entries without extracting\n"

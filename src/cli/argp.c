@@ -35,6 +35,14 @@ static void push_only(omnic_args *a, const char *f) {
     a->only[a->n_only++] = f;
 }
 
+static void push_exclude(omnic_args *a, const char *f) {
+    if (a->n_exclude == a->exclude_cap) {
+        a->exclude_cap = a->exclude_cap ? a->exclude_cap * 2 : 8;
+        a->exclude = (const char **)realloc(a->exclude, sizeof(char *) * (size_t)a->exclude_cap);
+    }
+    a->exclude[a->n_exclude++] = f;
+}
+
 static int need_value(int argc, char **argv, int *i, const char **out, const char *flag) {
     if (*i + 1 >= argc) {
         fprintf(stderr, "omnic: option '%s' requires a value\n", flag);
@@ -63,6 +71,11 @@ static int parse_long_opt(omnic_args *a, int argc, char **argv, int *i) {
         a->opts.flags |= OMNIC_F_STRICT;
     } else if (strcmp(arg, "--ctime") == 0) {
         a->opts.flags |= OMNIC_F_CTIME;
+    } else if (strcmp(arg, "--xattr") == 0) {
+        a->opts.flags |= OMNIC_F_XATTR;
+    } else if (strcmp(arg, "--exclude") == 0) {
+        if (need_value(argc, argv, i, &v, arg) != 0) return 1;
+        push_exclude(a, v);
     } else if (strcmp(arg, "--list") == 0) {
         a->opts.flags |= OMNIC_F_LIST;
     } else if (strcmp(arg, "--verify") == 0) {
@@ -225,9 +238,15 @@ int omnic_parse_args(int argc, char **argv, omnic_args *a) {
         return 1;
     }
     if (strcmp(a->cmd, "pack") != 0 &&
-        (a->opts.flags & (OMNIC_F_STRICT | OMNIC_F_CTIME)) != 0) {
-        fprintf(stderr, "omnic: --strict and --ctime only apply to pack\n");
+        (a->opts.flags & (OMNIC_F_STRICT | OMNIC_F_CTIME | OMNIC_F_XATTR)) != 0) {
+        fprintf(stderr, "omnic: --strict, --ctime and --xattr only apply to pack\n");
         return 1;
     }
+    if (strcmp(a->cmd, "pack") != 0 && a->n_exclude > 0) {
+        fprintf(stderr, "omnic: --exclude only applies to pack\n");
+        return 1;
+    }
+    a->opts.exclude = a->exclude;
+    a->opts.n_exclude = (size_t)a->n_exclude;
     return 0;
 }

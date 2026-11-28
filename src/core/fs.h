@@ -36,6 +36,10 @@ typedef struct {
     unsigned attrs;                 /* OMNIC_FS_ATTR_*；POSIX 上 0 */
     int has_mode;                   /* 1 = mode 有效（0000 也是合法的权限位，不能拿 0 判有无） */
     unsigned long long dev, ino;    /* 文件身份（硬链接识别）；未知为 0 */
+    unsigned uid, gid;              /* POSIX 属主/属组；Windows 上 0 */
+    int has_owner;                  /* 1 = uid/gid 有效 */
+    unsigned char *xattr;           /* POSIX 扩展属性，连续的 [name_len u16][name][val_len u32][value] 记录；无则 NULL */
+    size_t xattr_len;
     int is_dir;
     int link_kind;                  /* OMNIC_FS_LINK_*；非链接为 0 */
     char *link_target;              /* 链接目标，原样；非链接为 NULL */
@@ -45,7 +49,25 @@ typedef struct {
 typedef struct {
     long long mtime, ctime;
     unsigned mode, attrs;
+    unsigned uid, gid; /* 仅 POSIX：非 0 才尝试恢复；没有权限（非 root）时静默跳过 */
 } omnic_fs_meta;
+
+/* 把一条扩展属性追加到连续缓冲区（*buf 由本函数 realloc 并拥有）。返回 0=成功 */
+int omnic_fs_xattr_append(unsigned char **buf, size_t *len, const char *name, const void *val,
+                          size_t val_len);
+
+/* 遍历连续缓冲区：*pos 为游标，每条记录都做边界检查。
+ * 返回 1=取到一条，0=正常结束，-1=记录越界或畸形。 */
+int omnic_fs_xattr_next(const unsigned char *buf, size_t len, size_t *pos, const char **name,
+                        size_t *name_len, const unsigned char **val, size_t *val_len);
+
+/* 读出 path 的全部扩展属性，按上面的记录格式放进 *buf（malloc，调用方 free）。
+ * 没有任何扩展属性：*buf=NULL、*len=0、返回 OK。 */
+omnic_status omnic_fs_get_xattrs(const char *path, unsigned char **buf, size_t *len);
+
+/* 恢复一条扩展属性（按路径；作用于链接本身）。失败返回 E_SYSTEM。 */
+omnic_status omnic_fs_set_xattr(const char *path, const char *name, const void *val,
+                                size_t val_len);
 
 /* 未收录进归档的条目：按原因计数，并保留最先遇到的若干条路径（截断存放） */
 #define OMNIC_FS_SKIP_SAMPLES 8
@@ -61,6 +83,12 @@ typedef struct {
 
 /* omnic_fs_walk_ex 的采集项 */
 #define OMNIC_FS_WANT_CTIME 0x1u /* 创建时间：POSIX 上每个条目多一次 statx，按需采集 */
+#define OMNIC_FS_WANT_OWNER 0x2u /* 属主/属组：lstat 顺手就有，零成本 */
+#define OMNIC_FS_WANT_XATTR 0x4u /* 扩展属性：每个条目多两次系统调用（列名 + 逐个读值） */
+
+/* 扩展属性记录（omnic_fs_entry.xattr 的布局，小端）：
+ *   name_len u16 | name（UTF-8，无结尾 NUL）| val_len u32 | value
+ * 一条接一条，直到 xattr_len 用尽。 */
 
 /* 递归枚举 root（不跟随链接）。返回 malloc 条目数组（文件、目录含空目录、链接），
  * *n 出数量；不可读子目录、超长/特殊文件计入跳过数，不中断。失败返回 NULL。 */
@@ -69,6 +97,12 @@ omnic_fs_entry *omnic_fs_walk_ex(const char *root, size_t *n, omnic_fs_skip_repo
 omnic_fs_entry *omnic_fs_walk_report(const char *root, size_t *n, omnic_fs_skip_report *rep);
 omnic_fs_entry *omnic_fs_walk(const char *root, size_t *n, size_t *skipped);
 void omnic_fs_entries_free(omnic_fs_entry *v, size_t n);
+
+/* 当前进程能否改文件的属主（POSIX：仅 root；Windows：恒 0） */
+int omnic_fs_can_chown(void);
+
+/* 改属主/属组（作用于链接本身）。uid/gid 为 0 表示不改。 */
+omnic_status omnic_fs_set_owner(const char *path, unsigned uid, unsigned gid);
 
 /* mkdir -p；路径已存在且为目录视为成功 */
 omnic_status omnic_fs_mkdir_p(const char *path);

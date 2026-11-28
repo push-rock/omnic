@@ -36,7 +36,7 @@ verified 8586/8586 entries, 4 blocks OK
 
 ## 概览
 
-omnic 的主场是混合内容的目录树——游戏资产、项目文件夹、构建产物：逐文件挑算法，已压缩的直接直通。你的工具不认识的格式，它也能直接开。目前还不支持加密和图形界面，也还不能完整替代 tar（还没有 `--exclude`，不保存访问控制列表和文件属主）——这些都会在后续版本中陆续支持。当前的全部边界见[它还做不到的事](#它还做不到的事)。
+omnic 的主场是混合内容的目录树——游戏资产、项目文件夹、构建产物：逐文件挑算法，已压缩的直接直通。你的工具不认识的格式，它也能直接开。目前还不支持加密和图形界面，也还不能完整替代 tar（不保存访问控制列表）——这些都会在后续版本中陆续支持。当前的全部边界见[它还做不到的事](#它还做不到的事)。
 
 - **开 14 种格式。** gzip、zlib、raw deflate、zstd、xz、lzma、lzip、bzip2、
   lz4、brotli、snappy、compress（`.Z`），以及苹果的 lzfse/lzvn。内置
@@ -127,6 +127,8 @@ options:
   --no-skip           pack: compress already-compressed assets too
   --strict            pack: fail if any entry had to be skipped (links, special files)
   --ctime             pack: also store creation times
+  --xattr             pack: also store POSIX extended attributes
+  --exclude <pattern> pack: leave out matching entries (repeatable; dir/ drops the subtree)
   --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)
   --file <pattern>    unpack: extract entries (exact path, dir/ prefix, or * glob; repeatable)
   --list              unpack: list entries without extracting
@@ -243,15 +245,17 @@ omnic 不带任何新算法：单文件模式只是路由到某个 codec——�
 
 截至 v0.3.3 的边界——把它用于备份之前请先读这一节。
 
-- **还不是完整的 tar 替代品。** 没有 `--exclude`，不保存访问控制列表、NTFS 备用
-  数据流和文件属主，也没有加密——都排在后续版本。7-Zip 的格式广度和 25 年
-  成熟度，omnic 目前确实还没有。
-- **链接和权限保住了，还有些没保住。** 符号链接、目录联接、硬链接都能原样往返，
-  POSIX 权限位和 Windows 的只读、隐藏、系统属性也可以；加 `--ctime` 连创建
-  时间一起存。FIFO、设备文件和 omnic 不认识的重解析点会被留下，`pack` 会说出来
-  ——跳过了几个、属于哪一类、前八个的名字；加 `--strict` 则直接判为失败（退出
-  码 2），什么都不写。在 Windows 上创建文件符号链接需要开发者模式或管理员权限，
-  没有的话这些条目会如实计为失败。
+- **还不是完整的 tar 替代品。** 不保存访问控制列表和 NTFS 备用数据流，也没有
+  加密——都排在后续版本。7-Zip 的格式广度和 25 年成熟度，omnic 目前确实还没有。
+- **链接、权限、属主和扩展属性都保住了。** 符号链接、目录联接、硬链接都能原样
+  往返，POSIX 权限位和 Windows 的只读、隐藏、系统属性也可以。`--ctime` 连创建
+  时间一起存，`--xattr` 连 POSIX 扩展属性一起存；文件属主总是存下来，以 root
+  解包时恢复（普通用户解出来的文件归自己所有，并有一行提示，和 `tar` 一样）。
+  这些都放在一块可选的区域里，不认识它的旧版读取端直接跳过，文件照常解出。
+  `--exclude` 按模式排除条目（`*.o`、`node_modules/`）。FIFO、设备文件和 omnic
+  不认识的重解析点也会被留下，`pack` 会说出来——跳过了几个、属于哪一类、前八个
+  的名字；加 `--strict` 则直接判为失败（退出码 2），什么都不写。在 Windows 上
+  创建文件符号链接需要开发者模式或管理员权限，没有的话这些条目会如实计为失败。
 - **只恢复文件的时间。** 目录的修改时间不恢复：往目录里写文件本身就会刷新它，
   只有空目录保得住。与其半保半丢，不如都不保。
 - **它不开 zip、7z、rar 归档。** 那 14 种是单流压缩格式；omnic 自己读写

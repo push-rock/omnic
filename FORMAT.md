@@ -42,7 +42,8 @@ relative to `data_off`; footer offsets are absolute file offsets.
 | 12  | 4    | n_blocks | ≥ 0 (0 = empty archive) |
 | 16  | 4    | n_entries| ≥ 0 |
 | 20  | 4    | data_off | 32 (readers refuse any other value) |
-| 24  | 8    | reserved | 0 (readers ignore non-zero) |
+| 24  | 4    | ext_off  | v2: file offset of the extension area; 0 = there is none. v1: 0 |
+| 28  | 4    | ext_crc32| v2: CRC-32 of the extension area's bytes; 0 when `ext_off` is 0 (one without the other is refused) |
 
 ## Data region and blocks
 
@@ -141,6 +142,48 @@ In v2 the 32-bit counts in the header are the only counts, and they must
 match the index exactly: the reader refuses an archive whose entry table
 runs past the end of the index or leaves bytes unread.
 
+## Extension area (v2)
+
+This is where metadata that not every archive has goes: file ownership and
+POSIX extended attributes. It was added without a version change, and that
+is the point of its design — an older v2 reader that knows nothing about it
+simply never looks at header bytes 24..32, opens the archive, and extracts
+every file; it just does not restore owners or xattrs.
+
+- **Layout:** `[Data][Index][Extension area][Footer]`. The area starts
+  exactly where the index ends and stops exactly where the footer starts.
+  The header's `ext_off` must equal `index_off + index_comp_size`; the
+  length is not stored anywhere, it follows from the two positions.
+- **Contents (uncompressed, covered by `ext_crc32`):** a list of records,
+  one per entry that has extension data, in ascending entry-index order:
+
+  | field       | size | meaning |
+  |-------------|-----:|---------|
+  | entry_index | 4    | index into the EntryTable |
+  | payload_len | 4    | bytes of payload that follow |
+  | payload     | …    | tag-length-value records, below |
+
+- **Payload tags:**
+
+  | tag  | value |
+  |------|-------|
+  | 0x01 | `uid`: 4 bytes, the owning user (never 0) |
+  | 0x02 | `gid`: 4 bytes, the owning group (never 0) |
+  | 0x10 | xattr blob: 4-byte length, then one or more records of `name_len u16`, `name` (UTF-8), `val_len u32`, `value` |
+
+  Each tag may appear at most once per entry; the xattr records must fill
+  their declared length exactly. An unknown tag, a duplicate, an entry index
+  out of range or out of order, or a CRC mismatch makes the whole archive
+  invalid — it is never "ignored".
+- **When it is absent:** an archive packed from a tree with no owners or
+  xattrs to keep (any Windows tree, by default) has `ext_off = 0` and is
+  byte-for-byte the length it would be without this feature.
+- **Restoring:** owners are only restored by a reader running as root; a
+  plain user gets the files with their own ownership and a note, which is
+  what `tar` does. `ext_off` is 32 bits, so an archive larger than 4 GiB
+  cannot carry an extension area; `pack` then leaves it out rather than
+  write a truncated offset.
+
 ## Codec ids (`fmt`)
 
 | id | codec | stream |
@@ -237,19 +280,29 @@ which needs no privilege, and the summary says so.
   than symlinks and junctions (cloud-file placeholders, dedup, app execution
   aliases). `pack` reports every entry it skips; `--strict` turns a skip
   into a failure.
-- Not stored: ACLs, NTFS alternate data streams, POSIX extended attributes,
-  file ownership (uid/gid).
+- Not stored: ACLs, NTFS alternate data streams. Owners and POSIX extended
+  attributes are stored in the extension area (see above); xattrs only with
+  `pack --xattr`.
 - Memory: pack ≈ max(block size, index plaintext); unpack ≈ same.
 
 ## Compatibility promise
 
 v1 is frozen: published fields never reorder, published semantics never
 change, and every v1 archive stays readable. v2 is the current version and
-is held to the same promise from now on. The rule for whatever comes next:
-a new field is a new version number, never a new flag bit. The reserved
-bytes (header 24..32, footer 28..32) are the only thing a reader ignores;
-everything else it either honours or refuses. The index codec is fixed at
-zstd so that a decoder only ever needs one index decompressor. The
-reference implementation lives in this repository
+is held to the same promise from now on. Two rules govern what comes next:
+
+1. **Never add a field to an existing record, and never a new flag bit.**
+   A change to the header, the footer, the block table or the entry records
+   is a new version number.
+2. **New metadata goes into the extension area.** It carries its own
+   tags, so it can grow without touching anything a v2 reader already
+   parses. An older v2 reader opens such an archive and extracts every
+   file; it just does not restore what it does not know. A reader that
+   knows the area refuses one it cannot fully parse — unknown tag, bad
+   order, bad CRC — rather than guess.
+
+The only bytes a reader ignores are the footer's last four. The index
+codec is fixed at zstd so that a decoder only ever needs one index
+decompressor. The reference implementation lives in this repository
 (`src/core/archive.c`); the container is deliberately small enough to
 reimplement independently in an afternoon.

@@ -4,6 +4,39 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
 
 ## [Unreleased]
 
+### Added — extension area: file owners, POSIX xattrs, `--exclude`
+
+- Owners (uid/gid) are now stored for every entry and restored when
+  unpacking as root; a plain user gets the files under their own name and a
+  note, as with `tar`. `pack --xattr` stores POSIX extended attributes
+  (macOS quarantine tags, Linux capabilities). `pack --exclude` leaves
+  matching entries out: `*` and `?` globs, or a trailing `/` to drop a whole
+  subtree (`node_modules/`).
+- These live in a new **extension area** between the index and the footer,
+  pointed at by header bytes that were reserved until now. The format
+  version stays 2: an older v2 reader never looks there, opens the archive
+  and extracts every file — it just does not restore owners or xattrs. A
+  reader that knows the area refuses one it cannot fully parse (unknown
+  tag, bad order, bad CRC) rather than guess. [FORMAT.md](FORMAT.md) has the
+  layout, and its compatibility rule now says it plainly: new metadata goes
+  into this area, never into an existing record.
+- An archive with nothing to put there (any Windows tree by default) is
+  byte-for-byte the same length as before.
+- Tests: `--exclude` in all three match forms, a hand-built extension area
+  (which doubles as proof the spec can be implemented from), seven
+  malformed shapes that must each be refused outright. The bit-flip sweep
+  got stricter: header bytes 24..32 used to be ignorable reserved bytes,
+  now every flip there is caught.
+
+### Fixed — magic detection and `--file` paths
+
+- snappy streams were identified by the wrong bytes ("SNPA" instead of the
+  framing format's "sNaPpY"), lzfse only by one of its three block magics,
+  and lzvn by a "bvn" prefix that does not exist. Files without an
+  extension in those formats are now recognised.
+- `--file sub\file.txt` on Windows never matched, because entry names are
+  stored with `/`. Backslashes are normalised before matching.
+
 ### Added — format v2: links, permissions, hard links, 32-bit counts
 
 - `.omnic` archives now keep what a backup needs and v1 dropped on the
