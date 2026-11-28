@@ -2029,6 +2029,354 @@ static void test_ext_area(void) {
     remove(A);
 }
 
+static void test_index_mirror(void) {
+    /* pack --mirror 在头部之后再存一份索引。要测四种情形：
+     *   完好归档与不带镜像的行为逐项相同；
+     *   尾部索引被破坏（文件长度不变）→ 从镜像读，全部解出；
+     *   尾部被截掉 → 从镜像读，数据区完整的块照常解出，被截到的块按坏块报告；
+     *   镜像坏了、尾部完好 → 照常工作，镜像不被用到。 */
+    const char *T = "omnic_arc_mi", *A = "omnic_arc_mi.omnic", *B = "omnic_arc_mi_p.omnic";
+    const char *O = "omnic_arc_mi_out";
+    rm_tree(T);
+    rm_tree(O);
+    omnic_fs_mkdir_p(T);
+    /* 几个足够大的可压缩文件，各占一块：--per-file 保证一块一文件 */
+    static char big[64 * 1024];
+    for (int i = 0; i < 5; i++) {
+        char p[64];
+        fill_text(big, sizeof(big));
+        snprintf(p, sizeof(p), "omnic_arc_mi/f%d.txt", i);
+        wfile(p, big, sizeof(big));
+    }
+    omnic_options m = mkopts(OMNIC_F_QUIET | OMNIC_F_MIRROR | OMNIC_F_PER_FILE, 0);
+    CHECK(pack_tree(T, A, m) == OMNIC_OK);
+    CHECK(pack_tree(T, B, mkopts(OMNIC_F_QUIET | OMNIC_F_PER_FILE, 0)) == OMNIC_OK);
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+
+    /* 头部：data_off > 32，其后是镜像魔数；镜像里的索引长度 ≤ 预留区 */
+    size_t n = 0;
+    unsigned char *b = slurp(A, &n);
+    CHECK(b != NULL);
+    uint32_t data_off = 0;
+    if (b != NULL) {
+        data_off = rd32(b + 20);
+        CHECK(data_off > 32);
+        CHECK(memcmp(b + 32, "OMNICMIR", 8) == 0);
+        uint64_t mlen = 0;
+        for (int i = 0; i < 8; i++) mlen |= (uint64_t)b[40 + i] << (8 * i);
+        CHECK(mlen > 0 && mlen <= data_off - 64);
+        /* 镜像里的压缩索引必须与尾部的那份逐字节相同 */
+        uint64_t io = 0, ic = 0;
+        for (int i = 0; i < 8; i++) io |= (uint64_t)b[n - 24 + i] << (8 * i);
+        for (int i = 0; i < 8; i++) ic |= (uint64_t)b[n - 16 + i] << (8 * i);
+        CHECK(ic == mlen);
+        CHECK(memcmp(b + 64, b + io, (size_t)ic) == 0);
+    }
+
+    /* 完好：与不带镜像的归档行为相同 */
+    CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK);
+    CHECK(unpack_arc(A, O, o) == OMNIC_OK);
+    CHECK(tree_equal(T, O));
+    rm_tree(O);
+    {
+        size_t n2 = 0;
+        unsigned char *pb = slurp(B, &n2);
+        CHECK(pb != NULL);
+        if (pb != NULL) CHECK(rd32(pb + 20) == 32); /* 不带镜像：data_off 仍是 32 */
+        free(pb);
+    }
+
+    /* 情形 1：尾部索引被破坏，文件长度不变 → 从镜像读，全部解出 */
+    if (b != NULL) {
+        uint64_t io = 0, ic = 0;
+        for (int i = 0; i < 8; i++) io |= (uint64_t)b[n - 24 + i] << (8 * i);
+        for (int i = 0; i < 8; i++) ic |= (uint64_t)b[n - 16 + i] << (8 * i);
+        for (uint64_t i = io; i < io + ic; i++) b[i] ^= 0xFF;
+        FILE *f = fopen(A, "wb");
+        CHECK(f != NULL);
+        if (f != NULL) { fwrite(b, 1, n, f); fclose(f); }
+    }
+    CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK);
+    CHECK(unpack_arc(A, O, o) == OMNIC_OK);
+    CHECK(tree_equal(T, O));
+    rm_tree(O);
+
+    /* 情形 2：尾部被截掉（只留前 70%：镜像完好、部分数据块被截）→ 仍能列出全部；
+     * 数据区完整的块解出，被截的块按坏块报告，退出码 2 */
+    CHECK(pack_tree(T, A, m) == OMNIC_OK);
+    {
+        unsigned char *fb = slurp(A, &n);
+        CHECK(fb != NULL);
+        if (fb != NULL) {
+            size_t keep = n * 7 / 10;
+            CHECK(keep > data_off); /* 截断点落在数据区里 */
+            FILE *f = fopen(A, "wb");
+            CHECK(f != NULL);
+            if (f != NULL) { fwrite(fb, 1, keep, f); fclose(f); }
+        }
+        free(fb);
+    }
+    /* 同样的截断对不带镜像的归档是全损：连校验都过不了 */
+    {
+        size_t n2 = 0;
+        unsigned char *pb = slurp(B, &n2);
+        CHECK(pb != NULL);
+        if (pb != NULL) {
+            FILE *f = fopen(B, "wb");
+            CHECK(f != NULL);
+            if (f != NULL) { fwrite(pb, 1, n2 * 7 / 10, f); fclose(f); }
+        }
+        free(pb);
+        omnic_options q = mkopts(OMNIC_F_QUIET, 0);
+        CHECK(omnic_arc_verify(B, &q, &g_rep) != OMNIC_OK);
+    }
+    {
+        /* --list 不解数据，只要索引在就能列全：stdout 捕获后数行数 */
+        int saved = dup(1);
+        FILE *h = omnic_fs_fopen("omnic_arc_mi_list.txt", "wb");
+        CHECK(h != NULL);
+        if (h != NULL) {
+            dup2(fileno(h), 1);
+            static const omnic_options lo = {.profile = OMNIC_PROFILE_BALANCED, .codec = NULL,
+                                             .level = 0, .threads = 0, .flags = 0u,
+                                             .output_dir = NULL, .block_mib = 0};
+            CHECK(omnic_arc_list(A, &lo) == OMNIC_OK);
+            fflush(stdout);
+            dup2(saved, 1);
+            close(saved);
+            fclose(h);
+            h = omnic_fs_fopen("omnic_arc_mi_list.txt", "rb");
+            int nl = 0;
+            char line[512];
+            while (h != NULL && fgets(line, sizeof(line), h) != NULL) nl++;
+            if (h != NULL) fclose(h);
+            CHECK(nl >= 6); /* 5 个文件 + 汇总行 */
+        } else {
+            dup2(saved, 1);
+            close(saved);
+        }
+        remove("omnic_arc_mi_list.txt");
+    }
+    CHECK(unpack_arc(A, O, o) == OMNIC_E_DATA); /* 有被截到的块：按坏块口径 */
+    {
+        /* 数据区里完整的块必须解出来了。块的顺序由分桶决定（大桶在前），不等于文件名顺序，
+         * 所以这里不点名：数一数解出了几个、逐个与原文件比对，至少要有完整的、也要有缺的。 */
+        int whole = 0, differ = 0;
+        for (int i = 0; i < 5; i++) {
+            char p[64], q[64];
+            snprintf(p, sizeof(p), "omnic_arc_mi/f%d.txt", i);
+            snprintf(q, sizeof(q), "omnic_arc_mi_out/f%d.txt", i);
+            if (!file_exists(q)) continue;
+            if (files_equal(p, q)) whole++;
+            else differ++;
+        }
+        CHECK(whole >= 1); /* 截断点之前至少有一个完整的块 */
+        CHECK(whole < 5);  /* 被截到的块没有被当成完好 */
+        CHECK(differ == 0); /* 解出来的一半截断文件：要么完整，要么没有 */
+    }
+    rm_tree(O);
+
+    /* 情形 3：镜像本身被破坏、尾部完好 → 照常工作 */
+    CHECK(pack_tree(T, A, m) == OMNIC_OK);
+    {
+        unsigned char *fb = slurp(A, &n);
+        CHECK(fb != NULL);
+        if (fb != NULL) {
+            for (int i = 0; i < 64; i++) fb[64 + i] ^= 0xFF;
+            FILE *f = fopen(A, "wb");
+            CHECK(f != NULL);
+            if (f != NULL) { fwrite(fb, 1, n, f); fclose(f); }
+        }
+        free(fb);
+    }
+    CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK);
+    CHECK(unpack_arc(A, O, o) == OMNIC_OK);
+    CHECK(tree_equal(T, O));
+    rm_tree(O);
+
+    /* 情形 4：两份索引都坏了 → 明确拒绝，不崩 */
+    {
+        unsigned char *fb = slurp(A, &n);
+        CHECK(fb != NULL);
+        if (fb != NULL) {
+            uint64_t io = 0, ic = 0;
+            for (int i = 0; i < 8; i++) io |= (uint64_t)fb[n - 24 + i] << (8 * i);
+            for (int i = 0; i < 8; i++) ic |= (uint64_t)fb[n - 16 + i] << (8 * i);
+            for (uint64_t i = io; i < io + ic; i++) fb[i] ^= 0xFF;
+            FILE *f = fopen(A, "wb");
+            CHECK(f != NULL);
+            if (f != NULL) { fwrite(fb, 1, n, f); fclose(f); }
+        }
+        free(fb);
+    }
+    CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_E_DATA);
+
+    /* 情形 5：镜像声称的长度越过预留区、伸进数据区，CRC 按越界后的内容重算、能对上。
+     * 它会被"解压后的明文必须恰好用完"这条校验拒绝（多出来的字节解压后成了尾巴）。
+     * 读取端另有一条"镜像长度不得超出预留区"的检查，它排在这两道防线之后、不可单独触发，
+     * 是纵深防御——变异验收抓不到它是对的，见 archive.c 的注释。 */
+    CHECK(pack_tree(T, A, m) == OMNIC_OK);
+    {
+        unsigned char *fb = slurp(A, &n);
+        CHECK(fb != NULL);
+        if (fb != NULL) {
+            uint64_t mlen = 0, io = 0, ic = 0;
+            for (int i = 0; i < 8; i++) mlen |= (uint64_t)fb[40 + i] << (8 * i);
+            for (int i = 0; i < 8; i++) io |= (uint64_t)fb[n - 24 + i] << (8 * i);
+            for (int i = 0; i < 8; i++) ic |= (uint64_t)fb[n - 16 + i] << (8 * i);
+            mlen += 1; /* 多读一个字节：真实的索引 + 数据区的第一个字节 */
+            for (int i = 0; i < 8; i++) fb[40 + i] = (unsigned char)(mlen >> (8 * i));
+            uint32_t crc = omnic_crc32(0, fb + 64, (size_t)mlen);
+            for (int i = 0; i < 4; i++) fb[48 + i] = (unsigned char)(crc >> (8 * i));
+            for (uint64_t i = io; i < io + ic; i++) fb[i] ^= 0xFF; /* 尾部弄坏，逼它用镜像 */
+            FILE *f = fopen(A, "wb");
+            CHECK(f != NULL);
+            if (f != NULL) { fwrite(fb, 1, n, f); fclose(f); }
+        }
+        free(fb);
+    }
+    CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_E_DATA);
+
+    free(b);
+    rm_tree(T);
+    remove(A);
+    remove(B);
+}
+
+/* 坏块里的抢救：store 块的块 CRC 挂了，不再整块放弃——每个条目自带的 CRC 仍然可信，
+ * 只有真正坏掉的字节所在的那个文件丢，其余照常写出。压缩块不行：块 CRC 错意味着
+ * 解压结果不可信，整块丢弃是对的（对照项）。 */
+static void test_store_salvage(void) {
+    const char *T = "omnic_arc_sv", *A = "omnic_arc_sv.omnic", *O = "omnic_arc_sv_out";
+    rm_tree(T);
+    rm_tree(O);
+    omnic_fs_mkdir_p(T);
+    /* 直通进 store 块的内容：带 PNG 魔数的文件被 omnic_classify_magic 判成"已压缩资产"，
+     * 不走压缩。别靠"看起来随机"的数据——LCG 的输出 zstd 一眼看穿，会被压成几百字节。 */
+    static unsigned char rnd[4096];
+    for (int i = 0; i < 6; i++) {
+        char p[64];
+        static const unsigned char png[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+        memcpy(rnd, png, 8);
+        for (size_t k = 8; k < sizeof(rnd); k++) rnd[k] = (unsigned char)rng();
+        rnd[9] = (unsigned char)i; /* 让六个文件各不相同 */
+        snprintf(p, sizeof(p), "omnic_arc_sv/r%d.bin", i);
+        wfile(p, rnd, sizeof(rnd));
+    }
+    omnic_options o = mkopts(OMNIC_F_QUIET, 0);
+    CHECK(pack_tree(T, A, o) == OMNIC_OK);
+
+    /* 找到 store 块在文件里的位置：从 --list 拿不到偏移，直接在数据区里定位——
+     * 用"翻转后报 fmt 0 的坏块"来确认落在了 store 块里 */
+    size_t n = 0;
+    unsigned char *good = slurp(A, &n);
+    CHECK(good != NULL);
+    if (good == NULL) { rm_tree(T); return; }
+    uint32_t data_off = rd32(good + 20);
+    int found = 0;
+    /* 从数据区起点开始逐 64 字节探：store 块在压缩块之前（最大的桶排最前），
+     * 翻转后 --verify 的坏块报告里会写 fmt 0 */
+    for (size_t pos = data_off + 64; pos < data_off + 4096 && !found; pos += 64) {
+        unsigned char *bb = (unsigned char *)malloc(n);
+        CHECK(bb != NULL);
+        if (bb == NULL) break;
+        memcpy(bb, good, n);
+        bb[pos] ^= 0xFF;
+        FILE *f = fopen(A, "wb");
+        if (f != NULL) { fwrite(bb, 1, n, f); fclose(f); }
+        free(bb);
+        int saved = dup(2);
+        FILE *h = omnic_fs_fopen("omnic_arc_sv_err.txt", "wb");
+        CHECK(h != NULL);
+        if (h != NULL) {
+            dup2(fileno(h), 2);
+            /* 不能带 QUIET：report_bad_block 在 quiet 下什么都不打印，探测就瞎了 */
+            omnic_options q = mkopts(0, 0);
+            memset(&g_rep, 0, sizeof(g_rep));
+            omnic_arc_verify(A, &q, &g_rep);
+            fflush(stderr);
+            dup2(saved, 2);
+            close(saved);
+            fclose(h);
+            h = omnic_fs_fopen("omnic_arc_sv_err.txt", "rb");
+            char line[512];
+            int is_store = 0;
+            while (h != NULL && fgets(line, sizeof(line), h) != NULL)
+                if (strstr(line, "(fmt 0) corrupted") != NULL) is_store = 1;
+            if (h != NULL) fclose(h);
+            if (is_store) found = 1;
+        } else {
+            close(saved);
+        }
+        remove("omnic_arc_sv_err.txt");
+    }
+    CHECK(found == 1); /* 探到了 store 块 */
+    if (!found) { free(good); rm_tree(T); remove(A); return; }
+
+    /* 就用这一份损坏的归档：store 块里翻了一个字节 */
+    {
+        int saved = dup(2);
+        FILE *h = omnic_fs_fopen("omnic_arc_sv_err.txt", "wb");
+        CHECK(h != NULL);
+        if (h != NULL) dup2(fileno(h), 2);
+        memset(&g_rep, 0, sizeof(g_rep));
+        omnic_status st = unpack_arc(A, O, o);
+        fflush(stderr);
+        if (h != NULL) { dup2(saved, 2); close(saved); fclose(h); } else { close(saved); }
+        remove("omnic_arc_sv_err.txt");
+        CHECK(st == OMNIC_E_DATA); /* 有文件坏了：退出码 2，不装没事 */
+        CHECK(g_rep.out_bytes == 5 * sizeof(rnd)); /* 六个里写出五个 */
+    }
+    {
+        int whole = 0;
+        for (int i = 0; i < 6; i++) {
+            char p[64], q[64];
+            snprintf(p, sizeof(p), "omnic_arc_sv/r%d.bin", i);
+            snprintf(q, sizeof(q), "omnic_arc_sv_out/r%d.bin", i);
+            if (file_exists(q) && files_equal(p, q)) whole++;
+        }
+        CHECK(whole == 5);      /* 坏字节所在的那个文件没了，其余完好 */
+    }
+    rm_tree(O);
+
+    /* 对照：压缩块坏了仍是整块丢弃。用可压缩文本 + 默认分块，翻压缩块里的一个字节 */
+    {
+        const char *T2 = "omnic_arc_sv2", *A2 = "omnic_arc_sv2.omnic", *O2 = "omnic_arc_sv2_out";
+        rm_tree(T2);
+        rm_tree(O2);
+        omnic_fs_mkdir_p(T2);
+        static char txt[64 * 1024];
+        for (int i = 0; i < 6; i++) {
+            char p[64];
+            fill_text(txt, sizeof(txt));
+            snprintf(p, sizeof(p), "omnic_arc_sv2/t%d.txt", i);
+            wfile(p, txt, sizeof(txt));
+        }
+        CHECK(pack_tree(T2, A2, o) == OMNIC_OK);
+        size_t n2 = 0;
+        unsigned char *g2 = slurp(A2, &n2);
+        CHECK(g2 != NULL);
+        if (g2 != NULL) {
+            /* 压缩流从块起点开始：翻转数据区最前面的字节（压缩块是唯一一个块） */
+            g2[rd32(g2 + 20) + 8] ^= 0xFF;
+            FILE *f = fopen(A2, "wb");
+            CHECK(f != NULL);
+            if (f != NULL) { fwrite(g2, 1, n2, f); fclose(f); }
+        }
+        memset(&g_rep, 0, sizeof(g_rep));
+        CHECK(unpack_arc(A2, O2, o) == OMNIC_E_DATA);
+        CHECK(g_rep.out_bytes == 0); /* 整块丢弃：一个都没写出 */
+        free(g2);
+        rm_tree(T2);
+        rm_tree(O2);
+        remove(A2);
+    }
+
+    free(good);
+    rm_tree(T);
+    remove(A);
+}
+
 int main(void) {
     test_roundtrip();
     test_roundtrip_edges();
@@ -2055,6 +2403,8 @@ int main(void) {
     test_index_fuzz();
     test_exclude();
     test_ext_area();
+    test_index_mirror();
+    test_store_salvage();
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

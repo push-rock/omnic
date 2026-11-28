@@ -684,6 +684,13 @@ int omnic_fs_path_inside(const char *root_abs, const char *path_abs) {
 /* Windows 上没有 POSIX 意义的属主与扩展属性：一律"没有/不能"，归档里就不会出现这些数据 */
 int omnic_fs_can_chown(void) { return 0; }
 
+int omnic_fs_is_dir(const char *path) {
+    wchar_t wp[WIN_PATH_MAX];
+    if (win_abspath(path, wp, WIN_PATH_MAX) == 0) return 0;
+    DWORD at = GetFileAttributesW(wp);
+    return (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_DIRECTORY) != 0) ? 1 : 0;
+}
+
 omnic_status omnic_fs_set_owner(const char *path, unsigned uid, unsigned gid) {
     (void)path; (void)uid; (void)gid;
     return OMNIC_E_SYSTEM;
@@ -767,6 +774,11 @@ static char *read_link_alloc(const char *path) {
  * 读一个属性失败不致命：跳过它，剩下的照存。 */
 
 int omnic_fs_can_chown(void) { return geteuid() == 0 ? 1 : 0; }
+
+int omnic_fs_is_dir(const char *path) {
+    struct stat st;
+    return (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) ? 1 : 0;
+}
 
 omnic_status omnic_fs_set_owner(const char *path, unsigned uid, unsigned gid) {
     if (lchown(path, (uid_t)uid, (gid_t)gid) == 0) return OMNIC_OK;

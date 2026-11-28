@@ -101,6 +101,9 @@ void omnic_fs_entries_free(omnic_fs_entry *v, size_t n);
 /* 当前进程能否改文件的属主（POSIX：仅 root；Windows：恒 0） */
 int omnic_fs_can_chown(void);
 
+/* path 是不是目录（不存在或不是目录返回 0） */
+int omnic_fs_is_dir(const char *path);
+
 /* 改属主/属组（作用于链接本身）。uid/gid 为 0 表示不改。 */
 omnic_status omnic_fs_set_owner(const char *path, unsigned uid, unsigned gid);
 

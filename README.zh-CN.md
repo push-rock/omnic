@@ -129,6 +129,7 @@ options:
   --ctime             pack: also store creation times
   --xattr             pack: also store POSIX extended attributes
   --exclude <pattern> pack: leave out matching entries (repeatable; dir/ drops the subtree)
+  --mirror            pack: keep a second copy of the index so a truncated archive still yields its intact files
   --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)
   --file <pattern>    unpack: extract entries (exact path, dir/ prefix, or * glob; repeatable)
   --list              unpack: list entries without extracting
@@ -186,14 +187,18 @@ Silesia（202 MiB，12 个内容域混合文件，均无扩展名——每个决
 
   ```console
   $ omnic unpack gamedir.omnic              # 这个归档里被翻转了一个字节
-  omnic: block 0 (fmt 0) corrupted — skipped, affected: luanti-5.16.1-win64/textures/base/pack/air.png …
-  omnic: extracted 7435/8586 entries (1151 failed)
+  omnic: block 0 (fmt 0) corrupted — checking entries one by one, affected: luanti-5.16.1-win64/textures/base/pack/air.png …
+  omnic: entry corrupted — skipped: luanti-5.16.1-win64/textures/base/pack/aux1_btn.png
+  omnic: extracted 8585/8586 entries (1 failed)
   $ echo $?
   2
   ```
 
-  那个块装着 1,151 个文件；其余 7,435 个解出并通过了校验。块有多大——以及
-  这与 zip、与 solid 的 `tar.xz` 相比如何——写在[它还做不到的事](#它还做不到的事)里。
+  那个字节落在一个装着 1,151 个已压缩文件的 store 块里。块的校验和挂了，
+  但每个文件自带校验和，于是解包器把 1,151 个挨个核对，写出了通过的 1,150 个。
+  坏掉的那个点了名，退出码是 2，别的谁也没被连累。坏在*压缩*块里仍然丢
+  整块——这个归档里最多 4,233 个文件——`--per-file` 和 `--block-size`
+  就是为此准备的，见[它还做不到的事](#它还做不到的事)。
 
 <details>
 <summary>两张图背后的原始数字</summary>
@@ -262,14 +267,17 @@ omnic 不带任何新算法：单文件模式只是路由到某个 codec——�
   的归档是 `.omnic`。
 - **两端都要用新版 omnic。** 从这一版起格式是 v2；omnic 0.3.x 打开 v2 归档会
   报「需要更新的 omnic」。0.3.x 写的归档照常能读。
-- **索引只有一份，在文件尾部。** 被截断或尾部损坏的归档会被整体拒绝——
-  隔离只覆盖数据块内部的损坏。
-- **爆炸半径是一个块，而块可能很大。** 块上限 64 MiB（`--block-size
+- **默认索引只有一份，在文件尾部。** 被截断或尾部损坏的归档会被整体拒绝——
+  隔离只覆盖数据块内部的损坏。`pack --mirror` 会在头部之后再存一份：被截断的
+  归档仍能列出全部、解出没被截到的每一个块。它占空间（游戏树上 +0.87%），
+  这样的归档也要新版 omnic 才能读，所以不开就没有。
+- **压缩块里坏了，丢的是一个块，而块可能很大。** 块上限 64 MiB（`--block-size
   1..1024`），对小文件成堆的目录树就是几千个文件：上面那个归档里，最大的
-  一个块装着 4,233 个文件。公道地说：zip 只丢受损坏的那一个文件，而单流
-  的 `tar.xz` 或 solid 的 7z 会丢掉坏字节之后的一切。omnic 居中，粒度
-  是块——而块大小由你定。`--per-file` 让每个*被压缩的*文件独占一块；
-  已压缩文件仍共享 store 块，所以在意爆炸半径时把 `--block-size` 也调小。
+  一个块装着 4,233 个文件。store 块里坏了只丢真正碰到的那几个文件。公道地
+  说：zip 只丢受损坏的那一个文件，而单流的 `tar.xz` 或 solid 的 7z 会丢掉坏
+  字节之后的一切。omnic 居中，粒度是块——而块大小由你定。`--per-file` 让每个
+  *被压缩的*文件独占一块；已压缩文件仍共享 store 块，不过那些正是会逐个
+  抢救的。
 - **单流仍然压得更狠。** `tar | xz -9` 在游戏树上到 56.8%（v0.3.3 窗口），
   `best_ratio` 是 63.2%——代价是放弃逐文件路由、直通和毫秒级单文件提取。
 - **Windows 上解包大量小文件比 tar 慢**：8,586 个文件的树，首次测量是

@@ -135,6 +135,15 @@ enum { ARC_T_FILE = 0, ARC_T_DIR = 1, ARC_T_SYMLINK = 2, ARC_T_HARDLINK = 3 };
 #define ARC_EXT_TAG_GID 0x02u    /* gid u32 */
 #define ARC_EXT_TAG_XATTR 0x10u  /* 扩展属性：一条或多条 [name_len u16][name][val_len u32][value] 连续存放 */
 
+/* ---- 索引镜像（FORMAT.md §Index mirror）----
+ * pack --mirror 在头部之后、数据区之前再存一份压缩索引；头部 data_off 指向数据区真实起点。
+ * 没有镜像时 data_off = 32，归档与以前逐字节相同。镜像头 32 字节：
+ *   magic "OMNICMIR" | comp_size u64 | crc32 u32 | reserved u32
+ * 尾部索引损坏或整个尾部被截掉时，读取端退回镜像：数据区未损的块仍可列出、解出。 */
+#define ARC_MIRROR_HDR 32u
+static const uint8_t ARC_MAGIC_M[8] = {'O', 'M', 'N', 'I', 'C', 'M', 'I', 'R'};
+#define ARC_MIRROR_SLACK 64u /* 预留 = 索引明文大小 + 这点余量（zstd 对不可压输入的头部开销） */
+
 #ifndef OMNIC_CODEC_ZSTD
 #error "internal: stub must precede helpers"
 #endif
@@ -172,13 +181,20 @@ typedef struct {
     arc_entry *ent;
     size_t nent;
     unsigned version;
+    uint64_t data_off; /* 数据区起点：无镜像 = 32，带镜像时后移 */
+    int from_mirror;   /* 1 = 索引取自头部镜像（尾部已损坏或被截掉），降级模式 */
+    uint64_t file_size; /* 降级模式下的真实文件长度：越界的块按坏块处理 */
 } arc_index;
 
 static void arc_index_mem_free(arc_index *ix) {
     if (ix == NULL) return;
-    for (size_t i = 0; i < ix->nent; i++) {
-        free(ix->ent[i].name);
-        free(ix->ent[i].xattr);
+    /* ent 可能为 NULL 而 nent 非零：arc_index_parse 在分配条目数组之前就可能拒绝。
+     * 这时不能按 nent 去遍历。 */
+    if (ix->ent != NULL) {
+        for (size_t i = 0; i < ix->nent; i++) {
+            free(ix->ent[i].name);
+            free(ix->ent[i].xattr);
+        }
     }
     free(ix->ent);
     free(ix->blk);
@@ -1411,6 +1427,31 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     /* 桶序统一 qsort（大小降序；store 桶自然沉浮由总量决定）——确定性 */
     qsort(bkts, nb, sizeof(arc_bucket), bucket_cmp);
 
+    /* ---- 索引镜像的预留（pack --mirror）----
+     * 镜像在头部之后、数据区之前，所以大小必须在写第一个数据块之前定下。索引明文 =
+     * 块表(32B/块) + 条目记录；条目记录此刻已完全确定，块数还没切、只能取上界：
+     * 每桶至少一块，每块不超过 block_max，所以 ≤ Σ(⌈桶字节/块上限⌉) + 桶数。
+     * 默认块大小下这个上界只比实际多几行；--per-file 下桶数 = 块数，上界即精确值。 */
+    int want_mirror = (o != NULL && (o->flags & OMNIC_F_MIRROR) != 0);
+    if (want_mirror) {
+        size_t blk_upper = 0;
+        for (size_t bi = 0; bi < nb; bi++)
+            blk_upper += (size_t)((bkts[bi].total + block_max - 1) / block_max) + 1;
+        size_t plain_upper = blk_upper * ARC_BLK_ROW;
+        for (size_t i = 0; i < n; i++) {
+            plain_upper += 2 + strlen(ix.ent[i].name) + ARC_ENT_FIX;
+            if (ix.ent[i].flags & ARC_EF_HAS_LINKTO) plain_upper += 4;
+            if (ix.ent[i].flags & ARC_EF_HAS_CTIME) plain_upper += 8;
+            if (ix.ent[i].flags & ARC_EF_HAS_MODE) plain_upper += 2;
+            if (ix.ent[i].flags & ARC_EF_HAS_ATTRS) plain_upper += 2;
+        }
+        data_off = ARC_HDR + ARC_MIRROR_HDR + plain_upper + ARC_MIRROR_SLACK;
+        arc_pos = data_off;
+        /* 预留区（头部之后、数据区之前）留作零：文件位置必须真的跳过去，
+         * 否则数据块会从 32 开始写、盖住镜像区 */
+        if (arc_seek(f, data_off) != 0) goto io_fail;
+    }
+
     /* ---- 并行块压缩池（T12）：threads 语义与分类池一致（0=默认8、1=串行）。
      * 构块留主线程，压缩重叠进行；回执按派发序收——保序 = 块表/产物与串行一致。
      * 局部量已在函数头声明置零（fail 标签先于本块可达）。 ---- */
@@ -1772,6 +1813,30 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
         goto io_fail;
     }
     uint32_t index_crc = omnic_crc32(0, zbuf, (size_t)zn);
+    /* 索引镜像：趁 zbuf 还在，把同一份压缩索引写进头部之后的预留区。
+     * 不能等 free 之后再从尾部读回来——归档以 "wb" 打开，只写句柄读不了。
+     * 镜像头记真实的压缩长度与 CRC；预留区其余部分保持为零。 */
+    if (want_mirror) {
+        uint8_t mh[ARC_MIRROR_HDR];
+        memset(mh, 0, sizeof(mh));
+        memcpy(mh, ARC_MAGIC_M, 8);
+        put64(mh + 8, zn);
+        put32(mh + 16, index_crc);
+        if (zn > data_off - ARC_HDR - ARC_MIRROR_HDR) { /* 不可能：预留按明文上界算，压缩只会更小 */
+            free(zbuf);
+            omnic_set_error("internal: index larger than its mirror reserve");
+            goto fail;
+        }
+        if (arc_seek(f, ARC_HDR) != 0 || fwrite(mh, 1, sizeof(mh), f) != sizeof(mh) ||
+            fwrite(zbuf, 1, zn, f) != zn) {
+            free(zbuf);
+            goto io_fail;
+        }
+        if (arc_seek(f, index_off + zn) != 0) { /* 回到尾部继续写 */
+            free(zbuf);
+            goto io_fail;
+        }
+    }
     free(zbuf);
     arc_pos += zn;
 
@@ -1816,6 +1881,12 @@ omnic_status omnic_pack(const char *root, const char *archive_path,
     put32(exrow, ext_off);
     put32(exrow + 4, ext_crc);
     if (arc_seek(f, ARC_EXT_OFF) != 0 || fwrite(exrow, 1, 8, f) != 8) goto io_fail;
+    /* data_off：开头按 32 写下，带镜像时数据区后移了，这里改回真实值 */
+    if (data_off != ARC_HDR) {
+        uint8_t dorow[4];
+        put32(dorow, (uint32_t)data_off);
+        if (arc_seek(f, 20) != 0 || fwrite(dorow, 1, 4, f) != 4) goto io_fail;
+    }
     if (arc_seek(f, arc_pos) != 0) goto io_fail; /* 回填后回到尾部写 Footer */
 
     uint8_t ftr[ARC_FTR];
@@ -1871,15 +1942,75 @@ static int arc_file_exists(const char *path) {
     return 1;
 }
 
+/* 读一段压缩索引（zstd 帧 + CRC），解压并解析进 *ix。
+ * tail_ok 非空时回写"这段索引是否完整落在文件内"。 */
+static omnic_status arc_load_index_blob(FILE *f, uint64_t off, uint64_t comp, uint32_t crc,
+                                        uint32_t nent, uint32_t nblk, unsigned version, int has_mtime,
+                                        arc_index *ix) {
+    if (comp == 0 || comp > (1u << 30)) return OMNIC_E_DATA;
+    uint8_t *zbuf = (uint8_t *)malloc((size_t)comp);
+    if (zbuf == NULL) return OMNIC_E_SYSTEM;
+    if (arc_seek(f, off) != 0 || fread(zbuf, 1, (size_t)comp, f) != (size_t)comp ||
+        omnic_crc32(0, zbuf, (size_t)comp) != crc) {
+        free(zbuf);
+        return OMNIC_E_DATA;
+    }
+    uint64_t plain_cap = ZSTD_getFrameContentSize(zbuf, (size_t)comp);
+    if (plain_cap == 0 || plain_cap == ZSTD_CONTENTSIZE_ERROR ||
+        plain_cap == ZSTD_CONTENTSIZE_UNKNOWN || plain_cap > (64u << 20)) {
+        free(zbuf);
+        return OMNIC_E_DATA;
+    }
+    uint8_t *plain = (uint8_t *)malloc((size_t)plain_cap);
+    if (plain == NULL) {
+        free(zbuf);
+        return OMNIC_E_SYSTEM;
+    }
+    size_t plain_n = ZSTD_decompress(plain, (size_t)plain_cap, zbuf, (size_t)comp);
+    free(zbuf);
+    if (ZSTD_isError(plain_n)) {
+        free(plain);
+        return OMNIC_E_DATA;
+    }
+    /* v2 的记录恒带 mtime；v1 才看头部标志位 */
+    omnic_status pst = arc_index_parse(plain, plain_n, nent, nblk, version, has_mtime, ix);
+    free(plain);
+    if (pst == OMNIC_E_SYSTEM) return OMNIC_E_SYSTEM;
+    if (pst != OMNIC_OK) {
+        if (omnic_last_error()[0] == '\0') omnic_set_error("corrupt archive index");
+        return OMNIC_E_DATA;
+    }
+    return OMNIC_OK;
+}
+
+/* 尾部索引的位置、长度、校验：Footer 在最后 32 字节。Footer 读不到或魔数不对 → E_DATA */
+static omnic_status arc_read_footer(FILE *f, uint64_t *index_off, uint64_t *index_comp,
+                                    uint32_t *index_crc, uint16_t *fent, uint16_t *fblk) {
+    uint8_t ftr[ARC_FTR];
+    if (fseek(f, -(long)sizeof(ftr), SEEK_END) != 0 ||
+        fread(ftr, 1, sizeof(ftr), f) != sizeof(ftr) || memcmp(ftr, ARC_MAGIC_F, 8) != 0)
+        return OMNIC_E_DATA;
+    *index_off = get64(ftr + 8);
+    *index_comp = get64(ftr + 16);
+    *index_crc = get32(ftr + 24);
+    *fent = get16(ftr + 28);
+    *fblk = get16(ftr + 30);
+    return OMNIC_OK;
+}
+
 /* 打开归档并解析索引（unpack/list/verify 共用，§4.1 打开顺序）。
+ * 先走尾部索引；尾部坏了且头部说有镜像，就退回头部镜像并把 ix 标成降级模式。
  * 成功时 *out_f 与 *ix 归调用方清理（fclose / arc_index_mem_free）。 */
 static omnic_status arc_open_index(const char *archive_path, FILE **out_f, arc_index *ix) {
+    /* 调用方传来的 ix 未初始化。以前不要紧（arc_index_parse 一进门就清零），现在尾部失败时
+     * 会在解析之前就对它做 arc_index_mem_free——不清零就是释放野指针。 */
+    memset(ix, 0, sizeof(*ix));
     FILE *f = omnic_fs_fopen(archive_path, "rb");
     if (f == NULL) {
         omnic_set_error("cannot open archive: %s", archive_path);
         return OMNIC_E_SYSTEM;
     }
-    uint8_t hdr[ARC_HDR], ftr[ARC_FTR];
+    uint8_t hdr[ARC_HDR];
     if (fread(hdr, 1, sizeof(hdr), f) != sizeof(hdr) || memcmp(hdr, ARC_MAGIC_H, 8) != 0) {
         omnic_set_error("not a valid .omnic archive (bad header magic)");
         fclose(f);
@@ -1904,86 +2035,89 @@ static omnic_status arc_open_index(const char *archive_path, FILE **out_f, arc_i
         fclose(f);
         return OMNIC_E_DATA;
     }
-    /* 读取端按固定的数据区起点算块偏移：别处的值不能默默放过 */
-    if (get32(hdr + 20) != ARC_HDR) {
-        omnic_set_error("unsupported data offset %u", get32(hdr + 20));
-        fclose(f);
-        return OMNIC_E_DATA;
-    }
-    if (fseek(f, -(long)sizeof(ftr), SEEK_END) != 0 ||
-        fread(ftr, 1, sizeof(ftr), f) != sizeof(ftr) || memcmp(ftr, ARC_MAGIC_F, 8) != 0) {
-        omnic_set_error("not a valid .omnic archive (bad footer magic)");
-        fclose(f);
-        return OMNIC_E_DATA;
-    }
-    uint64_t index_off = get64(ftr + 8), index_comp = get64(ftr + 16);
-    uint32_t index_crc = get32(ftr + 24);
-    /* 计数以 32 位的头为准（v2 起）；v1 另与尾部的 16 位计数交叉核对 */
+    int has_mtime = (version == 1) ? ((hflags & OMNIC_ARC_F_MTIME) != 0) : 1;
+    /* 计数以 32 位的头为准（v2 起） */
     uint32_t nent = get32(hdr + 16), nblk = get32(hdr + 12);
-    if (version == 1 && (get16(ftr + 28) != nent || get16(ftr + 30) != nblk)) {
-        omnic_set_error("archive header/footer mismatch — corrupt archive");
-        fclose(f);
-        return OMNIC_E_DATA;
-    }
-    if (index_off < ARC_HDR || index_comp == 0 || index_comp > (1u << 30)) {
-        omnic_set_error("archive index out of range — corrupt archive");
-        fclose(f);
-        return OMNIC_E_DATA;
-    }
-    uint8_t *zbuf = (uint8_t *)malloc((size_t)index_comp);
-    if (zbuf == NULL) {
-        fclose(f);
-        return OMNIC_E_SYSTEM;
-    }
-    if (arc_seek(f, index_off) != 0 ||
-        fread(zbuf, 1, (size_t)index_comp, f) != (size_t)index_comp) {
-        free(zbuf);
-        omnic_set_error("archive index truncated — cannot list or extract");
-        fclose(f);
-        return OMNIC_E_DATA;
-    }
-    if (omnic_crc32(0, zbuf, (size_t)index_comp) != index_crc) {
-        free(zbuf);
-        omnic_set_error("archive index corrupted — cannot list or extract");
-        fclose(f);
-        return OMNIC_E_DATA;
-    }
-    uint64_t plain_cap = ZSTD_getFrameContentSize(zbuf, (size_t)index_comp);
-    if (plain_cap == 0 || plain_cap == ZSTD_CONTENTSIZE_ERROR ||
-        plain_cap == ZSTD_CONTENTSIZE_UNKNOWN || plain_cap > (64u << 20)) {
-        free(zbuf);
-        fclose(f);
-        return OMNIC_E_DATA;
-    }
-    uint8_t *plain = (uint8_t *)malloc((size_t)plain_cap);
-    if (plain == NULL) {
-        free(zbuf);
-        fclose(f);
-        return OMNIC_E_SYSTEM;
-    }
-    size_t plain_n = ZSTD_decompress(plain, (size_t)plain_cap, zbuf, (size_t)index_comp);
-    free(zbuf);
-    if (ZSTD_isError(plain_n)) {
-        free(plain);
-        omnic_set_error("archive index corrupted — cannot list or extract");
-        fclose(f);
-        return OMNIC_E_DATA;
-    }
-    /* v2 的记录恒带 mtime；v1 才看头部标志位 */
-    omnic_status pst = arc_index_parse(plain, plain_n, nent, nblk, version,
-                                        version == 1 ? ((hflags & OMNIC_ARC_F_MTIME) != 0) : 1, ix);
-    free(plain);
-    if (pst == OMNIC_E_SYSTEM) {
-        fclose(f);
-        return OMNIC_E_SYSTEM;
-    }
-    if (pst != OMNIC_OK) {
-        if (omnic_last_error()[0] == '\0') omnic_set_error("corrupt archive index");
-        fclose(f);
-        return OMNIC_E_DATA;
-    }
-    /* 扩展区（属主/扩展属性）：位置与校验在头部的保留字节里。v1 没有这块，偏移必须为 0 */
+    uint32_t data_off = get32(hdr + 20);
     uint32_t ext_off = get32(hdr + ARC_EXT_OFF), ext_crc = get32(hdr + ARC_EXT_OFF + 4);
+
+    /* 镜像头（头部之后紧跟着）：data_off > 32 说明有，否则必须正好是 32。
+     * v1 归档永远没有镜像。 */
+    uint64_t m_comp = 0, m_off = 0;
+    uint32_t m_crc = 0;
+    int has_mirror = 0;
+    if (data_off != ARC_HDR) {
+        uint8_t mh[ARC_MIRROR_HDR];
+        if (version < OMNIC_ARC_VERSION || data_off < ARC_HDR + ARC_MIRROR_HDR ||
+            fread(mh, 1, sizeof(mh), f) != sizeof(mh) || memcmp(mh, ARC_MAGIC_M, 8) != 0 ||
+            get32(mh + 20) != 0) {
+            omnic_set_error("unsupported data offset %u (no valid index mirror there)", data_off);
+            fclose(f);
+            return OMNIC_E_DATA;
+        }
+        m_comp = get64(mh + 8);
+        m_crc = get32(mh + 16);
+        m_off = ARC_HDR + ARC_MIRROR_HDR;
+        has_mirror = 1;
+        /* 镜像必须整个落在预留区内。注：这条是纵深防御——越界的镜像会先被 CRC 拦下（读到的
+         * 字节不对），CRC 被改对也会被"解压后的明文必须恰好用完"拦下（多出的字节成了尾巴），
+         * 所以它不可单独触发，变异验收抓不到它是对的。 */
+        if (m_comp == 0 || m_comp > data_off - m_off) {
+            omnic_set_error("index mirror out of range — corrupt archive");
+            fclose(f);
+            return OMNIC_E_DATA;
+        }
+    } else if (version < OMNIC_ARC_VERSION && (ext_off != 0 || ext_crc != 0)) {
+        omnic_set_error("v1 archive with a non-zero extension offset");
+        fclose(f);
+        return OMNIC_E_DATA;
+    }
+
+    /* ---- 先走尾部 ---- */
+    uint64_t index_off = 0, index_comp = 0, fsize = 0;
+    uint32_t index_crc = 0;
+    uint16_t fent = 0, fblk = 0;
+    omnic_status st = OMNIC_OK;
+    int tail_ok = 0;
+    if (arc_read_footer(f, &index_off, &index_comp, &index_crc, &fent, &fblk) == OMNIC_OK &&
+        index_off >= data_off) {
+        if (version == 1 && (fent != nent || fblk != nblk)) {
+            omnic_set_error("archive header/footer mismatch — corrupt archive");
+            fclose(f);
+            return OMNIC_E_DATA;
+        }
+        if (fseek(f, 0, SEEK_END) == 0) fsize = (uint64_t)ftell(f);
+        if (index_off + index_comp + ARC_FTR <= fsize) {
+            st = arc_load_index_blob(f, index_off, index_comp, index_crc, nent, nblk, version,
+                                     has_mtime, ix);
+            tail_ok = (st == OMNIC_OK);
+        }
+    }
+    if (!tail_ok) {
+        /* ---- 尾部坏了：有镜像就退回去，没有就到此为止 ---- */
+        if (!has_mirror) {
+            if (omnic_last_error()[0] == '\0' || st == OMNIC_OK)
+                omnic_set_error("archive index truncated or corrupted — cannot list or extract");
+            fclose(f);
+            return OMNIC_E_DATA;
+        }
+        arc_index_mem_free(ix);
+        st = arc_load_index_blob(f, m_off, m_comp, m_crc, nent, nblk, version, has_mtime, ix);
+        if (st != OMNIC_OK) {
+            if (omnic_last_error()[0] == '\0')
+                omnic_set_error("archive index corrupted and the mirror is unusable too");
+            fclose(f);
+            return st;
+        }
+        ix->from_mirror = 1;
+        if (fsize == 0 && fseek(f, 0, SEEK_END) == 0) fsize = (uint64_t)ftell(f);
+        ix->file_size = fsize;
+        /* 降级模式没有扩展区：Footer 没了就找不到它。属主/扩展属性这次不恢复。 */
+        ix->data_off = data_off;
+        *out_f = f;
+        return OMNIC_OK;
+    }
+    /* 尾部完好：扩展区（属主/扩展属性）。v1 没有这块，偏移必须为 0 */
     omnic_status est = OMNIC_OK;
     if (version >= OMNIC_ARC_VERSION) est = arc_ext_load(f, ix, ext_off, ext_crc);
     else if (ext_off != 0 || ext_crc != 0) est = OMNIC_E_DATA;
@@ -1994,14 +2128,16 @@ static omnic_status arc_open_index(const char *archive_path, FILE **out_f, arc_i
         fclose(f);
         return est;
     }
+    ix->data_off = data_off;
     *out_f = f;
     return OMNIC_OK;
 }
-
 /* T2 模板：坏块报告含受影响条目名（至多 10 个，§5.4） */
-static void report_bad_block(const arc_index *ix, size_t bi, unsigned fmt, unsigned quiet) {
+static void report_bad_block(const arc_index *ix, size_t bi, unsigned fmt, unsigned quiet, int salvaged) {
     if (quiet) return;
-    fprintf(stderr, "omnic: block %zu (fmt %u) corrupted — skipped, affected:", bi, fmt);
+    /* salvaged：store 块的字节都在，块 CRC 不符后会逐条目校验抢救——说"跳过"就是误导 */
+    fprintf(stderr, "omnic: block %zu (fmt %u) corrupted — %s, affected:", bi, fmt,
+            salvaged ? "checking entries one by one" : "skipped");
     size_t shown = 0;
     for (size_t i = 0; i < ix->nent && shown < 10; i++)
         if ((ix->ent[i].type == ARC_T_FILE || ix->ent[i].type == ARC_T_SYMLINK) &&
@@ -2062,25 +2198,32 @@ static int ent_has_data(const arc_entry *e) {
 }
 
 /* 解码单块为裸字节（store 直读 / 压缩流解压，块层 CRC 先行）。
- * 返回 0=成功 1=数据损坏（坏块口径）2=无解码器 3=OOM。 */
-static int decode_block(FILE *f, const arc_block *b, uint8_t **raw) {
+ * 返回 0=成功 1=数据损坏（坏块口径）2=无解码器 3=OOM
+ *        4=store 块的字节都在、但块 CRC 不符——*raw 仍然有效，交调用方逐条目抢救。
+ * file_end 非零 = 降级模式（索引取自镜像、尾部已丢）：块必须整个落在它之前。 */
+static int decode_block(FILE *f, const arc_block *b, uint64_t data_off, uint64_t file_end,
+                        uint8_t **raw) {
+    uint64_t start = data_off + b->offset;
+    uint64_t stored = (b->fmt == 0) ? b->raw_size : b->comp_size;
+    /* 降级模式下块必须整个落在文件内。注：纵深防御——越过文件末尾的块，fread 读不足、CRC
+     * 必然失败，所以没有这条也会被当坏块；留着它是因为不依赖 fread 的边界行为。 */
+    if (file_end != 0 && (start > file_end || stored > file_end - start)) return 1; /* 被截掉了 */
     if (b->fmt == 0) { /* store：直读（+1 防 raw_size==0 的 malloc(0)） */
         uint8_t *m = (uint8_t *)malloc((size_t)b->raw_size + 1);
         if (m == NULL) return 3;
-        if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
-            fread(m, 1, (size_t)b->raw_size, f) != (size_t)b->raw_size ||
-            omnic_crc32(0, m, (size_t)b->raw_size) != b->crc) {
+        if (arc_seek(f, start) != 0 || fread(m, 1, (size_t)b->raw_size, f) != (size_t)b->raw_size) {
             free(m);
             return 1;
         }
         *raw = m;
+        if (omnic_crc32(0, m, (size_t)b->raw_size) != b->crc) return 4;
         return 0;
     }
     const omnic_codec_ops *ops = omnic_codec_for_fmt((omnic_fmt_id)b->fmt);
     if (ops == NULL || !ops->can_decompress) return 2;
     uint8_t *cbuf = (uint8_t *)malloc((size_t)b->comp_size);
     if (cbuf == NULL) return 3;
-    if (arc_seek(f, ARC_HDR + b->offset) != 0 ||
+    if (arc_seek(f, start) != 0 ||
         fread(cbuf, 1, (size_t)b->comp_size, f) != (size_t)b->comp_size ||
         omnic_crc32(0, cbuf, (size_t)b->comp_size) != b->crc) {
         free(cbuf);
@@ -2122,6 +2265,8 @@ typedef struct {
 
 typedef struct {
     const char *path;    /* 归档路径：worker 各自 fopen 独立句柄 */
+    uint64_t data_off;   /* 只读：数据区起点（带镜像时不是 32） */
+    uint64_t file_end;   /* 只读：降级模式下的真实文件长度，0 = 不限 */
     dec_job *head, *tail;
     dec_result *res;     /* 回执环（cap=workers+1） */
     size_t res_cap;
@@ -2157,7 +2302,7 @@ ARC_THREAD_FN dec_worker(void *arg) {
         dec_result r;
         memset(&r, 0, sizeof(r));
         if (f != NULL) {
-            r.drc = decode_block(f, j->b, &r.raw);
+            r.drc = decode_block(f, j->b, c->data_off, c->file_end, &r.raw);
         } else {
             r.drc = 3; /* 句柄耗尽按 OOM 口径：主线程统一失败处理 */
         }
@@ -2467,7 +2612,8 @@ static void finish_links(const arc_index *ix, const char *dstroot, const unsigne
             }
         } else {
             uint8_t *raw = NULL;
-            if (decode_block(f, &ix->blk[own->block_id], &raw) == 0) {
+            if (decode_block(f, &ix->blk[own->block_id], ix->data_off,
+                             ix->from_mirror ? ix->file_size : 0, &raw) == 0) {
                 /* 数据取自目标条目（大小/偏移/校验），元数据用本条目自己的 */
                 arc_entry tmp = *own;
                 tmp.mtime = e->mtime;
@@ -2730,6 +2876,8 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
     if (dec_ok) {
         (void)omnic_crc32(0, "", 0); /* 预热分表：worker 可能先于主线程首调 */
         dec.path = archive_path;
+        dec.data_off = ix.data_off;
+        dec.file_end = ix.from_mirror ? ix.file_size : 0;
         dec.res_cap = (size_t)writers + 1;
         dec.res = (dec_result *)calloc(dec.res_cap, sizeof(dec_result));
         if (dec.res != NULL) {
@@ -2776,10 +2924,10 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                 drc = r->drc;
                 r->raw = NULL; /* 所有权移交 */
             } else {
-                drc = decode_block(f, b, &raw); /* 池停后的串行兜底 */
+                drc = decode_block(f, b, ix.data_off, ix.from_mirror ? ix.file_size : 0, &raw); /* 池停后的串行兜底 */
             }
-            if (drc != 0) {
-                if (drc == 1) report_bad_block(&ix, bi, b->fmt, quiet);
+            if (drc != 0 && drc != 4) {
+                if (drc == 1) report_bad_block(&ix, bi, b->fmt, quiet, 0);
                 else if (drc == 2) omnic_set_error("block %zu: no decoder for format %u", bi, b->fmt);
                 else omnic_set_error("out of memory");
                 failed += blk_cnt[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
@@ -2787,7 +2935,13 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
                 continue;
             }
             if (parallel) pool.slot[slot].buf = raw;
-            blocks_ok++;
+            if (drc == 4) {
+                /* store 块的字节都在、只是块 CRC 不符：不整块放弃。逐条目 CRC 会把真正
+                 * 坏掉的挑出来，其余照常写出。报告一句；这个块不算"OK"。 */
+                report_bad_block(&ix, bi, b->fmt, quiet, 1);
+            } else {
+                blocks_ok++;
+            }
             for (size_t k = blk_off[bi]; k < blk_off[bi + 1]; k++) {
                 size_t i = ent_ord[k];
                 arc_entry *e = &ix.ent[i];
@@ -2854,10 +3008,10 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
         if (want_blk != NULL && !want_blk[bi]) continue; /* --file：无目标条目的块不解 */
         int slot = parallel ? pool_acquire_slot(&pool) : -1;
         uint8_t *raw = NULL; /* 本块原始字节（store 直读 / 压缩解压产物） */
-        int drc = decode_block(f, b, &raw);
+        int drc = decode_block(f, b, ix.data_off, ix.from_mirror ? ix.file_size : 0, &raw);
 
-        if (drc != 0) {
-            if (drc == 1) report_bad_block(&ix, bi, b->fmt, quiet);
+        if (drc != 0 && drc != 4) {
+            if (drc == 1) report_bad_block(&ix, bi, b->fmt, quiet, 0);
             else if (drc == 2) omnic_set_error("block %zu: no decoder for format %u", bi, b->fmt);
             else omnic_set_error("out of memory");
             failed += blk_cnt[bi]; /* 坏块的条目全计失败：extracted N/M 口径 */
@@ -2865,7 +3019,13 @@ static omnic_status unpack_core(const char *archive_path, const char *dest_dir,
             continue;
         }
         if (parallel) pool.slot[slot].buf = raw; /* open 且 pending==0：无 worker 触碰，直接赋值 */
-        blocks_ok++;
+        if (drc == 4) {
+            /* store 块的字节都在、只是块 CRC 不符：不整块放弃。逐条目 CRC 会把真正
+             * 坏掉的挑出来，其余照常写出。报告一句；这个块不算"OK"。 */
+            report_bad_block(&ix, bi, b->fmt, quiet, 1);
+        } else {
+            blocks_ok++;
+        }
         for (size_t k = blk_off[bi]; k < blk_off[bi + 1]; k++) {
             size_t i = ent_ord[k];
             arc_entry *e = &ix.ent[i];

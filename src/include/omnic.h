@@ -99,6 +99,7 @@ typedef struct omnic_options {
 #define OMNIC_F_STRICT 0x100u  /* 归档：--strict 有条目被跳过（链接/特殊文件/不可读）即失败 */
 #define OMNIC_F_CTIME 0x200u   /* 归档：pack --ctime 连创建时间一起存（POSIX 上每条目多一次 statx） */
 #define OMNIC_F_XATTR 0x400u   /* 归档：pack --xattr 连 POSIX 扩展属性一起存（每条目多两次系统调用） */
+#define OMNIC_F_MIRROR 0x800u  /* 归档：pack --mirror 在头部之后再存一份索引；归档被截断后仍能救回未损部分 */
 
 /* 采样与决策参数（SYS-CMP-002：决策 ≤50ms）
  * 二期分层采样（PHASE2_DECIDER_DESIGN §3.2）：头/中/尾各 256KiB，

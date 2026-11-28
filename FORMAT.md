@@ -41,7 +41,7 @@ relative to `data_off`; footer offsets are absolute file offsets.
 | 10  | 2    | flags    | bit0 `HAS_MTIME`; bit2 `INDEX_ZSTD` (always 1). v1: bit0 says whether records carry mtime. v2: records always carry it, so the flags must be exactly `0x0005`. Any other bit → the archive is refused |
 | 12  | 4    | n_blocks | ≥ 0 (0 = empty archive) |
 | 16  | 4    | n_entries| ≥ 0 |
-| 20  | 4    | data_off | 32 (readers refuse any other value) |
+| 20  | 4    | data_off | where the Data region starts. 32 without an index mirror; with `pack --mirror` it is `32 + 32 + reserve` (see *Index mirror*). Readers use it for every block offset and refuse anything they cannot make sense of |
 | 24  | 4    | ext_off  | v2: file offset of the extension area; 0 = there is none. v1: 0 |
 | 28  | 4    | ext_crc32| v2: CRC-32 of the extension area's bytes; 0 when `ext_off` is 0 (one without the other is refused) |
 
@@ -233,17 +233,50 @@ corruption, and the unpacker refuses it.
 
 ## Unpacker behavior
 
-Open sequence: read the last 32 bytes, verify `OMNICEND`, cross-check
-counts; seek to `index_off`, verify the index CRC, decompress with zstd;
-parse and validate both tables (path rules, bounds, uniqueness). Any failure
-is fatal for the archive — a damaged index means no listing and no
-extraction (v1 keeps no index mirror).
+Open sequence: read the header, then the last 32 bytes, verify `OMNICEND`,
+cross-check counts; seek to `index_off`, verify the index CRC, decompress
+with zstd; parse and validate both tables (path rules, bounds, uniqueness).
+If that fails and the header points at an index mirror, open the mirror
+instead (below). Without a mirror, a damaged index means no listing and no
+extraction.
+
+**Index mirror** (`pack --mirror`, optional) — a second copy of the
+compressed index, stored right after the header so that truncation, which
+always eats the tail first, cannot take both:
+
+- Layout: `[Header 32][Mirror header 32][compressed index copy][zeros][Data]…`
+  `data_off` points past the whole reserved area. An archive without a
+  mirror has `data_off = 32` and is byte-for-byte what it was before this
+  feature existed.
+- Mirror header: magic `OMNICMIR`, `comp_size u64` (must equal the tail
+  index's), `crc32 u32` (of the copy; must equal the tail's), `reserved u32`
+  (0). The copy must lie entirely inside the reserved area.
+- The reader always tries the tail index first and falls back to the mirror
+  only when the tail is unusable. From the mirror it can list every entry;
+  blocks that lie entirely inside the surviving prefix extract normally,
+  the ones the truncation cut into are reported as bad.
+- **Cost:** the reserve is sized before any data is written, from the index's
+  *uncompressed* upper bound (entries are known by then, block count is
+  bounded), so the compressed copy leaves the rest as zeros. On the
+  8,586-file game tree that is 868 KB reserved for a 165 KB index:
+  **+0.87 %** on a 100 MB archive. Off by default for that reason.
+- An older v2 reader (before this feature) insists on `data_off = 32` and
+  refuses a mirrored archive outright. That is the price of not using a
+  reserved header byte for this, and the reason `--mirror` is opt-in.
 
 **Corruption isolation** — the format's headline property:
 
 - Block CRC mismatch or decode failure → *that block's* entries are skipped
   and reported by name; every other block extracts normally. One flipped bit
   kills one block, not the archive.
+- **Store-block salvage.** A store block (`fmt = 0`) whose bytes are all
+  present but whose block CRC fails is not given up on: the data is exactly
+  where the index says, and every entry carries its own CRC. The unpacker
+  checks each entry and writes the ones that pass; only the entries the
+  damage actually touched are lost. The block is still reported as bad and
+  does not count as OK. On the game tree a flipped byte in the store block
+  used to cost 1,151 files and now costs 1. A *compressed* block with a bad
+  CRC is still dropped whole — its decoded bytes cannot be trusted.
 - Entry CRC mismatch (block stream intact, content wrong) → that file is
   skipped and reported; extraction continues.
 - Final summary reports `extracted N/M entries`; exit code 2 (`E_DATA`).
@@ -292,14 +325,20 @@ change, and every v1 archive stays readable. v2 is the current version and
 is held to the same promise from now on. Two rules govern what comes next:
 
 1. **Never add a field to an existing record, and never a new flag bit.**
-   A change to the header, the footer, the block table or the entry records
-   is a new version number.
+   A change to the layout of the header, the footer, the block table or the
+   entry records is a new version number. Giving an existing field a value
+   it never had before is allowed only when it cannot confuse a reader: the
+   index mirror does this with `data_off` (always 32 until then), and older
+   readers refuse the archive rather than misread it.
 2. **New metadata goes into the extension area.** It carries its own
    tags, so it can grow without touching anything a v2 reader already
    parses. An older v2 reader opens such an archive and extracts every
    file; it just does not restore what it does not know. A reader that
    knows the area refuses one it cannot fully parse — unknown tag, bad
    order, bad CRC — rather than guess.
+3. **Both of the above are opt-in at pack time.** An archive packed without
+   `--mirror` and without owners or xattrs to store is byte-for-byte the
+   layout the first v2 reader parsed.
 
 The only bytes a reader ignores are the footer's last four. The index
 codec is fixed at zstd so that a decoder only ever needs one index

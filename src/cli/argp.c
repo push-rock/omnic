@@ -73,6 +73,8 @@ static int parse_long_opt(omnic_args *a, int argc, char **argv, int *i) {
         a->opts.flags |= OMNIC_F_CTIME;
     } else if (strcmp(arg, "--xattr") == 0) {
         a->opts.flags |= OMNIC_F_XATTR;
+    } else if (strcmp(arg, "--mirror") == 0) {
+        a->opts.flags |= OMNIC_F_MIRROR;
     } else if (strcmp(arg, "--exclude") == 0) {
         if (need_value(argc, argv, i, &v, arg) != 0) return 1;
         push_exclude(a, v);
@@ -238,8 +240,8 @@ int omnic_parse_args(int argc, char **argv, omnic_args *a) {
         return 1;
     }
     if (strcmp(a->cmd, "pack") != 0 &&
-        (a->opts.flags & (OMNIC_F_STRICT | OMNIC_F_CTIME | OMNIC_F_XATTR)) != 0) {
-        fprintf(stderr, "omnic: --strict, --ctime and --xattr only apply to pack\n");
+        (a->opts.flags & (OMNIC_F_STRICT | OMNIC_F_CTIME | OMNIC_F_XATTR | OMNIC_F_MIRROR)) != 0) {
+        fprintf(stderr, "omnic: --strict, --ctime, --xattr and --mirror only apply to pack\n");
         return 1;
     }
     if (strcmp(a->cmd, "pack") != 0 && a->n_exclude > 0) {

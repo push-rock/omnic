@@ -183,10 +183,15 @@ complete list of edges, format limits included, lives in the
 
 Corruption isolation, for the record: every block carries a CRC-32; one
 flipped bit kills one block and names the affected files while the rest of the
-tree extracts cleanly (`extracted 7435/8586 files`, exit code 2). A zip with a
-damaged central directory usually gives you nothing. Two things the headline
-does not cover: the blast radius is one block (up to 64 MiB, thousands of
-small files), and a damaged index or footer is fatal for the whole archive.
+tree extracts cleanly (exit code 2). How much that one block costs depends on
+its kind. In a store block every file's own CRC still holds, so the unpacker
+checks them one by one: a flipped byte in the game-tree store block (1,151
+files) costs exactly one file (`extracted 8585/8586`). In a compressed block
+the decoded bytes cannot be trusted and the whole block is lost — up to
+4,233 files in that archive. A zip with a damaged central directory usually
+gives you nothing. A damaged index or footer is fatal for the whole archive
+unless it was packed with `--mirror`, which keeps a second copy of the index
+after the header at a cost of +0.87 % on that tree.
 
 ## Methodology
 

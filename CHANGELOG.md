@@ -4,6 +4,31 @@ All notable changes to omnic. Format follows [Keep a Changelog](https://keepacha
 
 ## [Unreleased]
 
+### Added — index mirror (`--mirror`), store-block salvage, clearer `analyze`
+
+- **Store-block salvage.** A store block whose checksum fails is no longer
+  given up on: every entry in it carries its own CRC, so the unpacker checks
+  them one by one and writes the ones that pass. A flipped byte in the game
+  tree's store block used to cost 1,151 files; it now costs one, named.
+  The block is still reported and still does not count as OK. A *compressed*
+  block with a bad checksum is still lost whole — its decoded bytes cannot
+  be trusted.
+- **`pack --mirror`** keeps a second copy of the index right after the
+  header. Truncation always eats the tail first, so the tail index is the
+  first thing a truncated archive loses; with a mirror the archive still
+  lists every entry and extracts every block the truncation did not cut
+  into (95 % of the game tree kept: 8,302 of 8,586 files; without a mirror:
+  nothing, not even a listing). The reader tries the tail first and only
+  falls back when the tail is unusable. Cost: the reserve is sized from the
+  index's uncompressed upper bound, +0.87 % on the game tree — which is why
+  it is opt-in, and why archives packed with it need a current omnic.
+- `omnic analyze <directory>` now says it takes files and points at `pack`,
+  instead of a permission-denied error from deep inside the file reader.
+- Tests: a mirrored archive under four kinds of damage (tail index corrupted,
+  tail truncated, mirror corrupted, both), the mirror's copy checked
+  byte-for-byte against the tail's, store-block salvage with a compressed
+  block as the control.
+
 ### Added — extension area: file owners, POSIX xattrs, `--exclude`
 
 - Owners (uid/gid) are now stored for every entry and restored when

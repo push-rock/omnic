@@ -38,6 +38,7 @@ static void usage(FILE *out) {
            "  --ctime             pack: also store creation times\n"
            "  --xattr             pack: also store POSIX extended attributes\n"
            "  --exclude <pattern> pack: leave out matching entries (repeatable; dir/ drops the subtree)\n"
+           "  --mirror            pack: keep a second copy of the index so a truncated archive still yields its intact files\n"
           "  --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)\n"
           "  --file <pattern>    unpack: extract entries (exact path, dir/ prefix, or * glob; repeatable)\n"
           "  --list              unpack: list entries without extracting\n"
@@ -176,6 +177,12 @@ int main(int argc, char **argv) {
             }
             st = omnic_decompress(a.files[i], &a.opts, &rep);
         } else { /* analyze：直连 run_analyze 带全选项（api.c 公开接口按库契约为 NULL 选项） */
+            if (omnic_fs_is_dir(a.files[i])) { /* 目录不是"打不开"：说清楚，别让底层的 permission denied 去猜 */
+                fprintf(stderr, "omnic: '%s' is a directory — analyze takes files; use 'omnic pack' for a tree\n",
+                        a.files[i]);
+                if (rc < OMNIC_E_USAGE) rc = OMNIC_E_USAGE;
+                continue;
+            }
             st = omnic_run_analyze(a.files[i], &a.opts, &rep);
             if (st == OMNIC_OK) {
                 if (!(a.opts.flags & OMNIC_F_QUIET)) {

@@ -146,6 +146,7 @@ options:
   --ctime             pack: also store creation times
   --xattr             pack: also store POSIX extended attributes
   --exclude <pattern> pack: leave out matching entries (repeatable; dir/ drops the subtree)
+  --mirror            pack: keep a second copy of the index so a truncated archive still yields its intact files
   --block-size <MiB>  pack: solid block limit, 1..1024 (default 64)
   --file <pattern>    unpack: extract entries (exact path, dir/ prefix, or * glob; repeatable)
   --list              unpack: list entries without extracting
@@ -224,15 +225,20 @@ VoxeLibre: PNG textures, Lua scripts, Ogg audio, models, fonts, DLLs):
 
   ```console
   $ omnic unpack gamedir.omnic              # one byte inside this archive was flipped
-  omnic: block 0 (fmt 0) corrupted — skipped, affected: luanti-5.16.1-win64/textures/base/pack/air.png …
-  omnic: extracted 7435/8586 entries (1151 failed)
+  omnic: block 0 (fmt 0) corrupted — checking entries one by one, affected: luanti-5.16.1-win64/textures/base/pack/air.png …
+  omnic: entry corrupted — skipped: luanti-5.16.1-win64/textures/base/pack/aux1_btn.png
+  omnic: extracted 8585/8586 entries (1 failed)
   $ echo $?
   2
   ```
 
-  That block held 1,151 files; the other 7,435 came out and passed their
-  checksums. How big a block is — and how that compares with zip and with a
-  solid `tar.xz` — is spelled out under [Limits](#what-it-doesnt-do-yet).
+  That byte landed in a store block holding 1,151 already-compressed files.
+  The block's checksum failed, but every file carries its own, so the
+  unpacker checked all 1,151 and wrote the 1,150 that passed. The damaged one
+  is named, the exit code says 2, and nothing else was held hostage. Damage
+  inside a *compressed* block still costs that block — up to 4,233 files in
+  this archive — which is why `--per-file` and `--block-size` exist; see
+  [Limits](#what-it-doesnt-do-yet).
 
 <details>
 <summary>Raw numbers behind both charts</summary>
@@ -319,18 +325,23 @@ The edges as of v0.3.3 — read this before trusting it with a backup.
 - **Archives need a current omnic on both ends.** The format is v2 since this
   version; omnic 0.3.x refuses a v2 archive with "needs a newer omnic".
   Archives written by 0.3.x stay readable.
-- **The index is a single copy at the tail of the file.** A truncated or
-  tail-damaged archive is refused outright — isolation covers damage inside
-  the data blocks.
-- **The blast radius is one block, and a block can be big.** Blocks hold up to
-  64 MiB (`--block-size 1..1024`), which for trees of small files means
-  thousands of files: in the archive above, the largest block holds 4,233.
-  In fairness: zip loses only the single damaged file, while a single-stream
-  `tar.xz` or a solid 7z loses everything after a bad byte. omnic sits in
-  between, at block granularity — and the block size is yours to choose.
-  `--per-file` gives every *compressed* file its own block; already-compressed
-  files keep sharing store blocks, so lower `--block-size` as well when blast
-  radius matters.
+- **By default the index is a single copy at the tail of the file.** A
+  truncated or tail-damaged archive is then refused outright — isolation
+  covers damage inside the data blocks. `pack --mirror` keeps a second copy
+  right after the header instead: a truncated archive still lists everything
+  and yields every block the truncation did not cut into. It costs space
+  (+0.87 % on the game tree) and such archives need a current omnic, so it
+  is off unless you ask.
+- **The blast radius of damage in a compressed block is that block, and a
+  block can be big.** Blocks hold up to 64 MiB (`--block-size 1..1024`),
+  which for trees of small files means thousands of files: in the archive
+  above, the largest block holds 4,233. Damage in a store block costs only
+  the files it actually touched. In fairness: zip loses only the single
+  damaged file, while a single-stream `tar.xz` or a solid 7z loses
+  everything after a bad byte. omnic sits in between, at block granularity —
+  and the block size is yours to choose. `--per-file` gives every
+  *compressed* file its own block; already-compressed files keep sharing
+  store blocks, but those are the ones that get salvaged file by file.
 - **A single stream still squeezes harder.** `tar | xz -9` reached 56.8% on
   the game tree (v0.3.3 window) against `best_ratio`'s 63.2% — and gives up
   the per-file routing, the pass-through and the millisecond single-file
