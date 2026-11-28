@@ -87,12 +87,14 @@ jobs:
         if: failure()
         shell: bash
         run: |
-          # 以前只认行首 FAIL：超时、崩溃、ctest 自己的失败清单都抓不到，而且 grep 无匹配
-          # 时返回 1，这一步自己就先失败了。现在把日志尾部原样发出来——不管里面是什么词。
-          # 标注每条上限 250 字符；日志不长时就是全文。
+          # 分两段发：先断言失败行（最关键，且在日志靠前的位置——test_archive 的输出
+          # 后面还跟着 bench/fuzz 的几百行，单纯取尾部会被它们挤掉），再发 ctest 自己
+          # 的总结（Passed/Failed/超时/Not Run）。都不限定行首，避免漏掉超时和崩溃。
           {
-            echo "ctest summary (tail of test.log):"
-            tail -n 60 test.log
+            echo "--- assertion failures ---"
+            grep -nE 'FAIL|checks, [0-9]+ failed|Assertion|Sanitizer|runtime error|Segmentation|Timed out|\*\*\*' test.log | head -40
+            echo "--- ctest summary ---"
+            grep -nE 'Test +#[0-9]+:|tests passed|tests failed|The following tests|Total Test time' test.log | tail -n 20
           } | while IFS= read -r line; do
             printf '::error title=ctest::%s\n' "$(printf '%s' "$line" | cut -c1-250)"
           done

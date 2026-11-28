@@ -1869,7 +1869,8 @@ static void test_exclude(void) {
 }
 
 /* 按 FORMAT.md 的布局手工往一个归档里插扩展区：独立于 omnic 的写入端，
- * 顺带证明规范照着能实现。ext 为整块明文（[index u32][len u32][payload]…）。 */
+ * 顺带证明规范照着能实现。ext 为整块明文（[index u32][len u32][payload]…）。
+ * 归档已经带扩展区时（POSIX 上属主总是被存，这是常态）就整段替换掉它。 */
 static int inject_ext_area(const char *arc, const uint8_t *ext, size_t ext_len, int corrupt_crc) {
     size_t n = 0;
     unsigned char *b = slurp(arc, &n);
@@ -1880,7 +1881,7 @@ static int inject_ext_area(const char *arc, const uint8_t *ext, size_t ext_len, 
     for (int i = 0; i < 8; i++) index_off |= (uint64_t)ftr[8 + i] << (8 * i);
     for (int i = 0; i < 8; i++) index_comp |= (uint64_t)ftr[16 + i] << (8 * i);
     uint64_t end = index_off + index_comp;
-    if (end + 32 != n) { free(b); return -1; } /* 这个归档已经有扩展区或布局不符 */
+    if (end + 32 > n) { free(b); return -1; } /* 布局不符：索引伸进了 Footer */
     uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < ext_len; i++) {
         crc ^= ext[i];
@@ -1888,7 +1889,9 @@ static int inject_ext_area(const char *arc, const uint8_t *ext, size_t ext_len, 
     }
     crc ^= 0xFFFFFFFFu;
     if (corrupt_crc) crc ^= 0x1u;
-    unsigned char *nb = (unsigned char *)malloc(n + ext_len);
+    /* 新文件 = [数据][索引] + 新扩展区 + Footer；旧的扩展区（end+32 .. n）被丢掉 */
+    size_t new_n = (size_t)end + ext_len + 32;
+    unsigned char *nb = (unsigned char *)malloc(new_n);
     if (nb == NULL) { free(b); return -1; }
     memcpy(nb, b, (size_t)end);
     memcpy(nb + end, ext, ext_len);
@@ -1899,7 +1902,7 @@ static int inject_ext_area(const char *arc, const uint8_t *ext, size_t ext_len, 
     for (int i = 0; i < 4; i++) nb[28 + i] = (unsigned char)(crc >> (8 * i));
     FILE *f = fopen(arc, "wb");
     if (f == NULL) { free(b); free(nb); return -1; }
-    fwrite(nb, 1, n + ext_len, f);
+    fwrite(nb, 1, new_n, f);
     fclose(f);
     free(b);
     free(nb);
@@ -1916,7 +1919,9 @@ static void test_ext_area(void) {
     wfile("omnic_arc_xt/a.txt", txt, 30);
     omnic_options o = mkopts(OMNIC_F_QUIET, 0);
 
-    /* 没有属主/扩展属性可存（Windows；或没开 --xattr）：头部 24..32 全 0，没有扩展区 */
+    /* Windows 上没有属主/扩展属性可存：头部 24..32 全 0，没有扩展区。
+     * POSIX 上属主总是被存（lstat 顺手就有）：一定有扩展区，头部指向它。
+     * 两种结果都是对的，按平台断言——以前只按 Windows 写，POSIX 上这里必挂。 */
     CHECK(pack_tree(T, A, o) == OMNIC_OK);
     size_t n = 0;
     unsigned char *b = slurp(A, &n);
@@ -1924,8 +1929,16 @@ static void test_ext_area(void) {
     int zero = 1;
     for (int i = 24; i < 32; i++)
         if (b[i] != 0) zero = 0;
+#ifndef _WIN32
+    uint32_t ext_off = (b != NULL) ? rd32(b + 24) : 0;
+#endif
     free(b);
+#ifdef _WIN32
     CHECK(zero == 1);
+#else
+    CHECK(zero == 0); /* 有属主数据：扩展区存在，头部记着它的位置 */
+    CHECK(ext_off != 0);
+#endif
     CHECK(omnic_arc_verify(A, &o, &g_rep) == OMNIC_OK);
 
     /* 手工注入一段合法扩展区：entry 0 的 uid=1000 gid=100，外加一条 xattr。
