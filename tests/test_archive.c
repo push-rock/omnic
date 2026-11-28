@@ -32,16 +32,37 @@ int main(void) { return 0; } /* 归档功能依赖 zstd（构建开关关闭时�
 
 static int g_fail = 0;
 static int g_run = 0;
+/* 失败条目另存一份，程序退出前在总结行之后再打一遍：ctest 对单个测试的输出有长度上限，
+ * 中间的 FAIL 行会被截掉——放在最末尾就不会。只存行号和条件，最多 64 条，不占多少内存。 */
+#define FAIL_MAX 64
+static struct { int line; const char *cond; } g_failed[FAIL_MAX];
+static int g_failed_n = 0;
 
-#define CHECK(cond)                                                          \
+/* 条件里常有逗号（CHECK(pack_tree(T, A, o) == OK)），预处理器会把它切成多个实参。
+ * 用 __VA_ARGS__ 整体接住，再把它们拼回一个表达式；#__VA_ARGS__ 得到完整的条件文本。 */
+#define CHECK(...)                                                            \
     do {                                                                     \
         g_run++;                                                             \
-        if (!(cond)) {                                                       \
+        if (!(__VA_ARGS__)) {                                                \
             g_fail++;                                                        \
-            printf("FAIL %s:%d: %s  [err: %s]\n", __FILE__, __LINE__, #cond, \
-                   omnic_last_error());                                      \
+            printf("FAIL %s:%d: %s  [err: %s]\n", __FILE__, __LINE__,        \
+                   #__VA_ARGS__, omnic_last_error());                        \
+            if (g_failed_n < FAIL_MAX) {                                     \
+                g_failed[g_failed_n].line = __LINE__;                        \
+                g_failed[g_failed_n].cond = #__VA_ARGS__;                    \
+                g_failed_n++;                                                \
+            }                                                                \
         }                                                                    \
     } while (0)
+
+static void print_failures_tail(void) {
+    if (g_fail == 0) return;
+    printf("FAILED-CHECKS-BEGIN %d of %d\n", g_fail, g_run);
+    for (int i = 0; i < g_failed_n; i++) printf("FAILED-CHECK %d: %s\n", g_failed[i].line, g_failed[i].cond);
+    if (g_fail > g_failed_n) printf("FAILED-CHECK ... %d more not listed\n", g_fail - g_failed_n);
+    printf("FAILED-CHECKS-END\n");
+    fflush(stdout);
+}
 
 /* 索引明文布局（与 archive.c 序列化对齐）：v2 条目定长 34B（type/flags/block_id/in_off/
  * size/crc/mtime），可选字段按 flags 跟在后面，次序固定。 */
@@ -2419,6 +2440,7 @@ int main(void) {
     test_index_mirror();
     test_store_salvage();
     printf("%d checks, %d failed\n", g_run, g_fail);
+    print_failures_tail();
     return g_fail ? 1 : 0;
 }
 

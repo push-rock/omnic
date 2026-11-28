@@ -93,6 +93,8 @@ jobs:
           {
             echo "--- assertion failures ---"
             grep -nE 'FAIL|checks, [0-9]+ failed|Assertion|Sanitizer|runtime error|Segmentation|Timed out|\*\*\*' test.log | head -40
+            echo "--- failed-check list (re-printed at the very end of each suite, so truncation cannot eat it) ---"
+            grep -nE 'FAILED-CHECK' test.log | head -40
             echo "--- ctest summary ---"
             grep -nE 'Test +#[0-9]+:|tests passed|tests failed|The following tests|Total Test time' test.log | tail -n 20
           } | while IFS= read -r line; do
