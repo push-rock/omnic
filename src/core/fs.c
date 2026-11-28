@@ -769,9 +769,20 @@ static char *read_link_alloc(const char *path) {
 }
 
 /* ---- 扩展属性（xattr）与属主：POSIX 专有 ----
- * listxattr 在两边语义不同：Linux 返回"名字串的总长"，macOS 返回"名字串总长 + 每个名字
- * 一个 NUL"；llistxattr(…, NULL, 0) 两边都只给长度。名字一律以 NUL 分隔，逐个 lgetxattr 取值。
+ * 两个平台的"不跟随符号链接"写法不同，收进这三个宏，下面的代码只写一遍：
+ *   Linux  llistxattr / lgetxattr / lsetxattr
+ *   macOS  listxattr / getxattr / setxattr + XATTR_NOFOLLOW 位置参数 options
+ * listxattr 的返回值两边都是"名字串的总长"（名字以 NUL 分隔）。逐个 get 取值。
  * 读一个属性失败不致命：跳过它，剩下的照存。 */
+#if defined(__APPLE__)
+#define OMNIC_LIST_XATTR(p, b, n) listxattr((p), (b), (n), XATTR_NOFOLLOW)
+#define OMNIC_GET_XATTR(p, nm, b, n) getxattr((p), (nm), (b), (n), 0, XATTR_NOFOLLOW)
+#define OMNIC_SET_XATTR(p, nm, b, n) setxattr((p), (nm), (b), (n), 0, XATTR_NOFOLLOW)
+#else
+#define OMNIC_LIST_XATTR(p, b, n) llistxattr((p), (b), (n))
+#define OMNIC_GET_XATTR(p, nm, b, n) lgetxattr((p), (nm), (b), (n))
+#define OMNIC_SET_XATTR(p, nm, b, n) lsetxattr((p), (nm), (b), (n), 0)
+#endif
 
 int omnic_fs_can_chown(void) { return geteuid() == 0 ? 1 : 0; }
 
@@ -789,12 +800,12 @@ omnic_status omnic_fs_get_xattrs(const char *path, unsigned char **buf, size_t *
     *buf = NULL;
     *len = 0;
 #ifdef OMNIC_HAVE_XATTR
-    ssize_t sz = llistxattr(path, NULL, 0);
+    ssize_t sz = OMNIC_LIST_XATTR(path, NULL, 0);
     if (sz < 0) return (errno == ENOTSUP) ? OMNIC_OK : OMNIC_E_SYSTEM; /* 文件系统不支持 = 没有 */
     if (sz == 0) return OMNIC_OK;
     char *names = (char *)malloc((size_t)sz + 1);
     if (names == NULL) return OMNIC_E_SYSTEM;
-    ssize_t got = llistxattr(path, names, (size_t)sz);
+    ssize_t got = OMNIC_LIST_XATTR(path, names, (size_t)sz);
     if (got != sz) { /* 两次调用之间属性变了：按当下没有处理，不存半截 */
         free(names);
         return OMNIC_OK;
@@ -804,11 +815,11 @@ omnic_status omnic_fs_get_xattrs(const char *path, unsigned char **buf, size_t *
     size_t acc_len = 0;
     for (const char *nm = names; nm < names + sz; nm += strlen(nm) + 1) {
         if (*nm == '\0') continue;
-        ssize_t vsz = lgetxattr(path, nm, NULL, 0);
+        ssize_t vsz = OMNIC_GET_XATTR(path, nm, NULL, 0);
         if (vsz < 0) continue;
         void *val = malloc(vsz > 0 ? (size_t)vsz : 1);
         if (val == NULL) { free(names); free(acc); return OMNIC_E_SYSTEM; }
-        if (vsz > 0 && lgetxattr(path, nm, val, (size_t)vsz) != vsz) { free(val); continue; }
+        if (vsz > 0 && OMNIC_GET_XATTR(path, nm, val, (size_t)vsz) != vsz) { free(val); continue; }
         if (omnic_fs_xattr_append(&acc, &acc_len, nm, val, (size_t)vsz) != 0) {
             free(val); free(names); free(acc);
             return OMNIC_E_SYSTEM;
@@ -827,7 +838,7 @@ omnic_status omnic_fs_get_xattrs(const char *path, unsigned char **buf, size_t *
 omnic_status omnic_fs_set_xattr(const char *path, const char *name, const void *val,
                                 size_t val_len) {
 #ifdef OMNIC_HAVE_XATTR
-    return lsetxattr(path, name, val, val_len, 0) == 0 ? OMNIC_OK : OMNIC_E_SYSTEM;
+    return OMNIC_SET_XATTR(path, name, val, val_len) == 0 ? OMNIC_OK : OMNIC_E_SYSTEM;
 #else
     (void)path; (void)name; (void)val; (void)val_len;
     return OMNIC_E_SYSTEM;
