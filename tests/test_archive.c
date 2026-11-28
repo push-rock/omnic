@@ -332,19 +332,54 @@ static uint8_t *load_index_plain(const char *arc, size_t *out_n, uint64_t *index
     return plain;
 }
 
-/* 改后回写：truncate 到 index_off → zstd/3 压缩 → 新索引 + 新 Footer */
+/* 改后回写：truncate 到 index_off → zstd/3 压缩 → 新索引 + 原扩展区 + 新 Footer。
+ * 扩展区（属主/xattr，FORMAT.md §Extension area）紧跟索引、Footer 之前，自带 CRC。
+ * 索引重压后长度会变，扩展区跟着挪：内容原样接回去，头部 24..28 的偏移改成新位置。
+ * 不这么做的话头部指着旧位置，读取端会按"扩展区损坏"拒绝整个归档（POSIX 上属主总是
+ * 被存，每个归档都有扩展区，所以那里必挂）。 */
 static int save_index_plain(const char *arc, uint8_t *plain, size_t n, uint64_t index_off) {
+    /* 先把现有布局里索引之后、Footer 之前的全部字节（即扩展区，可能为空）读出来 */
+    unsigned char *ext = NULL;
+    size_t ext_len = 0;
+    {
+        FILE *f = omnic_fs_fopen(arc, "rb");
+        if (f == NULL) return -1;
+        if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+        long sz = ftell(f);
+        uint8_t ftr[32];
+        if (sz < 64 || fseek(f, -32, SEEK_END) != 0 || fread(ftr, 1, 32, f) != 32) {
+            fclose(f);
+            return -1;
+        }
+        uint64_t io = 0, ic = 0;
+        for (int i = 0; i < 8; i++) io |= (uint64_t)ftr[8 + i] << (8 * i);
+        for (int i = 0; i < 8; i++) ic |= (uint64_t)ftr[16 + i] << (8 * i);
+        if (io != index_off || io + ic + 32 > (uint64_t)sz) { fclose(f); return -1; } /* 布局不符 */
+        ext_len = (size_t)((uint64_t)sz - 32 - (io + ic));
+        if (ext_len > 0) {
+            ext = (unsigned char *)malloc(ext_len);
+            if (ext == NULL || fseek(f, (long)(io + ic), SEEK_SET) != 0 ||
+                fread(ext, 1, ext_len, f) != ext_len) {
+                free(ext);
+                fclose(f);
+                return -1;
+            }
+        }
+        fclose(f);
+    }
     size_t zcap = ZSTD_compressBound(n);
     uint8_t *zbuf = (uint8_t *)malloc(zcap);
-    if (zbuf == NULL) return -1;
+    if (zbuf == NULL) { free(ext); return -1; }
     size_t zn = ZSTD_compress(zbuf, zcap, plain, n, 3);
     if (ZSTD_isError(zn)) {
         free(zbuf);
+        free(ext);
         return -1;
     }
     FILE *f = omnic_fs_fopen(arc, "r+b");
     if (f == NULL) {
         free(zbuf);
+        free(ext);
         return -1;
     }
     /* CRC-32/IEEE（与归档同款多项式），流式 */
@@ -356,6 +391,7 @@ static int save_index_plain(const char *arc, uint8_t *plain, size_t n, uint64_t 
     crc ^= 0xFFFFFFFFu;
     fseek(f, (long)index_off, SEEK_SET);
     fwrite(zbuf, 1, zn, f);
+    if (ext_len > 0) fwrite(ext, 1, ext_len, f); /* 原扩展区接在索引之后 */
     uint8_t ftr[32];
     memset(ftr, 0, sizeof(ftr));
     memcpy(ftr, "OMNICEND", 8);
@@ -364,14 +400,28 @@ static int save_index_plain(const char *arc, uint8_t *plain, size_t n, uint64_t 
     for (int i = 0; i < 4; i++) ftr[24 + i] = (uint8_t)(crc >> (8 * i));
     /* 尾部 28..32：v2 保留为 0（计数以头部为准） */
     fwrite(ftr, 1, 32, f);
+    /* 头部 24..28 记的是扩展区的偏移。索引重压后长度变了，扩展区跟着挪，
+     * 偏移必须改成新位置；它的 CRC 不用动（内容没变）。 */
+    if (ext_len > 0) {
+        uint32_t new_off = (uint32_t)(index_off + zn);
+        uint8_t orow[4];
+        for (int i = 0; i < 4; i++) orow[i] = (uint8_t)(new_off >> (8 * i));
+        if (fseek(f, 24, SEEK_SET) != 0 || fwrite(orow, 1, 4, f) != 4) {
+            fclose(f);
+            free(zbuf);
+            free(ext);
+            return -1;
+        }
+    }
     /* "r+" 不截断：重压索引比原短时尾部残留旧字节，SEEK_END 读 Footer 会落空 */
 #if defined(_WIN32)
-    _chsize(fileno(f), (long)(index_off + zn + 32));
+    _chsize(fileno(f), (long)(index_off + zn + ext_len + 32));
 #else
-    ftruncate(fileno(f), (off_t)(index_off + zn + 32));
+    ftruncate(fileno(f), (off_t)(index_off + zn + ext_len + 32));
 #endif
     fclose(f);
     free(zbuf);
+    free(ext);
     return 0;
 }
 
